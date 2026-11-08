@@ -1,0 +1,14 @@
+# Rust
+/target/
+/dist/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+
+# Claude Code (configuración local y memoria de sesión)
+.claude/*
+# …salvo los agentes del proyecto, que sí se versionan.
+!.claude/agents/

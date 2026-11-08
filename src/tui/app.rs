@@ -1,0 +1,4091 @@
+//! Estado de la pantalla y su actualización: sin terminal ni I/O, para poder
+//! probarlo con teclas y mensajes construidos a mano.
+
+use crate::agents::{Agent, Scope};
+use crate::report;
+use crate::runs::Run;
+use crate::status::{
+    self, Context, LaunchedBy, Period, PeriodStats, RankKey, RunDetail, RunKind, RunState, Work,
+};
+use crate::transcripts::Invocation;
+use chrono::{DateTime, Duration, FixedOffset, NaiveDateTime, TimeDelta, Utc};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+
+/// Días del gráfico de la ficha, contando hoy.
+pub const DAYS: usize = 14;
+
+/// Días locales que guarda cada fila, contando hoy: el máximo que puede pedir
+/// la barrita elástica de «todos» (`Row::days`).
+pub const MAX_DAYS: usize = 90;
+
+/// Evalúa `$body` con `$tz` en la zona de la pantalla: la fija de `App::tz` si
+/// la hay (tests) o `chrono::Local`.
+macro_rules! in_zone {
+    ($app:expr, $tz:ident => $body:expr) => {
+        match $app.tz {
+            Some(off) => {
+                let $tz = &off;
+                $body
+            }
+            None => {
+                let $tz = &chrono::Local;
+                $body
+            }
+        }
+    };
+}
+
+/// Lo que el hilo de lectura manda a la pantalla.
+pub enum Msg {
+    Agents(Vec<Agent>),
+    Activity {
+        calls: Vec<Invocation>,
+        /// Todas las ejecuciones con transcripción propia (`crate::runs`).
+        runs: Vec<Run>,
+        sessions: usize,
+    },
+    Error(String),
+}
+
+pub enum Action {
+    Key(KeyEvent),
+    Tick(DateTime<Utc>),
+    Msg(Msg),
+    /// Rueda del ratón: líneas que se mueve la vista (negativo, hacia arriba).
+    /// El cursor se arrastra si se sale de la vista.
+    Scroll(i32),
+}
+
+/// La pestaña abierta: la lista de los activos, la de todos o el ranking por
+/// tiempo trabajado.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    Active,
+    All,
+    Ranking,
+}
+
+impl Mode {
+    /// Tab: activos → todos → ranking → activos.
+    fn next(self) -> Self {
+        match self {
+            Mode::Active => Mode::All,
+            Mode::All => Mode::Ranking,
+            Mode::Ranking => Mode::Active,
+        }
+    }
+
+    /// `a`: alterna activos y todos; desde el ranking, a activos.
+    fn toggle(self) -> Self {
+        match self {
+            Mode::Active => Mode::All,
+            Mode::All | Mode::Ranking => Mode::Active,
+        }
+    }
+}
+
+/// Orden de las filas dentro de cada grupo de la lista (`o`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Order {
+    /// En curso, activos por su último uso, inactivos por su último uso y
+    /// nunca usados por nombre.
+    #[default]
+    Recent,
+    /// Por tiempo trabajado en total, de más a menos.
+    Worked,
+}
+
+impl Order {
+    fn toggle(self) -> Self {
+        match self {
+            Order::Recent => Order::Worked,
+            Order::Worked => Order::Recent,
+        }
+    }
+}
+
+/// Una fila de la lista: un agente, su última llamada dentro de la ventana y
+/// la última de todo el historial.
+#[derive(Clone, Debug)]
+pub struct Row {
+    /// Número que se muestra y al que saltan los dígitos, de 1 en adelante.
+    pub n: usize,
+    /// Índice en la lista de agentes.
+    pub agent: usize,
+    /// Última llamada dentro de la ventana: si la hay, el agente está activo.
+    pub last: Option<DateTime<Utc>>,
+    /// Última llamada de todo el historial; `None` si nunca se usó.
+    pub ever: Option<DateTime<Utc>>,
+    /// Trabajo de todas sus ejecuciones y la que está en curso, si hay una.
+    pub work: Work,
+    /// Trabajo de cada uno de los últimos `MAX_DAYS` días locales, el más
+    /// antiguo primero y hoy el último (`status::days_of`). Para un tramo más
+    /// corto, `Row::days`.
+    pub history: Vec<TimeDelta>,
+    pub section: String,
+}
+
+/// Una llamada de la ficha: cuándo, desde dónde, si cae en la ventana y la
+/// ejecución que lanzó, si se pudo enlazar.
+#[derive(Clone, Debug)]
+#[cfg_attr(not(test), allow(dead_code))] // la ficha ya no lista llamadas (visual); lo usan los tests
+pub struct Call<'a> {
+    pub at: DateTime<Utc>,
+    pub cwd: &'a Path,
+    pub in_window: bool,
+    pub run: Option<CallRun<'a>>,
+}
+
+/// La ejecución enlazada con una llamada (`status::run_of`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))] // la ficha ya no lista llamadas (visual); lo usan los tests
+pub struct CallRun<'a> {
+    /// Lo trabajado; si está en curso, lo que lleva hasta ahora.
+    pub worked: TimeDelta,
+    pub tools: usize,
+    /// `description` del meta.
+    pub description: Option<&'a str>,
+    pub in_progress: bool,
+}
+
+/// Una ejecución de la ficha, de la que empezó más tarde a la más antigua.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunLine<'a> {
+    /// Inicio en la hora local («4 nov 18:12»).
+    pub start: Option<NaiveDateTime>,
+    /// Lo trabajado; si está en curso, lo que lleva hasta ahora.
+    pub worked: TimeDelta,
+    pub tools: usize,
+    /// `description` del meta.
+    pub description: Option<&'a str>,
+    /// Desde dónde se lanzó, solo si no es la raíz del proyecto del agente.
+    pub cwd: Option<&'a Path>,
+    pub in_progress: bool,
+}
+
+/// Una ejecución de activos, de cualquier tipo, en curso o terminada dentro de
+/// la ventana (`state`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NowLine {
+    /// Identificador estable de la ejecución (`status::run_id`): lo que
+    /// identifica a la ficha de ejecución entre refrescos.
+    pub id: String,
+    /// `agentType`, con «workflow» para las de workflow (`status::display_name`).
+    pub name: String,
+    pub cwd: Option<PathBuf>,
+    pub since: Option<DateTime<Utc>>,
+    /// Lo que lleva trabajado hasta ahora.
+    pub worked: TimeDelta,
+    pub tools: usize,
+    /// De dónde viene: agente definido, built-in o paso de workflow.
+    pub kind: RunKind,
+    /// El encargo (`status::NowRun::task`); en un workflow, sin él no hay.
+    pub task: Option<String>,
+    /// Última herramienta usada (`Bash · git diff --stat`), para «ahora».
+    pub last_tool: Option<String>,
+    /// En curso (`RunState::Running`) o terminada y cuándo
+    /// (`RunState::Done { ended }`: de ahí sale «hace N min»).
+    pub state: RunState,
+    /// Ejecuciones (o llamadas) fundidas en la fila, ≥ 1. `id` es la que la
+    /// representa. La vista pinta `×N` solo si es mayor que 1.
+    pub runs: usize,
+    /// Tokens de todas las ejecuciones de la fila (columna «tokens»).
+    pub tokens: u64,
+    /// Contexto de la representante (columna «ctx»): solo en curso; `None`
+    /// si terminó o aún no hay ningún mensaje con uso.
+    pub context: Option<Context>,
+}
+
+/// El último uso de cualquier agente definido, para el monitor vacío
+/// («último uso: <agente> de <proyecto> hace X»).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LastUse {
+    pub agent: usize,
+    /// Grupo del agente: «global» o el proyecto acortado con `~`.
+    pub section: String,
+    pub at: DateTime<Utc>,
+}
+
+impl Row {
+    /// En curso ahora o con una llamada dentro de la ventana.
+    pub fn active(&self) -> bool {
+        self.running() || self.last.is_some()
+    }
+
+    /// Tiene una ejecución en curso.
+    pub fn running(&self) -> bool {
+        self.work.running.is_some()
+    }
+
+    /// Trabajo de los últimos `n` días locales (como mucho `MAX_DAYS`), el más
+    /// antiguo primero y hoy el último. No recalcula: es un tramo de `history`.
+    pub fn days(&self, n: usize) -> &[TimeDelta] {
+        &self.history[self.history.len().saturating_sub(n)..]
+    }
+
+    /// Trabajo medio por ejecución; `None` sin ejecuciones.
+    pub fn mean(&self) -> Option<TimeDelta> {
+        let runs = i32::try_from(self.work.runs).ok().filter(|&n| n > 0)?;
+        Some(self.work.total / runs)
+    }
+}
+
+/// Una línea de la lista tal como se pinta. Las seleccionables (`Row`,
+/// `Folded`, `Rank`, `Live`) llevan número (`Item::n`).
+pub enum Item {
+    /// Activos: regla de un grupo de proyecto. `section` es la clave del grupo
+    /// (como `Row::section`: «global» o el `cwd` acortado con `~`); el nombre
+    /// corto es cosa de la vista. `running` son las ejecuciones en curso del
+    /// grupo y `recent` las terminadas en la ventana, contadas sobre lo que
+    /// deja el filtro (`running + recent` son los bloques que le siguen).
+    /// No se selecciona.
+    LiveGroup {
+        section: String,
+        running: usize,
+        recent: usize,
+    },
+    /// Activos: primera línea de un bloque de tres (agente, tipo, tiempo,
+    /// herramientas), en curso o terminado (`line.state`). Es la fila
+    /// seleccionable; `row` es la del agente definido si lo hay (un agente
+    /// definido, o un workflow cuyo agente real lo es) y `None` si es built-in
+    /// o un workflow sin agente definido. Enter abre en cualquier caso la ficha
+    /// de la ejecución (`line.id`). Le siguen `LiveTask` y `LiveNow`.
+    Live {
+        n: usize,
+        line: NowLine,
+        row: Option<Row>,
+    },
+    /// Activos: segunda línea del bloque, «encargo …» (`line.task`). No se
+    /// selecciona; va siempre detrás de su `Live`.
+    LiveTask(NowLine),
+    /// Activos: tercera línea del bloque, «ahora …» (`line.last_tool`). No se
+    /// selecciona; va siempre detrás de su `LiveTask`.
+    LiveNow(NowLine),
+    /// Activos sin nada en curso ni en la ventana (y sin filtro): el último
+    /// uso de cualquier agente definido, o `None` si no hay ninguno.
+    Quiet {
+        last: Option<LastUse>,
+    },
+    /// Cabecera de las columnas, una vez encima del primer grupo (en activos,
+    /// encima del primer grupo de proyecto).
+    Columns,
+    Section {
+        title: String,
+        /// Activos del grupo: «todos» ya no los pinta (visual); lo usan los tests.
+        #[cfg_attr(not(test), allow(dead_code))]
+        active: usize,
+        total: usize,
+        /// Lo trabajado por las filas del grupo («sin uso» si es cero).
+        worked: TimeDelta,
+    },
+    Row(Row),
+    /// Grupo en el que ningún agente se ha usado nunca: una línea que Enter
+    /// abre y cierra; abierto, le siguen sus filas.
+    Folded {
+        title: String,
+        total: usize,
+        n: usize,
+        open: bool,
+    },
+    /// Regla del ranking: cuántos agentes tienen trabajo en el periodo.
+    RankRule {
+        agents: usize,
+    },
+    /// Fila del ranking: el agente y su trabajo, ejecuciones y tokens dentro
+    /// del periodo. La barra y el orden siguen a `App::rank_key`.
+    Rank {
+        row: Row,
+        work: PeriodStats,
+    },
+    Blank,
+}
+
+impl Item {
+    /// Número de la línea si se puede seleccionar.
+    pub fn n(&self) -> Option<usize> {
+        match self {
+            Item::Row(r) | Item::Rank { row: r, .. } => Some(r.n),
+            Item::Folded { n, .. } | Item::Live { n, .. } => Some(*n),
+            _ => None,
+        }
+    }
+
+    /// El agente definido de la línea, si lo tiene: filas, filas del
+    /// ranking y bloques de activos de un agente definido.
+    fn row(&self) -> Option<&Row> {
+        match self {
+            Item::Row(r) | Item::Rank { row: r, .. } => Some(r),
+            Item::Live { row, .. } => row.as_ref(),
+            _ => None,
+        }
+    }
+}
+
+/// Una ficha de ejecución de la pila de vuelta, tal como se dejó: su última
+/// foto (se refresca al volver), el desplazamiento de los pasos y la hija
+/// elegida.
+struct RunBack {
+    detail: RunDetail,
+    steps_scroll: usize,
+    launched_sel: Option<usize>,
+}
+
+pub struct App {
+    pub minutes: i64,
+    pub home: PathBuf,
+    pub version: &'static str,
+    agents: Vec<Agent>,
+    calls: Vec<Invocation>,
+    /// Ejecuciones del último `Msg::Activity`, sin orden.
+    runs: Vec<Run>,
+    pub sessions: usize,
+    /// Ya llegó la primera lista de agentes.
+    pub loaded: bool,
+    /// Ya llegaron los agentes; `loaded` espera además la primera pasada del
+    /// historial, para no pintar a todos como «nunca» durante ese segundo.
+    agents_in: bool,
+    pub now: DateTime<Utc>,
+    /// Cuándo se abrió la pantalla: la espera de la carga cuenta desde aquí.
+    pub started: DateTime<Utc>,
+    /// Carpeta de las transcripciones (`~/.claude/projects`), la lectura que
+    /// la pantalla de carga nombra. Vacía si nadie la ha dado.
+    pub projects: PathBuf,
+    /// Zona de los días y las horas: `None` es la local; los tests fijan una.
+    pub tz: Option<FixedOffset>,
+    pub error: Option<String>,
+    /// Posición en las líneas seleccionables.
+    pub cursor: usize,
+    /// Primera línea de la lista que se pinta.
+    pub scroll: usize,
+    pub filter: String,
+    pub filtering: bool,
+    pub mode: Mode,
+    /// Orden dentro de los grupos de la lista.
+    pub order: Order,
+    /// Periodo del ranking.
+    pub period: Period,
+    /// Por qué se ordena el ranking y qué mide su barra (`s`).
+    pub rank_key: RankKey,
+    /// Grupos plegados que se han abierto con Enter.
+    open: HashSet<String>,
+    /// Ficha de agente abierta (la del agente bajo el cursor).
+    pub detail: bool,
+    /// Ficha de ejecución abierta: la última foto de la ejecución (`id` dentro).
+    /// Tiene prioridad sobre `detail`; se refresca con cada `Tick` y
+    /// `Msg::Activity` y, si la ejecución acaba o desaparece, se queda
+    /// abierta con `ended` (`RunDetail::refresh`).
+    pub run_detail: Option<RunDetail>,
+    /// Hija elegida en «launched» de la ficha de ejecución (índice en
+    /// `RunDetail::launched`): Tab/Shift-Tab o un dígito la eligen y Enter la
+    /// abre. `None` sin elegir; al abrir otra ficha vuelve a `None`.
+    pub launched_sel: Option<usize>,
+    /// Fichas de ejecución de las que se vino abriendo una hija o la madre
+    /// (`p`), la más reciente al final: Esc vuelve a la última.
+    run_back: Vec<RunBack>,
+    /// Pasos de la ficha de ejecución que se saltan por arriba, contando como
+    /// se pintan (`steps.len()` líneas). Se acota a `0..=len-1` y, al pintar,
+    /// a lo que cabe (`steps_window`).
+    pub steps_scroll: usize,
+    /// Alto de la lista de pasos en la última vuelta: lo que avanza una página.
+    steps_page: usize,
+    /// Alto del cuerpo en la última vuelta: lo que avanza una página.
+    page: usize,
+    /// Dígitos tecleados que aún pueden crecer con otro.
+    pending: Option<usize>,
+    pub quit: bool,
+    rescan: bool,
+}
+
+impl App {
+    pub fn new(minutes: i64, home: PathBuf, version: &'static str, now: DateTime<Utc>) -> Self {
+        Self {
+            minutes,
+            home,
+            version,
+            agents: Vec::new(),
+            calls: Vec::new(),
+            runs: Vec::new(),
+            sessions: 0,
+            loaded: false,
+            agents_in: false,
+            now,
+            started: now,
+            projects: PathBuf::new(),
+            tz: None,
+            error: None,
+            cursor: 0,
+            scroll: 0,
+            filter: String::new(),
+            filtering: false,
+            mode: Mode::Active,
+            order: Order::default(),
+            period: Period::default(),
+            rank_key: RankKey::default(),
+            open: HashSet::new(),
+            detail: false,
+            run_detail: None,
+            launched_sel: None,
+            run_back: Vec::new(),
+            steps_scroll: 0,
+            steps_page: 0,
+            page: 0,
+            pending: None,
+            quit: false,
+            rescan: false,
+        }
+    }
+
+    pub fn agent(&self, i: usize) -> &Agent {
+        &self.agents[i]
+    }
+
+    pub fn agent_count(&self) -> usize {
+        self.agents.len()
+    }
+
+    fn since(&self) -> DateTime<Utc> {
+        self.now - Duration::minutes(self.minutes)
+    }
+
+    fn section_of(&self, scope: &Scope) -> String {
+        match scope {
+            Scope::Global => "global".to_string(),
+            Scope::Project(dir) => report::shorten(dir, &self.home),
+        }
+    }
+
+    fn in_window(&self, at: DateTime<Utc>) -> bool {
+        at >= self.since()
+    }
+
+    /// Última vez de uso en todo el historial: llamada o ejecución.
+    fn ever_of(&self, agent: &Agent) -> Option<DateTime<Utc>> {
+        status::last_use(agent, &self.calls, &self.runs)
+    }
+
+    /// Última llamada si cae dentro de la ventana.
+    fn last_of(&self, agent: &Agent) -> Option<DateTime<Utc>> {
+        self.ever_of(agent).filter(|t| self.in_window(*t))
+    }
+
+    /// Trabajo del agente a fecha de ahora.
+    fn work_of(&self, agent: &Agent) -> Work {
+        status::work_of(agent, &self.runs, self.now)
+    }
+
+    /// Agentes activos ahora mismo (en curso o con una llamada en la ventana),
+    /// con o sin filtro.
+    #[cfg_attr(not(test), allow(dead_code))] // «todos» ya no cuenta activos (visual); lo usan los tests
+    pub fn active_count(&self) -> usize {
+        self.agents
+            .iter()
+            .filter(|a| self.last_of(a).is_some() || self.work_of(a).running.is_some())
+            .count()
+    }
+
+    /// La fila del agente `i`, sin numerar.
+    fn row_of(&self, i: usize) -> Row {
+        let a = &self.agents[i];
+        Row {
+            n: 0,
+            agent: i,
+            last: self.last_of(a),
+            ever: self.ever_of(a),
+            work: self.work_of(a),
+            history: in_zone!(self, tz => status::days_of(a, &self.runs, self.now, tz, MAX_DAYS)),
+            section: self.section_of(&a.scope),
+        }
+    }
+
+    /// El filtro encaja con el nombre o con el grupo.
+    fn matches(&self, row: &Row, needle: &str) -> bool {
+        needle.is_empty()
+            || self.agents[row.agent].name.to_lowercase().contains(needle)
+            || row.section.to_lowercase().contains(needle)
+    }
+
+    /// Las filas con agente de la vista abierta, en orden y con su número.
+    #[cfg_attr(not(test), allow(dead_code))] // las columnas salen de items() (visual); lo usan los tests
+    pub fn rows(&self) -> Vec<Row> {
+        self.items().iter().filter_map(Item::row).cloned().collect()
+    }
+
+    /// Cuántas líneas seleccionables hay: filas, grupos plegados y bloques de
+    /// activos.
+    pub fn count(&self) -> usize {
+        self.items().iter().filter_map(Item::n).max().unwrap_or(0)
+    }
+
+    /// Las líneas de la vista abierta: el monitor, la lista agrupada o el
+    /// ranking.
+    pub fn items(&self) -> Vec<Item> {
+        match self.mode {
+            Mode::Ranking => self.ranking_items(),
+            Mode::Active => self.monitor_items(),
+            Mode::All => self.list_items(),
+        }
+    }
+
+    /// Ejecuciones en curso ahora, de cualquier tipo y sin filtro: la
+    /// cabecera de activos (Σ `running` de los grupos).
+    pub fn live_count(&self) -> usize {
+        self.groups().iter().map(|g| g.running).sum()
+    }
+
+    /// Ejecuciones terminadas dentro de la ventana, sin filtro: la cabecera de
+    /// activos (Σ `recent` de los grupos).
+    pub fn recent_count(&self) -> usize {
+        self.groups().iter().map(|g| g.recent).sum()
+    }
+
+    /// Los grupos de activos tal como salen de `status::active_groups`, sin
+    /// filtro y ya en su orden final.
+    fn groups(&self) -> Vec<status::LiveGroup<'_>> {
+        status::active_groups(
+            &self.agents,
+            &self.calls,
+            &self.runs,
+            self.since(),
+            self.now,
+            &self.home,
+        )
+    }
+
+    /// Enter abre una ficha en la fila del cursor: la de la ejecución si es
+    /// un bloque de activos (en curso o terminado, de cualquier tipo, también
+    /// una llamada sin ejecución), o la del agente si la fila tiene uno
+    /// («todos», ranking). Desde activos la ficha del agente solo se abre con
+    /// `a` dentro de la ficha de la ejecución.
+    pub fn can_open(&self) -> bool {
+        match self.mode {
+            Mode::Active => self.live_at_cursor().is_some(),
+            _ => self.current().is_some(),
+        }
+    }
+
+    /// El bloque de activos bajo el cursor, si el cursor está en uno.
+    fn live_at_cursor(&self) -> Option<(NowLine, Option<Row>)> {
+        self.items().into_iter().find_map(|i| match i {
+            Item::Live { n, line, row } if n == self.cursor + 1 => Some((line, row)),
+            _ => None,
+        })
+    }
+
+    /// Los bloques de activos de la lista abierta (en curso y terminados), en el
+    /// orden agrupado: (número, línea, fila).
+    fn live_lines(&self) -> Vec<(usize, NowLine, Option<Row>)> {
+        self.items()
+            .into_iter()
+            .filter_map(|i| match i {
+                Item::Live { n, line, row } => Some((n, line, row)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Desde la ficha de ejecución se puede abrir la del agente: la ejecución
+    /// tiene `owner` y su bloque sigue en la lista (la ficha del agente es la
+    /// de la fila del cursor). El pie solo anuncia la tecla si es cierto.
+    pub fn can_open_agent(&self) -> bool {
+        self.run_detail.as_ref().is_some_and(|d| {
+            d.owner.is_some()
+                && self
+                    .live_line_of(&d.id)
+                    .is_some_and(|(_, _, row)| row.is_some())
+        })
+    }
+
+    /// Los ids de las ejecuciones de la fila que contiene `id`, de la más
+    /// reciente a la más antigua. Se calcula sobre los grupos sin filtrar:
+    /// la ficha no depende de lo que se teclease en `/`.
+    fn siblings(&self, id: &str) -> Vec<String> {
+        status::sibling_ids(&self.groups(), id)
+    }
+
+    /// El bloque de activos que contiene la ejecución `id`, sea o no la que
+    /// lo representa: (número, línea, fila).
+    fn live_line_of(&self, id: &str) -> Option<(usize, NowLine, Option<Row>)> {
+        let ids = self.siblings(id);
+        self.live_lines()
+            .into_iter()
+            .find(|(_, l, _)| l.id == id || ids.contains(&l.id))
+    }
+
+    /// Posición de la ejecución abierta entre las de su agente: (puesto
+    /// empezando en 1 por la más reciente, total). `None` si solo hay una o no
+    /// hay ficha de ejecución. Lo usa el pie (`←→ otra ejecución`) y la vista
+    /// para «ejecución 2/5».
+    pub fn run_nav(&self) -> Option<(usize, usize)> {
+        let d = self.run_detail.as_ref()?;
+        let ids = self.siblings(&d.id);
+        let pos = ids.iter().position(|i| *i == d.id)?;
+        (ids.len() > 1).then_some((pos + 1, ids.len()))
+    }
+
+    /// Lo de activos: por proyecto (`status::active_groups`, ya en su orden
+    /// final: los grupos por su actividad más reciente; dentro, primero las en
+    /// curso y luego las terminadas en la ventana), numerado de corrido por
+    /// todo. El filtro se aplica sobre las líneas antes de agrupar: nombre,
+    /// proyecto o encargo; los contadores `running`/`recent` del grupo se
+    /// rehacen con lo que queda y un grupo sin líneas no sale. Cada ejecución
+    /// es un bloque de tres líneas que cuenta como una fila; entre bloques, y
+    /// antes de la regla de cada grupo menos el primero, un `Item::Blank`
+    /// (que no es parte de ningún bloque para el scroll). Si su agente es
+    /// uno definido (`NowRun::owner`), lleva su fila para la ficha.
+    fn live_items(&self, needle: &str, n: &mut usize) -> Vec<Item> {
+        let keep = |r: &status::NowRun| {
+            let cwd = r.cwd.map(|c| report::shorten(c, &self.home));
+            contains(r.name, needle)
+                || cwd.is_some_and(|c| contains(&c, needle))
+                || r.task.is_some_and(|t| contains(t, needle))
+        };
+        let mut items = Vec::new();
+        for group in self.groups() {
+            let lines: Vec<status::NowRun> = group.lines.into_iter().filter(|r| keep(r)).collect();
+            if lines.is_empty() {
+                continue;
+            }
+            let running = lines
+                .iter()
+                .filter(|r| r.state == RunState::Running)
+                .count();
+            if items.is_empty() {
+                items.push(Item::Columns);
+            } else {
+                // aire antes de la regla de cada grupo menos el primero
+                items.push(Item::Blank);
+            }
+            items.push(Item::LiveGroup {
+                section: group.section,
+                running,
+                recent: lines.len() - running,
+            });
+            for (k, r) in lines.into_iter().enumerate() {
+                // una línea en blanco entre bloques, nunca tras el último
+                if k > 0 {
+                    items.push(Item::Blank);
+                }
+                *n += 1;
+                let row = r.owner.map(|i| Row {
+                    n: *n,
+                    ..self.row_of(i)
+                });
+                let line = NowLine {
+                    id: r.id.clone(),
+                    name: r.name.to_string(),
+                    cwd: r.cwd.map(Path::to_path_buf),
+                    since: r.since,
+                    worked: r.worked,
+                    tools: r.tools,
+                    kind: r.kind,
+                    task: r.task.map(String::from),
+                    last_tool: r.last_tool.map(String::from),
+                    state: r.state,
+                    runs: r.runs,
+                    tokens: r.tokens,
+                    context: r.context,
+                };
+                items.push(Item::Live {
+                    n: *n,
+                    line: line.clone(),
+                    row,
+                });
+                items.push(Item::LiveTask(line.clone()));
+                items.push(Item::LiveNow(line));
+            }
+        }
+        items
+    }
+
+    /// Activos, el monitor en directo: un grupo por proyecto con lo en curso y,
+    /// debajo, lo terminado en la ventana, numerado de corrido. Sin secciones
+    /// ni plegados. Si no hay nada y no se filtra, el último uso de cualquier
+    /// agente; si el filtro lo deja vacío, nada.
+    fn monitor_items(&self) -> Vec<Item> {
+        let needle = self.filter.to_lowercase();
+        let mut n = 0;
+        let mut items = self.live_items(&needle, &mut n);
+        if items.is_empty() && needle.is_empty() {
+            let last = status::last_use_overall(&self.agents, &self.calls, &self.runs).map(
+                |(agent, at)| LastUse {
+                    agent,
+                    section: self.section_of(&self.agents[agent].scope),
+                    at,
+                },
+            );
+            items.push(Item::Quiet { last });
+        }
+        items
+    }
+
+    /// La lista agrupada por proyecto y numerada de corrido.
+    ///
+    /// Grupos: primero los que tienen algo en curso, luego los que tienen algún
+    /// activo (el más reciente arriba), luego el resto por su última llamada de
+    /// siempre; a igualdad, global va detrás. Dentro del grupo, según `order`:
+    /// en curso, activos por su última llamada, inactivos por su última vez y
+    /// nunca usados por nombre; o por trabajado. Los grupos en los que ningún
+    /// agente se ha usado nunca van al final, plegados en una línea. Lo que
+    /// está en curso se ve solo con su ✦ en la fila.
+    fn list_items(&self) -> Vec<Item> {
+        let needle = self.filter.to_lowercase();
+        // Grupos con algún agente usado alguna vez, mirando todos sus agentes
+        // y no solo los que deja el filtro.
+        let used: HashSet<String> = self
+            .agents
+            .iter()
+            .filter(|a| status::ever_used(a, &self.calls, &self.runs))
+            .map(|a| self.section_of(&a.scope))
+            .collect();
+        let (mut shown, mut unused): (Vec<Row>, Vec<Row>) = (0..self.agents.len())
+            .map(|i| self.row_of(i))
+            .filter(|r| self.matches(r, &needle))
+            .partition(|r| used.contains(&r.section));
+        // De cada grupo: si tiene algo en curso, si tiene algún activo y su
+        // última llamada de siempre. Las tuplas ordenan campo a campo y `None`
+        // (nunca usado) queda por debajo de cualquier `Some`.
+        let mut groups: HashMap<String, (bool, bool, Option<DateTime<Utc>>)> = HashMap::new();
+        for r in &shown {
+            let g = groups.entry(r.section.clone()).or_default();
+            g.0 |= r.running();
+            g.1 |= r.active();
+            g.2 = g.2.max(r.ever);
+        }
+        let key = |r: &Row| (r.running(), r.active(), r.ever);
+        let name = |r: &Row| &self.agents[r.agent].name;
+        shown.sort_by(|a, b| {
+            groups
+                .get(&b.section)
+                .cmp(&groups.get(&a.section))
+                .then_with(|| (a.section == "global").cmp(&(b.section == "global")))
+                .then_with(|| a.section.cmp(&b.section))
+                .then_with(|| match self.order {
+                    Order::Recent => key(b).cmp(&key(a)),
+                    Order::Worked => b.work.total.cmp(&a.work.total),
+                })
+                .then_with(|| name(a).cmp(name(b)))
+        });
+        unused.sort_by(|a, b| {
+            (a.section == "global")
+                .cmp(&(b.section == "global"))
+                .then_with(|| a.section.cmp(&b.section))
+                .then_with(|| name(a).cmp(name(b)))
+        });
+
+        if shown.is_empty() && unused.is_empty() {
+            return Vec::new();
+        }
+        let mut items = vec![Item::Columns];
+        let mut n = 0;
+        for (k, group) in chunk_by_section(&mut shown).into_iter().enumerate() {
+            if k > 0 {
+                items.push(Item::Blank);
+            }
+            items.push(Item::Section {
+                title: group[0].section.clone(),
+                active: group.iter().filter(|r| r.active()).count(),
+                total: group.len(),
+                worked: status::total_worked(group.iter().map(|r| &r.work)),
+            });
+            for r in group {
+                n += 1;
+                r.n = n;
+                items.push(Item::Row(r.clone()));
+            }
+        }
+        if !shown.is_empty() && !unused.is_empty() {
+            items.push(Item::Blank);
+        }
+        let groups = chunk_by_section(&mut unused);
+        let last = groups.len().saturating_sub(1);
+        for (k, group) in groups.into_iter().enumerate() {
+            let title = group[0].section.clone();
+            let open = self.open.contains(&title);
+            n += 1;
+            items.push(Item::Folded {
+                title,
+                total: group.len(),
+                n,
+                open,
+            });
+            if open {
+                for r in group {
+                    n += 1;
+                    r.n = n;
+                    items.push(Item::Row(r.clone()));
+                }
+                if k < last {
+                    items.push(Item::Blank);
+                }
+            }
+        }
+        items
+    }
+
+    /// Trabajo, ejecuciones y tokens del agente `i` en el periodo del ranking.
+    fn period_stats(&self, i: usize) -> PeriodStats {
+        in_zone!(self, tz => status::stats_in(&self.agents[i], &self.runs, self.now, tz, self.period))
+    }
+
+    /// El ranking: los agentes con trabajo o alguna ejecución en el periodo
+    /// (una de 0 min también cuenta), de más a menos según `rank_key`, sin
+    /// grupos, con la regla delante. Vacío si no hay ninguno.
+    fn ranking_items(&self) -> Vec<Item> {
+        let needle = self.filter.to_lowercase();
+        let mut ranked: Vec<(Row, PeriodStats)> = (0..self.agents.len())
+            .map(|i| (i, self.period_stats(i)))
+            .filter(|(_, w)| w.worked > TimeDelta::zero() || w.runs > 0)
+            .map(|(i, w)| (self.row_of(i), w))
+            .filter(|(r, _)| self.matches(r, &needle))
+            .collect();
+        ranked.sort_by(|(ra, a), (rb, b)| {
+            self.rank_key
+                .cmp(a, b)
+                .then_with(|| self.agents[ra.agent].name.cmp(&self.agents[rb.agent].name))
+                .then_with(|| ra.section.cmp(&rb.section))
+        });
+        if ranked.is_empty() {
+            return Vec::new();
+        }
+        let mut items = vec![Item::RankRule {
+            agents: ranked.len(),
+        }];
+        for (k, (mut row, work)) in ranked.into_iter().enumerate() {
+            row.n = k + 1;
+            items.push(Item::Rank { row, work });
+        }
+        items
+    }
+
+    /// Suma del ranking que se ve: trabajado, ejecuciones y tokens en el
+    /// periodo.
+    pub fn ranking_total(&self) -> PeriodStats {
+        let mut total = PeriodStats::default();
+        if self.mode != Mode::Ranking {
+            return total;
+        }
+        for i in self.ranking_items() {
+            if let Item::Rank { work, .. } = i {
+                total += work;
+            }
+        }
+        total
+    }
+
+    /// Ejecuciones que solo siguen en el historial guardado porque Claude Code
+    /// ya borró su transcripción: «history kept: N runs…» del ranking.
+    pub fn cached_only(&self) -> usize {
+        status::cached_only(&self.runs)
+    }
+
+    /// Tokens de las filas de activos que se ven (con el filtro aplicado): la
+    /// cabecera de activos.
+    pub fn live_tokens(&self) -> u64 {
+        if self.filter.is_empty() {
+            return status::window_tokens(&self.groups());
+        }
+        self.items()
+            .iter()
+            .map(|i| match i {
+                Item::Live { line, .. } => line.tokens,
+                _ => 0,
+            })
+            .sum()
+    }
+
+    /// La fila bajo el cursor, si es un agente (no un grupo plegado).
+    pub fn current(&self) -> Option<Row> {
+        self.items()
+            .into_iter()
+            .find(|i| i.n() == Some(self.cursor + 1))
+            .and_then(|i| i.row().cloned())
+    }
+
+    /// El grupo plegado bajo el cursor, si lo es.
+    fn folded_at_cursor(&self) -> Option<String> {
+        self.items().into_iter().find_map(|i| match i {
+            Item::Folded { title, n, .. } if n == self.cursor + 1 => Some(title),
+            _ => None,
+        })
+    }
+
+    /// Llamadas del agente en todo el historial, la más reciente primero,
+    /// marcando las que caen dentro de la ventana y con la ejecución que
+    /// lanzaron si se enlazó (las antiguas, sin `id`, no enlazan).
+    #[cfg_attr(not(test), allow(dead_code))] // la ficha ya no lista llamadas (visual); lo usan los tests
+    pub fn calls_of(&self, agent: usize) -> Vec<Call<'_>> {
+        status::invocations_of(&self.agents[agent], &self.calls)
+            .into_iter()
+            .map(|c| Call {
+                at: c.at,
+                cwd: &c.cwd,
+                in_window: self.in_window(c.at),
+                run: status::run_of(c, &self.runs).map(|r| CallRun {
+                    worked: r.worked_until(self.now),
+                    tools: r.tools,
+                    description: r.description.as_deref(),
+                    in_progress: r.in_progress(self.now),
+                }),
+            })
+            .collect()
+    }
+
+    /// Todas las ejecuciones del agente para la ficha, también las de workflow
+    /// con su `agentType`, de la que empezó más tarde a la más antigua.
+    pub fn runs_of(&self, agent: usize) -> Vec<RunLine<'_>> {
+        let agent = &self.agents[agent];
+        let root = match &agent.scope {
+            Scope::Project(dir) => Some(dir.as_path()),
+            Scope::Global => None,
+        };
+        status::runs_of(agent, &self.runs)
+            .into_iter()
+            .map(|r| RunLine {
+                start: in_zone!(self, tz => r.start_local(tz).map(|s| s.naive_local())),
+                worked: r.worked_until(self.now),
+                tools: r.tools,
+                description: r.description.as_deref(),
+                cwd: r.cwd.as_deref().filter(|c| Some(*c) != root),
+                in_progress: r.in_progress(self.now),
+            })
+            .collect()
+    }
+
+    /// Llamadas antiguas del agente sin ejecución enlazada: «+ N llamadas
+    /// antiguas sin registro de duración».
+    pub fn old_calls(&self, agent: usize) -> usize {
+        status::calls_without_run(&self.agents[agent], &self.calls, &self.runs)
+    }
+
+    /// Líneas seleccionables de `items`, en el orden de su número.
+    fn row_lines(items: &[Item]) -> Vec<usize> {
+        items
+            .iter()
+            .enumerate()
+            .filter_map(|(l, i)| i.n().is_some().then_some(l))
+            .collect()
+    }
+
+    /// Primera línea que tiene que verse para que la fila de la línea `line`
+    /// se vea: todo lo de encima si es la primera (columnas, regla del
+    /// ranking, o la regla de grupo en activos) o su cabecera si es la primera de su sección.
+    fn row_top(items: &[Item], line: usize) -> usize {
+        if items[..line].iter().all(|i| i.n().is_none()) {
+            0
+        } else if line >= 1
+            && matches!(
+                items[line - 1],
+                Item::Section { .. } | Item::LiveGroup { .. }
+            )
+        {
+            line - 1
+        } else {
+            line
+        }
+    }
+
+    /// Última línea de la fila de la línea `line`: la tercera de un bloque de
+    /// activos, o ella misma.
+    fn row_end(items: &[Item], line: usize) -> usize {
+        let mut end = line;
+        while matches!(
+            items.get(end + 1),
+            Some(Item::LiveTask(_) | Item::LiveNow(_))
+        ) {
+            end += 1;
+        }
+        end
+    }
+
+    /// Mueve la vista `delta` líneas y arrastra el cursor si se queda fuera.
+    fn scroll_by(&mut self, delta: i64) {
+        let items = self.items();
+        let page = self.page.max(1);
+        let max = items.len().saturating_sub(page) as i64;
+        self.scroll = (self.scroll as i64 + delta).clamp(0, max.max(0)) as usize;
+        let lines = Self::row_lines(&items);
+        let Some(&line) = lines.get(self.cursor) else {
+            return;
+        };
+        let (top, bottom) = (self.scroll, self.scroll + page);
+        // Fila que se ve entera, cabecera incluida: así repintar no mueve la vista.
+        let fits = |l: usize| Self::row_top(&items, l) >= top && Self::row_end(&items, l) < bottom;
+        if Self::row_top(&items, line) < top {
+            if let Some(i) = lines.iter().position(|&l| fits(l)) {
+                self.cursor = i;
+            }
+        } else if Self::row_end(&items, line) >= bottom {
+            if let Some(i) = lines.iter().rposition(|&l| fits(l)) {
+                self.cursor = i;
+            }
+        }
+    }
+
+    /// Una página arriba (`dir < 0`) o abajo: la vista y el cursor avanzan el
+    /// alto del cuerpo; en los extremos, el cursor va a la primera o la última.
+    fn page_by(&mut self, dir: i64) {
+        let items = self.items();
+        let lines = Self::row_lines(&items);
+        let Some(&line) = lines.get(self.cursor) else {
+            return;
+        };
+        let page = self.page.max(1);
+        self.cursor = if dir > 0 {
+            let target = line + page;
+            lines
+                .iter()
+                .position(|&l| l >= target)
+                .unwrap_or(lines.len() - 1)
+        } else {
+            let target = line.saturating_sub(page);
+            lines.iter().rposition(|&l| l <= target).unwrap_or(0)
+        };
+        self.scroll_by(dir * page as i64);
+    }
+
+    /// Mueve `scroll` lo justo para que la línea del cursor quede a la vista.
+    /// Guarda además `height` como alto de página para la rueda y las páginas.
+    pub fn scroll_to_cursor(&mut self, items: &[Item], height: usize) {
+        self.page = height;
+        let Some(line) = items.iter().position(|i| i.n() == Some(self.cursor + 1)) else {
+            self.scroll = 0;
+            return;
+        };
+        // La cabecera de la sección acompaña a su primera fila, y las demás
+        // líneas de un bloque en curso, a la primera.
+        let top = Self::row_top(items, line);
+        let end = Self::row_end(items, line);
+        if top < self.scroll {
+            self.scroll = top;
+        } else if height > 0 && end >= self.scroll + height {
+            self.scroll = end + 1 - height;
+        }
+        self.scroll = self.scroll.min(items.len().saturating_sub(height));
+    }
+
+    /// En la ficha, ↑↓ pasan al agente anterior o siguiente de la vista
+    /// abierta, saltando los grupos plegados y, en activos, las filas en
+    /// curso sin agente definido; en los extremos no se mueve.
+    fn step_agent(&mut self, dir: i64) {
+        let agents: Vec<usize> = self
+            .items()
+            .iter()
+            .filter_map(|i| i.row().map(|r| r.n - 1))
+            .collect();
+        let next = if dir > 0 {
+            agents.iter().find(|&&c| c > self.cursor)
+        } else {
+            agents.iter().rev().find(|&&c| c < self.cursor)
+        };
+        if let Some(&c) = next {
+            self.cursor = c;
+        }
+    }
+
+    /// Abre la ficha de la ejecución `id` con su última lectura, en lugar de
+    /// la abierta y sin tocar la pila de vuelta; si no está en disco no hace
+    /// nada. Devuelve si la abrió.
+    fn open_run(&mut self, id: &str) -> bool {
+        let Some(d) = status::activity_detail(&self.agents, &self.calls, &self.runs, id, self.now)
+        else {
+            return false;
+        };
+        self.run_detail = Some(d);
+        self.steps_scroll = 0;
+        self.launched_sel = None;
+        true
+    }
+
+    /// Abre la ficha de `id` (una hija o la madre) guardando la abierta en la
+    /// pila de vuelta, para que Esc regrese a ella tal como estaba.
+    fn push_run(&mut self, id: &str) {
+        let Some(here) = self.run_detail.clone() else {
+            return;
+        };
+        let back = RunBack {
+            detail: here,
+            steps_scroll: self.steps_scroll,
+            launched_sel: self.launched_sel,
+        };
+        if self.open_run(id) {
+            self.run_back.push(back);
+        }
+    }
+
+    /// Esc (o Enter sin hija elegida): vuelve a la ficha de la que se vino,
+    /// puesta al día, o, si no hay, cierra la ficha.
+    fn back_run(&mut self) {
+        let Some(b) = self.run_back.pop() else {
+            self.close_run();
+            return;
+        };
+        self.run_detail = Some(b.detail);
+        self.steps_scroll = b.steps_scroll;
+        self.launched_sel = b.launched_sel;
+        self.refresh_run();
+    }
+
+    /// Hay una ficha de ejecución a la que Esc vuelve (el pie dice «back»
+    /// en lugar de cerrar).
+    #[cfg_attr(not(test), allow(dead_code))] // hasta que visual lo pinte
+    pub fn can_go_back(&self) -> bool {
+        self.run_detail.is_some() && !self.run_back.is_empty()
+    }
+
+    /// La ficha abierta la lanzó otra ejecución que sigue en los datos: `p`
+    /// abre su ficha. El pie solo anuncia `p parent` si es cierto.
+    pub fn can_open_parent(&self) -> bool {
+        self.parent_id().is_some()
+    }
+
+    fn parent_id(&self) -> Option<String> {
+        match self.run_detail.as_ref()?.launched_by.as_ref()? {
+            LaunchedBy::Run(link) => Some(link.id.clone()),
+            LaunchedBy::Session { .. } | LaunchedBy::GoneRun { .. } => None,
+        }
+    }
+
+    /// Cuántas hijas tiene la ficha abierta en «launched».
+    fn launched_len(&self) -> usize {
+        self.run_detail.as_ref().map_or(0, |d| d.launched.len())
+    }
+
+    /// Tab (`dir > 0`) y Shift-Tab: la hija siguiente o anterior de
+    /// «launched». Sin elegida, Tab va a la primera y Shift-Tab a la última;
+    /// pasada la última (o antes de la primera) no queda ninguna elegida.
+    fn step_launched(&mut self, dir: i64) {
+        let len = self.launched_len();
+        if len == 0 {
+            return;
+        }
+        self.launched_sel = match (self.launched_sel, dir > 0) {
+            (None, true) => Some(0),
+            (None, false) => Some(len - 1),
+            (Some(i), true) => (i + 1 < len).then_some(i + 1),
+            (Some(i), false) => i.checked_sub(1),
+        };
+    }
+
+    /// Enter con una hija elegida: abre su ficha (Esc vuelve aquí).
+    fn open_launched(&mut self) {
+        let id = self
+            .run_detail
+            .as_ref()
+            .zip(self.launched_sel)
+            .and_then(|(d, i)| d.launched.get(i))
+            .map(|l| l.id.clone());
+        if let Some(id) = id {
+            self.push_run(&id);
+        }
+    }
+
+    /// Un dígito tecleado sobre una lista de `total` líneas numeradas desde 1:
+    /// el número que forman con los anteriores si cae en rango. Deja en
+    /// `pending` lo tecleado si otro dígito aún podría formar uno válido.
+    fn type_digit(&mut self, d: usize, total: usize) -> Option<usize> {
+        let n = self.pending.unwrap_or(0) * 10 + d;
+        self.pending = (n * 10 <= total).then_some(n);
+        (1..=total).contains(&n).then_some(n)
+    }
+
+    /// En la ficha de ejecución, ↑↓ pasan a la anterior o siguiente bloque
+    /// (en curso o terminado) en el orden agrupado de la lista; en los extremos no se mueve.
+    /// Si la abierta ya no está en la lista (acabó), se parte de su cursor.
+    fn step_run(&mut self, dir: i64) {
+        let lines = self.live_lines();
+        let here = self.run_detail.as_ref().and_then(|d| {
+            let n = self.live_line_of(&d.id)?.0;
+            lines.iter().position(|(m, _, _)| *m == n)
+        });
+        let next = match (here, dir > 0) {
+            (Some(i), true) => lines.get(i + 1),
+            (Some(i), false) => i.checked_sub(1).and_then(|i| lines.get(i)),
+            (None, true) => lines.iter().find(|(n, _, _)| *n > self.cursor + 1),
+            (None, false) => lines.iter().rev().find(|(n, _, _)| *n < self.cursor + 1),
+        };
+        if let Some((n, line, _)) = next {
+            let (n, id) = (*n, line.id.clone());
+            self.cursor = n - 1;
+            // de vuelta a recorrer la lista: lo abierto antes ya no es «atrás»
+            self.run_back.clear();
+            self.open_run(&id);
+        }
+    }
+
+    /// Cierra la ficha de ejecución y deja el cursor en esa ejecución si
+    /// sigue en la lista.
+    fn close_run(&mut self) {
+        if let Some(d) = self.run_detail.take() {
+            if let Some((n, _, _)) = self.live_line_of(&d.id) {
+                self.cursor = n - 1;
+            }
+        }
+        self.steps_scroll = 0;
+        self.launched_sel = None;
+        self.run_back.clear();
+    }
+
+    /// En la ficha, ← y → pasan a la ejecución anterior (más antigua) o
+    /// siguiente (más reciente) del mismo agente; en los extremos, o sin
+    /// hermanas, no hacen nada. El cursor no se mueve: sigue en la fila.
+    fn step_sibling(&mut self, dir: i64) {
+        let Some(d) = &self.run_detail else { return };
+        let ids = self.siblings(&d.id);
+        let Some(pos) = ids.iter().position(|i| *i == d.id) else {
+            return;
+        };
+        // ids va de la más reciente a la más antigua: → resta, ← suma.
+        let next = if dir > 0 {
+            pos.checked_sub(1)
+        } else {
+            Some(pos + 1)
+        };
+        if let Some(id) = next.and_then(|i| ids.get(i)) {
+            let id = id.clone();
+            self.open_run(&id);
+        }
+    }
+
+    /// Tope de `steps_scroll`: el último paso, o lo que deja una última
+    /// página llena si ya se conoce el alto.
+    fn steps_max(&self) -> usize {
+        let len = self.run_detail.as_ref().map_or(0, |d| d.steps.len());
+        len.saturating_sub(self.steps_page.max(1))
+    }
+
+    /// Desplaza la lista de pasos `delta` líneas (negativo, hacia arriba),
+    /// acotado a `0..=steps_max`.
+    fn scroll_steps(&mut self, delta: i64) {
+        let max = self.steps_max() as i64;
+        self.steps_scroll = (self.steps_scroll as i64 + delta).clamp(0, max) as usize;
+    }
+
+    /// Para la vista: guarda `height` (líneas de pasos que caben) como alto
+    /// de página, acota `steps_scroll` a lo que deja la última página llena y
+    /// devuelve el offset a pintar.
+    pub fn steps_window(&mut self, height: usize) -> usize {
+        self.steps_page = height;
+        self.steps_scroll = self.steps_scroll.min(self.steps_max());
+        self.steps_scroll
+    }
+
+    /// Pone al día la ficha de ejecución abierta con las ejecuciones actuales.
+    fn refresh_run(&mut self) {
+        if let Some(d) = &mut self.run_detail {
+            d.refresh(status::activity_detail(
+                &self.agents,
+                &self.calls,
+                &self.runs,
+                &d.id,
+                self.now,
+            ));
+        }
+    }
+
+    /// Teclas de la ficha de ejecución. Se come todo lo que no es suyo (el
+    /// filtro, la pestaña…): la lista de fondo no cambia mientras se mira.
+    fn run_key(&mut self, k: KeyEvent) {
+        let page = self.steps_page.max(1) as i64;
+        if let Some(d) = match k.code {
+            KeyCode::Char(c) => c.to_digit(10),
+            _ => None,
+        } {
+            let total = self.launched_len();
+            if let Some(n) = self.type_digit(d as usize, total) {
+                self.launched_sel = Some(n - 1);
+            }
+            return;
+        }
+        self.pending = None;
+        match k.code {
+            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Enter if self.launched_sel.is_some() => self.open_launched(),
+            KeyCode::Esc | KeyCode::Enter => self.back_run(),
+            KeyCode::Tab => self.step_launched(1),
+            KeyCode::BackTab => self.step_launched(-1),
+            KeyCode::Char('p') => {
+                if let Some(id) = self.parent_id() {
+                    self.push_run(&id);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => self.step_run(1),
+            KeyCode::Up | KeyCode::Char('k') => self.step_run(-1),
+            KeyCode::Left | KeyCode::Char('h') => self.step_sibling(-1),
+            KeyCode::Right | KeyCode::Char('l') => self.step_sibling(1),
+            KeyCode::PageDown | KeyCode::Char(' ') => self.scroll_steps(page),
+            KeyCode::PageUp => self.scroll_steps(-page),
+            KeyCode::Home | KeyCode::Char('g') => self.steps_scroll = 0,
+            KeyCode::End | KeyCode::Char('G') => self.steps_scroll = self.steps_max(),
+            KeyCode::Char('a') if self.can_open_agent() => {
+                self.close_run();
+                self.detail = true;
+            }
+            _ => {}
+        }
+    }
+
+    pub fn take_rescan(&mut self) -> bool {
+        std::mem::take(&mut self.rescan)
+    }
+
+    pub fn update(&mut self, action: Action) {
+        match action {
+            Action::Tick(now) => {
+                self.now = now;
+                self.refresh_run();
+            }
+            Action::Msg(Msg::Agents(agents)) => {
+                self.agents = agents;
+                self.agents_in = true;
+                self.error = None;
+            }
+            Action::Msg(Msg::Activity {
+                calls,
+                runs,
+                sessions,
+            }) => {
+                self.calls = calls;
+                self.runs = runs;
+                self.sessions = sessions;
+                self.loaded = self.agents_in;
+                self.error = None;
+                self.refresh_run();
+            }
+            Action::Msg(Msg::Error(e)) => self.error = Some(e),
+            Action::Key(k) => self.key(k),
+            // En la ficha no hay lista que mover.
+            Action::Scroll(_) if self.detail || self.run_detail.is_some() => {}
+            Action::Scroll(delta) => self.scroll_by(delta.into()),
+        }
+        self.clamp();
+    }
+
+    fn clamp(&mut self) {
+        let n = self.count();
+        self.cursor = self.cursor.min(n.saturating_sub(1));
+        if self.detail && self.current().is_none() {
+            self.detail = false;
+        }
+        let launched = self.launched_len();
+        self.launched_sel = self
+            .launched_sel
+            .filter(|_| launched > 0)
+            .map(|i| i.min(launched - 1));
+        self.steps_scroll = self.steps_scroll.min(self.steps_max());
+    }
+
+    fn key(&mut self, k: KeyEvent) {
+        if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
+            self.quit = true;
+            return;
+        }
+        if self.run_detail.is_some() {
+            self.run_key(k);
+            return;
+        }
+        if self.filtering {
+            match k.code {
+                KeyCode::Char(c) => self.filter.push(c),
+                KeyCode::Backspace => {
+                    self.filter.pop();
+                }
+                KeyCode::Enter => self.filtering = false,
+                KeyCode::Esc => {
+                    self.filter.clear();
+                    self.filtering = false;
+                }
+                _ => {}
+            }
+            return;
+        }
+        let total = self.count();
+        let digit = match k.code {
+            KeyCode::Char(c) => c.to_digit(10).map(|d| d as usize),
+            _ => None,
+        };
+        match k.code {
+            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Esc if self.detail => self.detail = false,
+            KeyCode::Enter if self.detail => self.detail = false,
+            KeyCode::Enter => {
+                if let Some(title) = self.folded_at_cursor() {
+                    if !self.open.remove(&title) {
+                        self.open.insert(title);
+                    }
+                } else if let Some((line, _)) = self.live_at_cursor() {
+                    self.open_run(&line.id);
+                } else if self.current().is_some() {
+                    self.detail = true;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') if self.detail => self.step_agent(1),
+            KeyCode::Up | KeyCode::Char('k') if self.detail => self.step_agent(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.cursor += 1,
+            KeyCode::Up | KeyCode::Char('k') => self.cursor = self.cursor.saturating_sub(1),
+            KeyCode::Home | KeyCode::Char('g') => self.cursor = 0,
+            KeyCode::End | KeyCode::Char('G') => self.cursor = total.saturating_sub(1),
+            KeyCode::Char('/') => self.filtering = true,
+            KeyCode::Tab => self.mode = self.mode.next(),
+            KeyCode::Char('a') => self.mode = self.mode.toggle(),
+            KeyCode::Char('o') if self.mode == Mode::All => self.order = self.order.toggle(),
+            KeyCode::Char('p') if self.mode == Mode::Ranking => self.period = self.period.next(),
+            KeyCode::Char('s') if self.mode == Mode::Ranking => {
+                self.rank_key = self.rank_key.next()
+            }
+            KeyCode::PageDown | KeyCode::Char(' ') => self.page_by(1),
+            KeyCode::PageUp => self.page_by(-1),
+            KeyCode::Char('r') => self.rescan = true,
+            KeyCode::Char(_) if digit.is_some() => {
+                // Si otro dígito aún podría formar un número válido, se espera.
+                if let Some(n) = self.type_digit(digit.unwrap_or(0), total) {
+                    self.cursor = n - 1;
+                }
+                return;
+            }
+            _ => {}
+        }
+        self.pending = None;
+    }
+}
+
+/// `haystack` contiene `needle` (ya en minúsculas) sin mirar mayúsculas.
+fn contains(haystack: &str, needle: &str) -> bool {
+    haystack.to_lowercase().contains(needle)
+}
+
+/// Parte filas ya ordenadas por grupo en un trozo por grupo seguido.
+fn chunk_by_section(rows: &mut [Row]) -> Vec<&mut [Row]> {
+    let mut out = Vec::new();
+    let mut rest = rows;
+    while !rest.is_empty() {
+        let len = rest
+            .iter()
+            .position(|r| r.section != rest[0].section)
+            .unwrap_or(rest.len());
+        let (head, tail) = std::mem::take(&mut rest).split_at_mut(len);
+        out.push(head);
+        rest = tail;
+    }
+    out
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::agents::Scope;
+    use chrono::DurationRound;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::path::Path;
+
+    const NOW: &str = "2026-11-05T12:00:00Z";
+
+    fn agent(name: &str, dir: Option<&str>) -> Agent {
+        let (scope, path) = match dir {
+            Some(d) => (
+                Scope::Project(PathBuf::from(d)),
+                format!("{d}/.claude/agents/{name}.md"),
+            ),
+            None => (Scope::Global, format!("/Users/x/.claude/agents/{name}.md")),
+        };
+        Agent {
+            name: name.into(),
+            path: PathBuf::from(path),
+            scope,
+            description: Some(format!("Agente {name}")),
+        }
+    }
+
+    pub(crate) fn call(agent: &str, cwd: &str, at: &str) -> Invocation {
+        Invocation {
+            agent: agent.into(),
+            cwd: PathBuf::from(cwd),
+            at: at.parse().unwrap(),
+            id: None,
+            description: None,
+            prompt_line: None,
+        }
+    }
+
+    /// Dos proyectos y un global; `backend` tiene una llamada fuera de la ventana.
+    /// Actividad más reciente: taskflow (hace 5 s), global (15 s), station (2 min).
+    pub(crate) fn fixture() -> App {
+        let mut app = App::new(10, PathBuf::from("/Users/x"), "0.1.0", NOW.parse().unwrap());
+        app.mode = Mode::All; // los tests de la lista asumen la vista «todos»
+        app.tz = Some(utc());
+        app.update(Action::Msg(Msg::Agents(vec![
+            agent("backend", Some("/Users/x/Offing/argi/station")),
+            agent("docs", Some("/Users/x/Offing/argi/station")),
+            agent("frontend", Some("/Users/x/Offing/argi/station")),
+            agent("visual", Some("/Users/x/Offing/taskflow")),
+            agent("react-structure-checker", None),
+        ])));
+        app.update(Action::Msg(Msg::Activity {
+            calls: vec![
+                call(
+                    "frontend",
+                    "/Users/x/Offing/argi/station",
+                    "2026-11-05T11:58:00Z",
+                ),
+                call(
+                    "docs",
+                    "/Users/x/Offing/argi/station/front",
+                    "2026-11-05T11:52:00Z",
+                ),
+                call(
+                    "backend",
+                    "/Users/x/Offing/argi/station",
+                    "2026-11-05T11:30:00Z",
+                ),
+                call("visual", "/Users/x/Offing/taskflow", "2026-11-05T11:59:55Z"),
+                call(
+                    "react-structure-checker",
+                    "/Users/x/Offing/taskflow",
+                    "2026-11-05T11:59:45Z",
+                ),
+            ],
+            runs: vec![],
+            sessions: 4,
+        }));
+        app
+    }
+
+    /// `n` agentes globales, todos con una llamada antigua a la misma hora: un
+    /// solo grupo, sin plegar, ordenado por nombre.
+    fn many(n: usize) -> App {
+        let mut app = App::new(10, PathBuf::from("/Users/x"), "0.1.0", NOW.parse().unwrap());
+        app.mode = Mode::All; // estos tests asumen la vista «todos»
+        app.tz = Some(utc());
+        app.update(Action::Msg(Msg::Agents(
+            (0..n).map(|i| agent(&format!("a{i:02}"), None)).collect(),
+        )));
+        app.update(Action::Msg(Msg::Activity {
+            calls: (0..n)
+                .map(|i| call(&format!("a{i:02}"), "/Users/x/p", "2026-10-01T10:00:00Z"))
+                .collect(),
+            runs: vec![],
+            sessions: 0,
+        }));
+        app
+    }
+
+    pub(crate) fn utc() -> FixedOffset {
+        FixedOffset::east_opt(0).unwrap()
+    }
+
+    fn key(app: &mut App, code: KeyCode) {
+        app.update(Action::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+    }
+
+    fn names(app: &App) -> Vec<String> {
+        app.rows()
+            .iter()
+            .map(|r| app.agent(r.agent).name.clone())
+            .collect()
+    }
+
+    fn sections(app: &App) -> Vec<(String, usize, usize)> {
+        app.items()
+            .iter()
+            .filter_map(|i| match i {
+                Item::Section {
+                    title,
+                    active,
+                    total,
+                    ..
+                } => Some((title.clone(), *active, *total)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn row_named(app: &App, name: &str) -> Row {
+        app.rows()
+            .into_iter()
+            .find(|r| app.agent(r.agent).name == name)
+            .unwrap()
+    }
+
+    #[test]
+    fn groups_with_activity_go_first_most_recent_on_top() {
+        assert_eq!(
+            sections(&fixture()),
+            vec![
+                ("~/Offing/taskflow".to_string(), 1, 1),
+                ("global".to_string(), 1, 1),
+                ("~/Offing/argi/station".to_string(), 2, 3),
+            ]
+        );
+    }
+
+    #[test]
+    fn groups_never_used_go_folded_by_name_with_global_last() {
+        let mut app = fixture();
+        app.update(Action::Msg(Msg::Activity {
+            calls: vec![],
+            runs: vec![],
+            sessions: 0,
+        }));
+        assert!(sections(&app).is_empty());
+        let titles: Vec<String> = folded(&app).into_iter().map(|f| f.0).collect();
+        assert_eq!(
+            titles,
+            vec!["~/Offing/argi/station", "~/Offing/taskflow", "global"]
+        );
+    }
+
+    #[test]
+    fn rows_put_active_first_by_recency_then_name() {
+        assert_eq!(
+            names(&fixture()),
+            vec![
+                "visual",
+                "react-structure-checker",
+                "frontend",
+                "docs",
+                "backend"
+            ]
+        );
+    }
+
+    #[test]
+    fn rows_are_numbered_across_sections() {
+        let app = fixture();
+        let last = app.rows().pop().unwrap();
+        assert_eq!(last.n, 5);
+        assert_eq!(app.agent(last.agent).name, "backend");
+    }
+
+    #[test]
+    fn calls_older_than_the_window_do_not_count() {
+        let app = fixture();
+        assert!(
+            row_named(&app, "frontend").active(),
+            "frontend tuvo una llamada hace 2 min"
+        );
+        assert!(
+            !row_named(&app, "backend").active(),
+            "backend solo tiene una de hace 30 min"
+        );
+        assert_eq!(app.active_count(), 4);
+    }
+
+    #[test]
+    fn cursor_moves_and_clamps() {
+        let mut app = fixture();
+        for _ in 0..6 {
+            key(&mut app, KeyCode::Down);
+        }
+        assert_eq!(app.cursor, 4);
+        for _ in 0..9 {
+            key(&mut app, KeyCode::Char('k'));
+        }
+        assert_eq!(app.cursor, 0);
+        key(&mut app, KeyCode::End);
+        assert_eq!(app.cursor, 4);
+    }
+
+    #[test]
+    fn digits_jump_to_the_row() {
+        let mut app = fixture();
+        key(&mut app, KeyCode::Char('4'));
+        assert_eq!(app.cursor, 3);
+        let mut app = many(12);
+        key(&mut app, KeyCode::Char('1'));
+        key(&mut app, KeyCode::Char('2'));
+        assert_eq!(app.cursor, 11, "dos dígitos seguidos forman el 12");
+        key(&mut app, KeyCode::Char('3'));
+        assert_eq!(
+            app.cursor, 2,
+            "el buffer se vació al no caber un tercer dígito"
+        );
+    }
+
+    #[test]
+    fn active_mode_hides_inactive_rows_and_keeps_cursor_valid() {
+        let mut app = fixture();
+        key(&mut app, KeyCode::End);
+        key(&mut app, KeyCode::Char('a'));
+        assert_eq!(
+            names(&app),
+            vec!["visual", "react-structure-checker", "frontend", "docs"]
+        );
+        assert_eq!(app.cursor, 3);
+        key(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.rows().len(), 5);
+    }
+
+    #[test]
+    fn filter_matches_name_or_project_and_esc_clears_it() {
+        let mut app = fixture();
+        key(&mut app, KeyCode::Char('/'));
+        for c in "task".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        assert!(app.filtering);
+        assert_eq!(names(&app), vec!["visual"]);
+        key(&mut app, KeyCode::Enter);
+        assert!(
+            !app.filtering,
+            "enter deja de editar pero conserva el filtro"
+        );
+        assert_eq!(app.filter, "task");
+        key(&mut app, KeyCode::Char('/'));
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(app.filter, "");
+        assert_eq!(app.rows().len(), 5);
+    }
+
+    #[test]
+    fn a_new_app_opens_on_the_active_view_with_a_clean_state() {
+        let app = App::new(10, PathBuf::from("/Users/x"), "0.1.0", NOW.parse().unwrap());
+        assert_eq!(app.mode, Mode::Active);
+        assert_eq!((app.cursor, app.scroll), (0, 0));
+        assert!(app.filter.is_empty() && !app.filtering && !app.detail);
+    }
+
+    #[test]
+    fn while_filtering_letters_go_to_the_filter() {
+        let mut app = fixture();
+        key(&mut app, KeyCode::Char('/'));
+        key(&mut app, KeyCode::Char('a'));
+        key(&mut app, KeyCode::Char('q'));
+        assert_eq!(app.filter, "aq");
+        assert_eq!(app.mode, Mode::All);
+        assert!(!app.quit);
+        key(&mut app, KeyCode::Backspace);
+        assert_eq!(app.filter, "a");
+    }
+
+    #[test]
+    fn enter_opens_the_detail_and_esc_closes_it() {
+        let mut app = fixture();
+        key(&mut app, KeyCode::Enter);
+        assert!(app.detail);
+        assert_eq!(app.agent(app.current().unwrap().agent).name, "visual");
+        key(&mut app, KeyCode::Esc);
+        assert!(!app.detail);
+    }
+
+    #[test]
+    fn arrows_in_the_detail_move_to_the_next_agent() {
+        let mut app = fixture();
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Down);
+        assert!(app.detail, "la ficha sigue abierta");
+        assert_eq!(
+            app.agent(app.current().unwrap().agent).name,
+            "react-structure-checker"
+        );
+    }
+
+    #[test]
+    fn q_and_ctrl_c_quit() {
+        let mut app = fixture();
+        key(&mut app, KeyCode::Char('q'));
+        assert!(app.quit);
+        let mut app = fixture();
+        app.update(Action::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn activity_message_replaces_the_calls() {
+        let mut app = fixture();
+        app.update(Action::Msg(Msg::Activity {
+            calls: vec![],
+            runs: vec![],
+            sessions: 1,
+        }));
+        assert_eq!(app.active_count(), 0);
+        assert_eq!(app.sessions, 1);
+    }
+
+    #[test]
+    fn r_requests_a_rescan_once() {
+        let mut app = fixture();
+        assert!(!app.take_rescan());
+        key(&mut app, KeyCode::Char('r'));
+        assert!(app.take_rescan());
+        assert!(!app.take_rescan());
+    }
+
+    #[test]
+    fn calls_of_the_current_agent_are_listed_for_the_detail() {
+        let app = fixture();
+        let row = app.current().unwrap();
+        let calls = app.calls_of(row.agent);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].cwd, Path::new("/Users/x/Offing/taskflow"));
+        assert!(calls[0].in_window);
+    }
+
+    #[test]
+    fn calls_of_cover_the_whole_history_and_mark_the_window() {
+        let mut app = fixture();
+        app.update(Action::Msg(Msg::Activity {
+            calls: vec![
+                call(
+                    "docs",
+                    "/Users/x/Offing/argi/station",
+                    "2026-10-01T08:00:00Z",
+                ),
+                call(
+                    "docs",
+                    "/Users/x/Offing/argi/station",
+                    "2026-11-05T11:55:00Z",
+                ),
+                call(
+                    "docs",
+                    "/Users/x/Offing/argi/station",
+                    "2026-11-04T08:00:00Z",
+                ),
+                call("docs", "/Users/x/Offing/otro", "2026-11-05T11:59:00Z"),
+            ],
+            runs: vec![],
+            sessions: 1,
+        }));
+        let docs = row_named(&app, "docs").agent;
+        let got: Vec<(String, bool)> = app
+            .calls_of(docs)
+            .iter()
+            .map(|c| (c.at.to_rfc3339(), c.in_window))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("2026-11-05T11:55:00+00:00".to_string(), true),
+                ("2026-11-04T08:00:00+00:00".to_string(), false),
+                ("2026-10-01T08:00:00+00:00".to_string(), false),
+            ],
+            "la más reciente primero; la de otro proyecto no cuenta"
+        );
+    }
+
+    #[test]
+    fn rows_know_the_last_call_ever_besides_the_window() {
+        let app = fixture();
+        let backend = row_named(&app, "backend");
+        assert!(!backend.active());
+        assert_eq!(backend.last, None);
+        assert_eq!(backend.ever, Some("2026-11-05T11:30:00Z".parse().unwrap()));
+        let visual = row_named(&app, "visual");
+        assert_eq!(visual.last, visual.ever);
+    }
+
+    /// Un grupo activo, dos con llamadas antiguas, uno nunca usado y global
+    /// nunca usado: el orden de «todos» y el de dentro de cada grupo.
+    fn history() -> App {
+        let mut app = App::new(10, PathBuf::from("/Users/x"), "0.1.0", NOW.parse().unwrap());
+        app.mode = Mode::All; // estos tests asumen la vista «todos»
+        app.tz = Some(utc());
+        app.update(Action::Msg(Msg::Agents(vec![
+            agent("zeta", Some("/Users/x/a-viejo")),
+            agent("uno", Some("/Users/x/b-ayer")),
+            agent("dos", Some("/Users/x/b-ayer")),
+            agent("tres", Some("/Users/x/b-ayer")),
+            agent("cuatro", Some("/Users/x/b-ayer")),
+            agent("nada", Some("/Users/x/c-nunca")),
+            agent("ahora", Some("/Users/x/d-ahora")),
+            agent("suelto", None),
+        ])));
+        app.update(Action::Msg(Msg::Activity {
+            calls: vec![
+                call("zeta", "/Users/x/a-viejo", "2026-09-01T10:00:00Z"),
+                call("uno", "/Users/x/b-ayer", "2026-11-04T10:00:00Z"),
+                call("dos", "/Users/x/b-ayer", "2026-11-04T12:00:00Z"),
+                call("ahora", "/Users/x/d-ahora", "2026-11-05T11:59:00Z"),
+            ],
+            runs: vec![],
+            sessions: 0,
+        }));
+        app
+    }
+
+    #[test]
+    fn all_mode_orders_groups_by_window_then_by_last_call_ever_then_never() {
+        let titles: Vec<String> = sections(&history()).into_iter().map(|s| s.0).collect();
+        assert_eq!(titles, vec!["~/d-ahora", "~/b-ayer", "~/a-viejo"]);
+        let folded: Vec<String> = folded(&history()).into_iter().map(|f| f.0).collect();
+        assert_eq!(
+            folded,
+            vec!["~/c-nunca", "global"],
+            "los nunca usados, plegados"
+        );
+    }
+
+    #[test]
+    fn inside_a_group_inactive_go_by_last_call_ever_and_never_used_by_name() {
+        assert_eq!(
+            names(&history()),
+            vec!["ahora", "dos", "uno", "cuatro", "tres", "zeta"]
+        );
+    }
+
+    #[test]
+    fn mode_starts_in_all_tab_cycles_three_and_a_toggles_active_all() {
+        let mut app = fixture();
+        assert_eq!(app.mode, Mode::All);
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.mode, Mode::Ranking);
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.mode, Mode::Active);
+        assert_eq!(app.rows().len(), 4);
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.mode, Mode::All);
+        key(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.mode, Mode::Active);
+        key(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.mode, Mode::All);
+        assert_eq!(app.rows().len(), 5);
+        key(&mut app, KeyCode::Tab);
+        key(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.mode, Mode::Active, "desde el ranking, 'a' va a activos");
+    }
+
+    /// Una ejecución de `agent_type` en `cwd` que empezó en `start` y trabajó
+    /// `mins` minutos, lanzada por la llamada `id`; terminada si `finished`.
+    pub(crate) fn run(
+        agent_type: &str,
+        cwd: &str,
+        start: &str,
+        mins: i64,
+        id: Option<&str>,
+        finished: bool,
+    ) -> Run {
+        let start: DateTime<Utc> = start.parse().unwrap();
+        let last = start + Duration::minutes(mins);
+        Run {
+            agent_type: agent_type.into(),
+            description: Some(format!("{agent_type}: tarea")),
+            tool_use_id: id.map(String::from),
+            session_id: None,
+            cwd: Some(PathBuf::from(cwd)),
+            temp_cwd: None,
+            start: Some(start),
+            last: Some(last),
+            worked: Duration::minutes(mins),
+            worked_slots: std::collections::BTreeMap::from([(
+                start.duration_trunc(crate::runs::SLOT).unwrap(),
+                Duration::minutes(mins),
+            )]),
+            tools: 7,
+            task: None,
+            task_full: None,
+            last_tool: None,
+            steps: Default::default(),
+            tool_counts: Default::default(),
+            finished: Some(finished),
+            modified: last,
+            ..Default::default()
+        }
+    }
+
+    pub(crate) fn with_runs(mut app: App, runs: Vec<Run>) -> App {
+        let calls = app.calls.clone();
+        app.update(Action::Msg(Msg::Activity {
+            calls,
+            runs,
+            sessions: 4,
+        }));
+        app
+    }
+
+    const STATION: &str = "/Users/x/Offing/argi/station";
+    const STATION_SECTION: &str = "~/Offing/argi/station";
+
+    #[test]
+    fn rows_carry_the_work_of_every_run() {
+        let app = with_runs(
+            fixture(),
+            vec![
+                run("docs", STATION, "2026-11-04T09:00:00Z", 50, None, true),
+                run("docs", STATION, "2026-11-03T09:00:00Z", 22, None, true),
+                run(
+                    "docs",
+                    "/Users/x/otro",
+                    "2026-11-03T09:00:00Z",
+                    99,
+                    None,
+                    true,
+                ),
+            ],
+        );
+        let docs = row_named(&app, "docs");
+        assert_eq!(docs.work.total, Duration::minutes(72));
+        assert_eq!(docs.work.runs, 2, "la de otro proyecto no cuenta");
+        assert_eq!(docs.work.running, None);
+        assert_eq!(row_named(&app, "visual").work.runs, 0);
+    }
+
+    #[test]
+    fn a_run_in_progress_makes_the_agent_active_without_a_call_in_the_window() {
+        // backend solo tiene una llamada de hace 30 min, pero trabaja ahora
+        let app = with_runs(
+            fixture(),
+            vec![run(
+                "backend",
+                STATION,
+                "2026-11-05T11:50:00Z",
+                8,
+                None,
+                false,
+            )],
+        );
+        let backend = row_named(&app, "backend");
+        assert!(backend.active());
+        assert_eq!(
+            backend.last,
+            Some("2026-11-05T11:58:00Z".parse().unwrap()),
+            "el último paso de la ejecución cuenta como uso"
+        );
+        let running = backend.work.running.unwrap();
+        assert_eq!(running.since, Some("2026-11-05T11:50:00Z".parse().unwrap()));
+        assert_eq!(running.worked, Duration::minutes(10));
+        assert_eq!(app.active_count(), 5, "cuenta en la cabecera");
+    }
+
+    #[test]
+    fn active_mode_shows_runs_in_progress() {
+        let mut app = with_runs(
+            fixture(),
+            vec![run(
+                "backend",
+                STATION,
+                "2026-11-05T11:50:00Z",
+                8,
+                None,
+                false,
+            )],
+        );
+        key(&mut app, KeyCode::Char('a'));
+        assert!(names(&app).contains(&"backend".to_string()));
+    }
+
+    #[test]
+    fn an_interrupted_run_does_not_make_the_agent_active() {
+        // sin terminar pero sin tocarse desde hace más de 10 min
+        let app = with_runs(
+            fixture(),
+            vec![run(
+                "backend",
+                STATION,
+                "2026-11-05T11:00:00Z",
+                20,
+                None,
+                false,
+            )],
+        );
+        let backend = row_named(&app, "backend");
+        assert!(!backend.active());
+        assert_eq!(backend.work.running, None);
+        assert_eq!(backend.work.total, Duration::minutes(20));
+        assert_eq!(app.active_count(), 4);
+    }
+
+    #[test]
+    fn inside_an_active_group_runs_in_progress_go_first() {
+        // en station, frontend (11:58) y docs (11:52) están activos; backend
+        // trabaja ahora y pasa delante de los dos
+        let app = with_runs(
+            fixture(),
+            vec![run(
+                "backend",
+                STATION,
+                "2026-11-05T11:55:00Z",
+                4,
+                None,
+                false,
+            )],
+        );
+        let station: Vec<String> = app
+            .rows()
+            .iter()
+            .filter(|r| r.section == "~/Offing/argi/station")
+            .map(|r| app.agent(r.agent).name.clone())
+            .collect();
+        assert_eq!(station, vec!["backend", "frontend", "docs"]);
+        assert_eq!(
+            sections(&app)
+                .iter()
+                .find(|s| s.0 == "~/Offing/argi/station")
+                .unwrap()
+                .1,
+            3
+        );
+    }
+
+    #[test]
+    fn a_group_with_a_run_in_progress_goes_first() {
+        // station tiene la llamada menos reciente de los tres grupos activos
+        let app = with_runs(
+            fixture(),
+            vec![run(
+                "backend",
+                STATION,
+                "2026-11-05T11:55:00Z",
+                4,
+                None,
+                false,
+            )],
+        );
+        let titles: Vec<String> = sections(&app).into_iter().map(|s| s.0).collect();
+        assert_eq!(
+            titles,
+            vec!["~/Offing/argi/station", "~/Offing/taskflow", "global"]
+        );
+    }
+
+    #[test]
+    fn a_running_agent_never_called_still_goes_first_in_its_group() {
+        // una ejecución de workflow: sin llamada a Agent en la transcripción padre
+        let app = with_runs(
+            history(),
+            vec![run(
+                "cuatro",
+                "/Users/x/b-ayer",
+                "2026-11-05T11:58:00Z",
+                1,
+                None,
+                false,
+            )],
+        );
+        assert_eq!(
+            names(&app),
+            vec!["cuatro", "dos", "uno", "tres", "ahora", "zeta"]
+        );
+    }
+
+    #[test]
+    fn calls_in_the_detail_carry_their_linked_run() {
+        let mut app = fixture();
+        let mut done = call("docs", STATION, "2026-11-05T09:00:00Z");
+        done.id = Some("toolu_1".into());
+        let mut now = call("docs", STATION, "2026-11-05T11:55:00Z");
+        now.id = Some("toolu_2".into());
+        let old = call("docs", STATION, "2026-10-01T09:00:00Z");
+        app.update(Action::Msg(Msg::Activity {
+            calls: vec![done, now, old],
+            runs: vec![
+                run(
+                    "docs",
+                    STATION,
+                    "2026-11-05T09:00:00Z",
+                    12,
+                    Some("toolu_1"),
+                    true,
+                ),
+                run(
+                    "docs",
+                    STATION,
+                    "2026-11-05T11:55:00Z",
+                    4,
+                    Some("toolu_2"),
+                    false,
+                ),
+            ],
+            sessions: 1,
+        }));
+        let docs = row_named(&app, "docs").agent;
+        let calls = app.calls_of(docs);
+        assert_eq!(calls.len(), 3);
+        let running = calls[0].run.as_ref().unwrap();
+        assert!(running.in_progress);
+        assert_eq!(running.worked, Duration::minutes(5), "lleva hasta ahora");
+        let done = calls[1].run.as_ref().unwrap();
+        assert!(!done.in_progress);
+        assert_eq!(done.worked, Duration::minutes(12));
+        assert_eq!(done.tools, 7);
+        assert_eq!(done.description, Some("docs: tarea"));
+        assert!(calls[2].run.is_none(), "sin id no hay ejecución enlazada");
+    }
+
+    /// Lo que hace la pantalla en cada vuelta: ajustar la vista al cursor con
+    /// el alto del cuerpo. Devuelve la línea del cursor.
+    fn frame(app: &mut App, height: usize) -> usize {
+        let items = app.items();
+        app.scroll_to_cursor(&items, height);
+        items
+            .iter()
+            .position(|i| i.n() == Some(app.cursor + 1))
+            .unwrap()
+    }
+
+    #[test]
+    fn wheel_moves_the_view_and_drags_the_cursor() {
+        // 30 filas en global: las columnas en la línea 0, la sección en la 1 y
+        // la fila n en la línea n + 1.
+        let mut app = many(30);
+        frame(&mut app, 10);
+        app.update(Action::Scroll(3));
+        assert_eq!(app.scroll, 3);
+        assert_eq!(app.cursor, 1, "el cursor baja a la primera fila a la vista");
+        frame(&mut app, 10);
+        assert_eq!(app.scroll, 3, "la vista no vuelve atrás al repintar");
+        app.update(Action::Scroll(-3));
+        assert_eq!(app.scroll, 0);
+        assert_eq!(app.cursor, 1, "el cursor sigue a la vista: no se mueve");
+        app.update(Action::Scroll(-3));
+        assert_eq!(app.scroll, 0, "no pasa del principio");
+        app.update(Action::Scroll(100));
+        assert_eq!(
+            app.scroll, 22,
+            "no pasa del final: 32 líneas, 10 a la vista"
+        );
+        assert_eq!(app.cursor, 20);
+        key(&mut app, KeyCode::End);
+        frame(&mut app, 10);
+        app.update(Action::Scroll(-3));
+        assert_eq!(app.scroll, 19);
+        assert_eq!(app.cursor, 26, "el cursor sube a la última fila a la vista");
+        assert_eq!(frame(&mut app, 10), 28);
+        assert_eq!(app.scroll, 19);
+    }
+
+    #[test]
+    fn wheel_does_not_leave_the_cursor_under_a_hidden_header() {
+        let mut app = history();
+        frame(&mut app, 4);
+        // Líneas: 0 columnas, 1 d-ahora, 2 ahora, 3 blanco, 4 b-ayer, 5 dos…
+        app.update(Action::Scroll(4));
+        let line = frame(&mut app, 4);
+        assert_eq!(app.scroll, 4, "repintar no deshace la rueda");
+        assert!((4..8).contains(&line), "línea {line}");
+    }
+
+    #[test]
+    fn page_keys_and_space_move_a_page() {
+        let mut app = many(30);
+        frame(&mut app, 10);
+        key(&mut app, KeyCode::PageDown);
+        assert_eq!(app.cursor, 10);
+        frame(&mut app, 10);
+        key(&mut app, KeyCode::Char(' '));
+        assert_eq!(app.cursor, 20);
+        frame(&mut app, 10);
+        key(&mut app, KeyCode::PageDown);
+        key(&mut app, KeyCode::PageDown);
+        assert_eq!(app.cursor, 29, "se para en la última");
+        frame(&mut app, 10);
+        key(&mut app, KeyCode::PageUp);
+        assert_eq!(app.cursor, 19);
+        frame(&mut app, 10);
+        key(&mut app, KeyCode::PageUp);
+        key(&mut app, KeyCode::PageUp);
+        assert_eq!(app.cursor, 0, "se para en la primera");
+        assert_eq!(frame(&mut app, 10), 2);
+        assert_eq!(app.scroll, 0);
+    }
+
+    #[test]
+    fn page_keys_also_move_the_view() {
+        let mut app = many(30);
+        frame(&mut app, 10);
+        key(&mut app, KeyCode::PageDown);
+        assert_eq!(app.scroll, 10);
+        let line = frame(&mut app, 10);
+        assert_eq!(app.scroll, 10);
+        assert_eq!(line, 12);
+    }
+
+    #[test]
+    fn space_while_filtering_goes_to_the_filter() {
+        let mut app = many(30);
+        key(&mut app, KeyCode::Char('/'));
+        key(&mut app, KeyCode::Char(' '));
+        assert_eq!(app.filter, " ");
+        assert_eq!(app.cursor, 0);
+    }
+
+    #[test]
+    fn scroll_follows_the_cursor() {
+        let mut app = many(30);
+        key(&mut app, KeyCode::End);
+        let items = app.items();
+        app.scroll_to_cursor(&items, 10);
+        let line = items.iter().position(|i| i.n() == Some(30)).unwrap();
+        assert!(
+            line >= app.scroll && line < app.scroll + 10,
+            "línea {line}, scroll {}",
+            app.scroll
+        );
+        key(&mut app, KeyCode::Home);
+        let items = app.items();
+        app.scroll_to_cursor(&items, 10);
+        assert_eq!(app.scroll, 0);
+    }
+
+    // --- Pestañas, franja «Ahora», grupos plegados, orden, ranking y ficha ---
+
+    fn folded(app: &App) -> Vec<(String, usize, usize, bool)> {
+        app.items()
+            .iter()
+            .filter_map(|i| match i {
+                Item::Folded {
+                    title,
+                    total,
+                    n,
+                    open,
+                } => Some((title.clone(), *total, *n, *open)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn never_used_groups_go_folded_at_the_end_numbered_after_the_rows() {
+        let app = history();
+        assert_eq!(
+            folded(&app),
+            vec![
+                ("~/c-nunca".to_string(), 1, 7, false),
+                ("global".to_string(), 1, 8, false)
+            ]
+        );
+        assert!(matches!(app.items().last(), Some(Item::Folded { .. })));
+        assert_eq!(app.count(), 8, "las líneas plegadas cuentan como filas");
+    }
+
+    #[test]
+    fn digits_and_enter_open_and_close_a_folded_group() {
+        let mut app = history();
+        key(&mut app, KeyCode::Char('7'));
+        assert_eq!(app.cursor, 6);
+        assert!(app.current().is_none(), "un grupo plegado no es un agente");
+        key(&mut app, KeyCode::Enter);
+        assert!(!app.detail, "enter despliega, no abre la ficha");
+        assert!(folded(&app)[0].3);
+        assert_eq!(names(&app).last().unwrap(), "nada");
+        assert_eq!(row_named(&app, "nada").n, 8);
+        assert_eq!(folded(&app)[1], ("global".to_string(), 1, 9, false));
+        assert_eq!(app.cursor, 6, "el cursor sigue en la línea del grupo");
+        key(&mut app, KeyCode::Char('8'));
+        key(&mut app, KeyCode::Enter);
+        assert!(app.detail);
+        assert_eq!(app.agent(app.current().unwrap().agent).name, "nada");
+        key(&mut app, KeyCode::Esc);
+        key(&mut app, KeyCode::Char('7'));
+        key(&mut app, KeyCode::Enter);
+        assert!(!folded(&app)[0].3, "enter otra vez lo pliega");
+        assert_eq!(app.count(), 8);
+    }
+
+    #[test]
+    fn active_mode_has_no_folded_groups() {
+        let mut app = history();
+        key(&mut app, KeyCode::Char('a'));
+        assert!(folded(&app).is_empty());
+        assert_eq!(names(&app), vec!["ahora"]);
+    }
+
+    #[test]
+    fn arrows_in_the_detail_skip_folded_groups() {
+        let mut app = history();
+        key(&mut app, KeyCode::Char('7'));
+        key(&mut app, KeyCode::Enter);
+        // zeta 6, c-nunca 7 (abierto), nada 8, global 9 (plegado)
+        key(&mut app, KeyCode::Char('6'));
+        key(&mut app, KeyCode::Enter);
+        assert!(app.detail);
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.agent(app.current().unwrap().agent).name, "nada");
+        key(&mut app, KeyCode::Down);
+        assert!(app.detail, "no hay otro agente: se queda");
+        assert_eq!(app.agent(app.current().unwrap().agent).name, "nada");
+        key(&mut app, KeyCode::Up);
+        assert_eq!(app.agent(app.current().unwrap().agent).name, "zeta");
+    }
+
+    #[test]
+    fn columns_header_goes_once_above_the_first_group() {
+        let app = fixture();
+        let items = app.items();
+        assert!(matches!(items[0], Item::Columns));
+        assert!(matches!(items[1], Item::Section { .. }));
+        assert_eq!(
+            items.iter().filter(|i| matches!(i, Item::Columns)).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn sections_carry_the_work_of_their_group() {
+        let app = with_runs(
+            fixture(),
+            vec![
+                run("docs", STATION, "2026-11-04T09:00:00Z", 50, None, true),
+                run("frontend", STATION, "2026-11-04T10:00:00Z", 5, None, true),
+            ],
+        );
+        let worked: Vec<(String, TimeDelta)> = app
+            .items()
+            .into_iter()
+            .filter_map(|i| match i {
+                Item::Section { title, worked, .. } => Some((title, worked)),
+                _ => None,
+            })
+            .collect();
+        assert!(worked.contains(&("~/Offing/argi/station".to_string(), Duration::minutes(55))));
+        assert!(worked.contains(&("global".to_string(), TimeDelta::zero())));
+    }
+
+    // --- Monitor de «activos»: grupos con lo en curso y lo terminado ---
+
+    /// Cuatro en curso (una built-in, una de workflow, otra built-in y una
+    /// definida) y una terminada fuera de la ventana; más las cuatro llamadas
+    /// sin ejecución del `fixture` que caen en la ventana (terminadas).
+    ///
+    /// Orden agrupado, con su número:
+    /// - `~/Offing/taskflow`: 1 visual, 2 react-structure-checker (terminadas)
+    /// - `~/Offing/argi/station`: 3 Explore, 4 workflow, 5 backend (en curso),
+    ///   6 frontend (terminada)
+    /// - `~/otro`: 7 general-purpose (en curso)
+    /// - `~/Offing/argi/station/front`: 8 docs (terminada)
+    fn busy() -> App {
+        with_runs(
+            fixture(),
+            vec![
+                run("backend", STATION, "2026-11-05T11:50:00Z", 8, None, false),
+                run(
+                    "general-purpose",
+                    "/Users/x/otro",
+                    "2026-11-05T11:55:00Z",
+                    4,
+                    None,
+                    false,
+                ),
+                run(
+                    "workflow-subagent",
+                    STATION,
+                    "2026-11-05T11:56:00Z",
+                    3,
+                    None,
+                    false,
+                ),
+                run("Explore", STATION, "2026-11-05T11:57:00Z", 2, None, false),
+                run("docs", STATION, "2026-11-05T09:00:00Z", 12, None, true),
+            ],
+        )
+    }
+
+    fn active(mut app: App) -> App {
+        key(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.mode, Mode::Active);
+        app
+    }
+
+    /// Lo seleccionable del monitor: (número, nombre, agente definido).
+    fn monitor(app: &App) -> Vec<(usize, String, Option<String>)> {
+        app.items()
+            .into_iter()
+            .filter_map(|i| match i {
+                Item::Live { n, line, row } => {
+                    Some((n, line.name, row.map(|r| app.agent(r.agent).name.clone())))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Las reglas de grupo: (proyecto, en curso, terminadas).
+    fn live_groups(app: &App) -> Vec<(String, usize, usize)> {
+        app.items()
+            .into_iter()
+            .filter_map(|i| match i {
+                Item::LiveGroup {
+                    section,
+                    running,
+                    recent,
+                } => Some((section, running, recent)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Pulsa `/`, teclea `text` y confirma.
+    fn type_filter(app: &mut App, text: &str) {
+        key(app, KeyCode::Char('/'));
+        for c in text.chars() {
+            key(app, KeyCode::Char(c));
+        }
+        key(app, KeyCode::Enter);
+    }
+
+    fn some(s: &str) -> Option<String> {
+        Some(s.to_string())
+    }
+
+    fn ended(app: &App, n: usize) -> RunState {
+        app.items()
+            .into_iter()
+            .find_map(|i| match i {
+                Item::Live { n: m, line, .. } if m == n => Some(line.state),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn all_mode_has_no_now_strip_and_starts_with_the_columns() {
+        let app = busy();
+        let items = app.items();
+        assert!(matches!(items[0], Item::Columns));
+        assert!(!items.iter().any(|i| matches!(
+            i,
+            Item::LiveGroup { .. } | Item::Live { .. } | Item::LiveTask(_) | Item::LiveNow(_)
+        )));
+        assert!(
+            row_named(&app, "backend").running(),
+            "su ✦ sigue en la fila"
+        );
+    }
+
+    #[test]
+    fn active_mode_is_a_monitor_without_sections_or_folds() {
+        let app = active(history());
+        assert!(!app
+            .items()
+            .iter()
+            .any(|i| matches!(i, Item::Section { .. } | Item::Folded { .. } | Item::Row(_))));
+        let app = active(fixture());
+        let items = app.items();
+        assert!(
+            matches!(items[0], Item::Columns),
+            "una vez, arriba del todo"
+        );
+        assert_eq!(
+            items.iter().filter(|i| matches!(i, Item::Columns)).count(),
+            1
+        );
+        assert_eq!(
+            live_groups(&app),
+            vec![
+                ("~/Offing/taskflow".to_string(), 0, 2),
+                ("~/Offing/argi/station".to_string(), 0, 1),
+                ("~/Offing/argi/station/front".to_string(), 0, 1),
+            ],
+            "sin nada en curso, solo terminadas: no hay otra sección"
+        );
+        // los blancos solo separan: ni al final ni dos seguidos
+        assert!(!matches!(items.last(), Some(Item::Blank)));
+        assert!(!items
+            .windows(2)
+            .any(|w| matches!(w, [Item::Blank, Item::Blank])));
+        assert_eq!(
+            monitor(&app),
+            vec![
+                (1, "visual".into(), some("visual")),
+                (
+                    2,
+                    "react-structure-checker".into(),
+                    some("react-structure-checker")
+                ),
+                (3, "frontend".into(), some("frontend")),
+                (4, "docs".into(), some("docs")),
+            ],
+            "por grupo; backend (hace 30 min) fuera"
+        );
+    }
+
+    /// Con un blanco entre bloques, el cursor sigue viéndose entero al bajar
+    /// y subir: el blanco no cuenta como parte del bloque.
+    #[test]
+    fn the_blank_between_blocks_keeps_the_cursor_block_in_view() {
+        let mut app = active(busy());
+        // bloque 2: líneas 6-8; con 3 de alto, la vista empieza en su nombre
+        app.cursor = 1;
+        assert_eq!(frame(&mut app, 3), 6);
+        assert_eq!(app.scroll, 6);
+        // el último (8): regla en 32, bloque 33-35; la vista acaba en el 35
+        app.cursor = 7;
+        assert_eq!(frame(&mut app, 4), 33);
+        assert_eq!(app.scroll, 32);
+        // y de vuelta al primero, con las columnas y su regla
+        app.cursor = 0;
+        assert_eq!(frame(&mut app, 4), 2);
+        assert_eq!(app.scroll, 0);
+    }
+
+    #[test]
+    fn a_group_lists_what_is_running_and_then_what_finished_numbered_straight_through() {
+        let app = active(busy());
+        let items = app.items();
+        assert!(matches!(items[0], Item::Columns));
+        assert_eq!(
+            live_groups(&app),
+            vec![
+                ("~/Offing/taskflow".to_string(), 0, 2),
+                ("~/Offing/argi/station".to_string(), 3, 1),
+                ("~/otro".to_string(), 1, 0),
+                ("~/Offing/argi/station/front".to_string(), 0, 1),
+            ],
+            "grupos por su actividad más reciente; running y recent por grupo"
+        );
+        // columnas, regla, bloque 1 (2-4), blanco, bloque 2 (6-8), blanco,
+        // regla de station...: un blanco entre bloques y antes de cada regla
+        // salvo la primera; nunca al final
+        assert!(matches!(items[1], Item::LiveGroup { .. }));
+        assert!(matches!(items[2], Item::Live { n: 1, .. }));
+        assert!(matches!(items[3], Item::LiveTask(_)));
+        assert!(matches!(items[4], Item::LiveNow(_)));
+        assert!(matches!(items[5], Item::Blank));
+        assert!(matches!(items[6], Item::Live { n: 2, .. }));
+        assert!(matches!(items[9], Item::Blank));
+        assert!(matches!(items[10], Item::LiveGroup { .. }));
+        assert!(matches!(items[11], Item::Live { n: 3, .. }));
+        assert!(matches!(items[14], Item::Blank));
+        assert!(matches!(items[23], Item::Live { n: 6, .. }));
+        assert!(matches!(items[26], Item::Blank));
+        assert!(matches!(items[27], Item::LiveGroup { .. }));
+        assert!(matches!(items[28], Item::Live { n: 7, .. }));
+        assert!(matches!(items[31], Item::Blank));
+        assert!(matches!(items[32], Item::LiveGroup { .. }));
+        assert!(matches!(items[33], Item::Live { n: 8, .. }));
+        assert!(matches!(items[35], Item::LiveNow(_)));
+        assert_eq!(items.len(), 36);
+        assert_eq!(
+            monitor(&app),
+            vec![
+                (1, "visual".into(), some("visual")),
+                (
+                    2,
+                    "react-structure-checker".into(),
+                    some("react-structure-checker")
+                ),
+                (3, "Explore".into(), None),
+                (4, "workflow-subagent: tarea".into(), None),
+                (5, "backend".into(), some("backend")),
+                (6, "frontend".into(), some("frontend")),
+                (7, "general-purpose".into(), None),
+                (8, "docs".into(), some("docs")),
+            ],
+            "en curso por inicio y luego terminadas por fin, dentro de cada grupo"
+        );
+        assert_eq!(app.count(), 8, "un bloque es una sola fila, termine o no");
+        let ended_at = |s: &str| RunState::Done {
+            ended: s.parse().unwrap(),
+        };
+        assert_eq!(ended(&app, 1), ended_at("2026-11-05T11:59:55Z"));
+        assert_eq!(ended(&app, 3), RunState::Running);
+        assert_eq!(ended(&app, 6), ended_at("2026-11-05T11:58:00Z"));
+        assert_eq!(ended(&app, 7), RunState::Running);
+        let Item::LiveTask(wf) = &items[16] else {
+            panic!("segunda línea de workflow")
+        };
+        assert_eq!(wf.name, "workflow-subagent: tarea");
+        assert_eq!(wf.kind, RunKind::WorkflowStep);
+        assert_eq!(wf.cwd.as_deref(), Some(Path::new(STATION)));
+        assert_eq!(wf.worked, Duration::minutes(4), "lleva hasta ahora");
+        assert_eq!(wf.tools, 7);
+        assert_eq!(wf.task, None, "en un workflow la description es el nombre");
+        assert_eq!(wf.last_tool, None);
+        assert_eq!(wf.since, Some("2026-11-05T11:56:00Z".parse().unwrap()));
+        let Item::Live { line, .. } = &items[11] else {
+            panic!("Explore")
+        };
+        assert_eq!(line.kind, RunKind::BuiltIn);
+        assert_eq!(line.task.as_deref(), Some("Explore: tarea"));
+    }
+
+    #[test]
+    fn a_finished_run_in_the_window_joins_its_group_below_the_running_ones() {
+        let mut app = fixture();
+        let mut calls = app.calls.clone();
+        calls[0].id = Some("t1".into()); // frontend, 11:58
+        app.update(Action::Msg(Msg::Activity {
+            calls,
+            runs: vec![
+                run(
+                    "frontend",
+                    STATION,
+                    "2026-11-05T11:58:00Z",
+                    1,
+                    Some("t1"),
+                    true,
+                ),
+                run("Explore", STATION, "2026-11-05T11:57:00Z", 2, None, false),
+            ],
+            sessions: 4,
+        }));
+        let app = active(app);
+        assert_eq!(
+            live_groups(&app)[1],
+            ("~/Offing/argi/station".to_string(), 1, 1),
+            "la llamada y su ejecución son una sola línea"
+        );
+        assert_eq!(
+            monitor(&app).into_iter().map(|m| m.1).collect::<Vec<_>>(),
+            vec![
+                "visual",
+                "react-structure-checker",
+                "Explore",
+                "frontend",
+                "docs"
+            ]
+        );
+        let line = app
+            .items()
+            .into_iter()
+            .find_map(|i| match i {
+                Item::Live { line, .. } if line.name == "frontend" => Some(line),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            line.state,
+            RunState::Done {
+                ended: "2026-11-05T11:59:00Z".parse().unwrap()
+            },
+            "termina en su último paso"
+        );
+        assert_eq!((line.worked, line.tools), (Duration::minutes(1), 7));
+    }
+
+    #[test]
+    fn the_cursor_and_the_digits_follow_the_grouped_order() {
+        let mut app = active(busy());
+        key(&mut app, KeyCode::Char('7'));
+        let Some(Item::Live { line, .. }) = app
+            .items()
+            .into_iter()
+            .find(|i| i.n() == Some(app.cursor + 1))
+        else {
+            panic!("el cursor está en un bloque")
+        };
+        assert_eq!(line.name, "general-purpose", "la 7 es la del grupo otro");
+        key(&mut app, KeyCode::Up);
+        assert_eq!(
+            app.current().unwrap().agent,
+            row_named(&app, "frontend").agent,
+            "la terminada de station, antes que la de otro"
+        );
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Down);
+        assert_eq!(
+            app.current().unwrap().agent,
+            row_named(&app, "docs").agent,
+            "pasa de grupo sin saltarse nada"
+        );
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.cursor, 7, "no pasa de la última");
+        key(&mut app, KeyCode::Home);
+        assert_eq!(app.cursor, 0);
+        key(&mut app, KeyCode::End);
+        assert_eq!(app.cursor, 7);
+    }
+
+    #[test]
+    fn the_header_counts_runs_in_progress_and_finished_in_the_window() {
+        let app = busy();
+        assert_eq!(app.live_count(), 4, "Σ running");
+        assert_eq!(app.recent_count(), 4, "Σ recent: las terminadas");
+        let app = fixture();
+        assert_eq!(app.live_count(), 0);
+        assert_eq!(app.recent_count(), 4);
+        let mut filtered = active(busy());
+        type_filter(&mut filtered, "explore");
+        assert_eq!(
+            (filtered.live_count(), filtered.recent_count()),
+            (4, 4),
+            "la cabecera cuenta sin filtro"
+        );
+    }
+
+    #[test]
+    fn enter_opens_the_run_detail_on_every_block_running_or_finished() {
+        let mut app = active(busy());
+        for (n, name, kind, owner, done) in [
+            (1u32, "visual", RunKind::Defined, true, true),
+            (2, "react-structure-checker", RunKind::Defined, true, true),
+            (3, "Explore", RunKind::BuiltIn, false, false),
+            (
+                4,
+                "workflow-subagent: tarea",
+                RunKind::WorkflowStep,
+                false,
+                false,
+            ),
+            (5, "backend", RunKind::Defined, true, false),
+            (6, "frontend", RunKind::Defined, true, true),
+            (7, "general-purpose", RunKind::BuiltIn, false, false),
+            (8, "docs", RunKind::Defined, true, true),
+        ] {
+            key(&mut app, KeyCode::Char(char::from_digit(n, 10).unwrap()));
+            assert!(app.can_open(), "{name}");
+            key(&mut app, KeyCode::Enter);
+            let d = app.run_detail.as_ref().expect(name);
+            assert_eq!(
+                (
+                    d.name.as_str(),
+                    d.kind,
+                    d.owner.is_some(),
+                    d.ended.is_some()
+                ),
+                (name, kind, owner, done),
+                "{name}"
+            );
+            assert!(!app.detail, "es la ficha de la ejecución, no la del agente");
+            key(&mut app, KeyCode::Esc);
+            assert!(app.run_detail.is_none());
+            assert_eq!(
+                app.cursor,
+                n as usize - 1,
+                "Esc deja el cursor en su bloque"
+            );
+        }
+    }
+
+    #[test]
+    fn enter_on_a_call_without_a_run_opens_a_minimal_detail_with_ended() {
+        let mut app = active(fixture());
+        key(&mut app, KeyCode::Char('3'));
+        key(&mut app, KeyCode::Enter);
+        let d = app.run_detail.as_ref().expect("la llamada abre su ficha");
+        assert_eq!(d.name, "frontend");
+        assert_eq!(
+            d.ended,
+            Some("2026-11-05T11:58:00Z".parse::<DateTime<Utc>>().unwrap())
+        );
+        assert!(d.steps.is_empty() && d.tool_counts.is_empty());
+        assert_eq!((d.tools, d.worked), (0, TimeDelta::zero()));
+        assert!(!app.detail);
+        // los refrescos no la cierran ni la cambian
+        let before = app.run_detail.clone();
+        app.update(Action::Tick("2026-11-05T12:00:30Z".parse().unwrap()));
+        assert_eq!(app.run_detail, before);
+        // y se puede abrir la ficha del agente desde ella
+        assert!(app.can_open_agent());
+        key(&mut app, KeyCode::Char('a'));
+        assert!(app.run_detail.is_none() && app.detail);
+        assert_eq!(app.agent(app.current().unwrap().agent).name, "frontend");
+    }
+
+    #[test]
+    fn enter_opens_the_run_of_a_workflow_whose_real_agent_is_a_defined_one() {
+        let mut wf = run(
+            "workflow-subagent",
+            STATION,
+            "2026-11-05T11:57:00Z",
+            2,
+            None,
+            false,
+        );
+        wf.description = Some("backend".into());
+        wf.task = Some("revisar el cruce".into());
+        let mut app = active(with_runs(fixture(), vec![wf]));
+        let items = app.items();
+        // taskflow (2 terminadas) va antes; el workflow abre station: la 3
+        let Item::Live { n, line, row } = &items[11] else {
+            panic!("el workflow abre el grupo de station")
+        };
+        assert_eq!(*n, 3);
+        assert_eq!(line.kind, RunKind::Workflow);
+        assert!(row.is_some(), "viene de owner");
+        key(&mut app, KeyCode::Char('3'));
+        key(&mut app, KeyCode::Enter);
+        let d = app.run_detail.as_ref().unwrap();
+        assert_eq!(d.kind, RunKind::Workflow);
+        assert_eq!(d.task.as_deref(), Some("revisar el cruce"));
+        assert!(app.can_open_agent());
+    }
+
+    #[test]
+    fn arrows_in_the_run_detail_walk_every_block_in_grouped_order() {
+        let mut app = active(busy());
+        key(&mut app, KeyCode::Enter);
+        let name = |a: &App| a.run_detail.as_ref().unwrap().name.clone();
+        assert_eq!(name(&app), "visual");
+        key(&mut app, KeyCode::Up);
+        assert_eq!(name(&app), "visual", "en el extremo no se mueve");
+        for want in [
+            "react-structure-checker",
+            "Explore",
+            "workflow-subagent: tarea",
+            "backend",
+            "frontend",
+            "general-purpose",
+            "docs",
+        ] {
+            key(&mut app, KeyCode::Down);
+            assert_eq!(name(&app), want);
+        }
+        key(&mut app, KeyCode::Down);
+        assert_eq!(name(&app), "docs", "tampoco por abajo");
+        assert_eq!(app.cursor, 7);
+        key(&mut app, KeyCode::Char('k'));
+        assert_eq!(name(&app), "general-purpose");
+        assert_eq!(app.cursor, 6);
+    }
+
+    #[test]
+    fn a_finished_run_stays_open_with_its_last_photo_and_ended() {
+        let mut app = active(busy());
+        key(&mut app, KeyCode::Char('5'));
+        key(&mut app, KeyCode::Enter);
+        let before = app.run_detail.clone().unwrap();
+        assert_eq!(before.ended, None);
+        // la ejecución termina
+        let mut runs = app.runs.clone();
+        for r in runs.iter_mut().filter(|r| r.agent_type == "backend") {
+            r.finished = Some(true);
+        }
+        app = with_runs(app, runs);
+        let d = app.run_detail.as_ref().expect("no se cierra");
+        assert!(d.ended.is_some());
+        assert_eq!(d.name, "backend");
+        // desaparece del disco: conserva la foto
+        let without: Vec<Run> = app
+            .runs
+            .iter()
+            .filter(|r| r.agent_type != "backend")
+            .cloned()
+            .collect();
+        let was = app.run_detail.clone();
+        app = with_runs(app, without);
+        assert_eq!(app.run_detail, was);
+        // ↑↓ desde una acabada parte de su cursor
+        key(&mut app, KeyCode::Up);
+        assert_eq!(
+            app.run_detail.as_ref().unwrap().name,
+            "workflow-subagent: tarea"
+        );
+    }
+
+    #[test]
+    fn steps_scroll_is_bounded() {
+        let mut r = run("Explore", STATION, "2026-11-05T11:57:00Z", 2, None, false);
+        r.steps = (0..5)
+            .map(|i| crate::runs::ToolStep {
+                at: "2026-11-05T11:58:00Z".parse().unwrap(),
+                name: "Bash".into(),
+                arg: Some(format!("cmd {i}")),
+            })
+            .collect::<Vec<_>>()
+            .into();
+        let mut app = active(with_runs(fixture(), vec![r]));
+        key(&mut app, KeyCode::Char('3'));
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.run_detail.as_ref().unwrap().name, "Explore");
+        key(&mut app, KeyCode::PageUp);
+        assert_eq!(app.steps_scroll, 0, "no pasa de 0");
+        assert_eq!(app.steps_window(2), 0);
+        key(&mut app, KeyCode::PageDown);
+        assert_eq!(app.steps_scroll, 2, "una página de 2");
+        key(&mut app, KeyCode::PageDown);
+        key(&mut app, KeyCode::PageDown);
+        assert_eq!(app.steps_scroll, 3, "no pasa de la última página llena");
+        key(&mut app, KeyCode::Home);
+        assert_eq!(app.steps_scroll, 0);
+        key(&mut app, KeyCode::End);
+        assert_eq!(app.steps_scroll, 3);
+        assert_eq!(app.steps_window(10), 0, "la vista acota a lo que cabe");
+    }
+
+    #[test]
+    fn a_opens_the_agent_only_when_the_run_has_an_owner() {
+        let mut app = active(busy());
+        key(&mut app, KeyCode::Char('4'));
+        key(&mut app, KeyCode::Enter);
+        assert!(!app.can_open_agent());
+        key(&mut app, KeyCode::Char('a'));
+        assert!(app.run_detail.is_some() && !app.detail && app.mode == Mode::Active);
+        key(&mut app, KeyCode::Char('5'));
+        assert!(app.run_detail.is_some(), "los dígitos no mueven la ficha");
+        key(&mut app, KeyCode::Esc);
+        key(&mut app, KeyCode::Char('5'));
+        key(&mut app, KeyCode::Enter);
+        assert!(app.can_open_agent());
+        key(&mut app, KeyCode::Char('a'));
+        assert!(app.run_detail.is_none() && app.detail);
+        assert_eq!(app.agent(app.current().unwrap().agent).name, "backend");
+    }
+
+    #[test]
+    fn esc_returns_with_the_cursor_on_the_same_run_and_the_filter_survives() {
+        let mut app = active(busy());
+        type_filter(&mut app, "station");
+        // station: 1 Explore, 2 workflow, 3 backend, 4 frontend; station/front: 5 docs
+        key(&mut app, KeyCode::Char('2'));
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Char('/'));
+        assert!(!app.filtering, "la ficha no abre el filtro");
+        assert_eq!(app.filter, "station");
+        key(&mut app, KeyCode::Esc);
+        assert!(app.run_detail.is_none());
+        assert_eq!(app.cursor, 2);
+        let Some(Item::Live { line, .. }) = app
+            .items()
+            .into_iter()
+            .find(|i| i.n() == Some(app.cursor + 1))
+        else {
+            panic!("el cursor está en un bloque")
+        };
+        assert_eq!(line.name, "backend");
+    }
+
+    #[test]
+    fn the_filter_in_active_matches_the_task_not_the_workflow_name() {
+        let mut r = run("Explore", STATION, "2026-11-05T11:56:00Z", 2, None, false);
+        r.task = Some("pintar la pantalla".into());
+        let mut app = active(with_runs(fixture(), vec![r]));
+        type_filter(&mut app, "pintar");
+        assert_eq!(monitor(&app).len(), 1);
+        assert_eq!(
+            live_groups(&app),
+            vec![("~/Offing/argi/station".to_string(), 1, 0)]
+        );
+    }
+
+    #[test]
+    fn the_filter_in_active_matches_name_project_or_task() {
+        let filtered = |f: &str| -> Vec<String> {
+            let mut app = active(busy());
+            type_filter(&mut app, f);
+            monitor(&app).into_iter().map(|m| m.1).collect()
+        };
+        assert_eq!(filtered("explore"), vec!["Explore"], "nombre");
+        assert_eq!(
+            filtered("otro"),
+            vec!["general-purpose"],
+            "ruta de la en curso"
+        );
+        assert_eq!(
+            filtered("taskflow"),
+            vec!["visual", "react-structure-checker"],
+            "proyecto de las terminadas"
+        );
+        assert_eq!(
+            filtered("tarea"),
+            vec![
+                "Explore",
+                "workflow-subagent: tarea",
+                "backend",
+                "general-purpose"
+            ],
+            "encargo (y el nombre del workflow); agrupado, por proyecto"
+        );
+        let mut app = active(busy());
+        type_filter(&mut app, "zzz");
+        assert!(
+            app.items().is_empty(),
+            "sin coincidencias no hay estado vacío"
+        );
+    }
+
+    #[test]
+    fn a_filter_that_leaves_only_finished_runs_rebuilds_the_group_counters() {
+        let mut app = active(busy());
+        type_filter(&mut app, "station");
+        assert_eq!(
+            live_groups(&app),
+            vec![
+                ("~/Offing/argi/station".to_string(), 3, 1),
+                ("~/Offing/argi/station/front".to_string(), 0, 1),
+            ],
+            "taskflow y otro se van; station conserva sus 3 + 1"
+        );
+        let mut app = active(busy());
+        type_filter(&mut app, "frontend");
+        assert_eq!(
+            live_groups(&app),
+            vec![("~/Offing/argi/station".to_string(), 0, 1)],
+            "solo queda una terminada: sin en curso en el grupo"
+        );
+        assert_eq!(
+            monitor(&app),
+            vec![(1, "frontend".into(), some("frontend"))],
+            "la numeración se rehace sobre lo que deja el filtro"
+        );
+        assert!(matches!(app.items()[0], Item::Columns));
+        assert_eq!(app.count(), 1);
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.run_detail.as_ref().unwrap().name, "frontend");
+    }
+
+    #[test]
+    fn an_empty_monitor_says_the_last_use_of_any_agent() {
+        let mut app = active(fixture());
+        app.update(Action::Tick("2026-11-05T13:00:00Z".parse().unwrap()));
+        let items = app.items();
+        assert_eq!(items.len(), 1);
+        let Item::Quiet { last: Some(last) } = &items[0] else {
+            panic!("estado vacío con último uso")
+        };
+        assert_eq!(app.agent(last.agent).name, "visual");
+        assert_eq!(last.section, "~/Offing/taskflow");
+        assert_eq!(
+            last.at,
+            "2026-11-05T11:59:55Z".parse::<DateTime<Utc>>().unwrap()
+        );
+        assert_eq!(app.count(), 0);
+        assert!(!app.can_open());
+        key(&mut app, KeyCode::Enter);
+        assert!(!app.detail && app.run_detail.is_none());
+
+        let mut app = active(fixture());
+        app.update(Action::Msg(Msg::Activity {
+            calls: vec![],
+            runs: vec![],
+            sessions: 0,
+        }));
+        assert!(matches!(app.items()[..], [Item::Quiet { last: None }]));
+    }
+
+    #[test]
+    fn a_block_scrolls_into_view_with_its_three_lines_running_or_finished() {
+        let mut app = active(busy());
+        key(&mut app, KeyCode::Char('7'));
+        // 0 columnas; general-purpose en la 28 y sus otras dos líneas en la 29 y la 30
+        assert_eq!(frame(&mut app, 5), 28);
+        assert_eq!(app.scroll, 26, "se ven las tres líneas del bloque");
+        key(&mut app, KeyCode::Char('1'));
+        frame(&mut app, 5);
+        assert_eq!(app.scroll, 0, "el primero arrastra la regla y las columnas");
+        // una terminada (la 6, líneas 23 a 25) también se ve entera
+        key(&mut app, KeyCode::Char('6'));
+        assert_eq!(frame(&mut app, 5), 23);
+        assert_eq!(app.scroll, 21);
+        // la última (la 8, líneas 33 a 35): scroll mínimo, con la regla de su grupo (32) a la vista
+        key(&mut app, KeyCode::Char('8'));
+        frame(&mut app, 5);
+        assert_eq!(app.scroll, 31);
+        key(&mut app, KeyCode::Home);
+        frame(&mut app, 5);
+        assert_eq!(app.scroll, 0);
+    }
+
+    #[test]
+    fn o_does_nothing_in_active() {
+        let mut app = active(fixture());
+        key(&mut app, KeyCode::Char('o'));
+        assert_eq!(app.order, Order::Recent);
+    }
+
+    #[test]
+    fn o_orders_inside_groups_by_worked_and_back() {
+        // station por recencia: frontend (11:58), docs (11:52), backend (11:30)
+        let mut app = with_runs(
+            fixture(),
+            vec![
+                run("backend", STATION, "2026-11-01T09:00:00Z", 40, None, true),
+                run("docs", STATION, "2026-11-02T09:00:00Z", 20, None, true),
+                run("frontend", STATION, "2026-11-03T09:00:00Z", 5, None, true),
+            ],
+        );
+        let station = |app: &App| -> Vec<String> {
+            app.rows()
+                .iter()
+                .filter(|r| r.section == "~/Offing/argi/station")
+                .map(|r| app.agent(r.agent).name.clone())
+                .collect()
+        };
+        let titles =
+            |app: &App| -> Vec<String> { sections(app).into_iter().map(|s| s.0).collect() };
+        assert_eq!(app.order, Order::Recent);
+        assert_eq!(station(&app), vec!["frontend", "docs", "backend"]);
+        let before = titles(&app);
+        key(&mut app, KeyCode::Char('o'));
+        assert_eq!(app.order, Order::Worked);
+        assert_eq!(station(&app), vec!["backend", "docs", "frontend"]);
+        assert_eq!(titles(&app), before, "los grupos no cambian de orden");
+        let ns: Vec<usize> = app.rows().iter().map(|r| r.n).collect();
+        assert_eq!(ns, vec![1, 2, 3, 4, 5]);
+        key(&mut app, KeyCode::Char('o'));
+        assert_eq!(app.order, Order::Recent);
+        assert_eq!(station(&app), vec!["frontend", "docs", "backend"]);
+    }
+
+    fn ranked(app: &App) -> Vec<(String, i64, usize)> {
+        app.items()
+            .iter()
+            .filter_map(|i| match i {
+                Item::Rank { row, work } => Some((
+                    app.agent(row.agent).name.clone(),
+                    work.worked.num_minutes(),
+                    work.runs,
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// En el ranking. docs 72 min en dos (una de hace 40 días), visual 30 de
+    /// hace 10 días y frontend 5 de ayer.
+    fn ranking() -> App {
+        let mut app = with_runs(
+            fixture(),
+            vec![
+                run("docs", STATION, "2026-11-04T09:00:00Z", 50, None, true),
+                run("docs", STATION, "2026-09-26T09:00:00Z", 22, None, true),
+                run("frontend", STATION, "2026-11-04T10:00:00Z", 5, None, true),
+                run(
+                    "visual",
+                    "/Users/x/Offing/taskflow",
+                    "2026-10-26T10:00:00Z",
+                    30,
+                    None,
+                    true,
+                ),
+            ],
+        );
+        key(&mut app, KeyCode::Tab);
+        app
+    }
+
+    fn s(v: &[(&str, i64, usize)]) -> Vec<(String, i64, usize)> {
+        v.iter().map(|(n, w, r)| (n.to_string(), *w, *r)).collect()
+    }
+
+    #[test]
+    fn ranking_lists_agents_with_work_by_worked_desc() {
+        let app = ranking();
+        assert_eq!(app.mode, Mode::Ranking);
+        assert_eq!(app.period, Period::Ever);
+        let items = app.items();
+        assert!(matches!(items[0], Item::RankRule { agents: 3 }));
+        assert_eq!(
+            ranked(&app),
+            s(&[("docs", 72, 2), ("visual", 30, 1), ("frontend", 5, 1)])
+        );
+        let ns: Vec<usize> = app.rows().iter().map(|r| r.n).collect();
+        assert_eq!(ns, vec![1, 2, 3]);
+        assert_eq!(
+            app.ranking_total(),
+            PeriodStats {
+                worked: Duration::minutes(107),
+                runs: 4,
+                tokens: 0,
+            }
+        );
+        assert!(!items
+            .iter()
+            .any(|i| matches!(i, Item::Columns | Item::Section { .. } | Item::Row(_))));
+    }
+
+    #[test]
+    fn p_cycles_the_period_of_the_ranking() {
+        let mut app = ranking();
+        key(&mut app, KeyCode::Char('p'));
+        assert_eq!(app.period, Period::Week);
+        assert_eq!(ranked(&app), s(&[("docs", 50, 1), ("frontend", 5, 1)]));
+        assert_eq!(
+            app.ranking_total(),
+            PeriodStats {
+                worked: Duration::minutes(55),
+                runs: 2,
+                tokens: 0,
+            }
+        );
+        key(&mut app, KeyCode::Char('p'));
+        assert_eq!(app.period, Period::Month);
+        assert_eq!(
+            ranked(&app),
+            s(&[("docs", 50, 1), ("visual", 30, 1), ("frontend", 5, 1)])
+        );
+        key(&mut app, KeyCode::Char('p'));
+        assert_eq!(app.period, Period::Ever);
+    }
+
+    #[test]
+    fn p_and_o_only_act_where_they_mean_something() {
+        let mut app = fixture();
+        key(&mut app, KeyCode::Char('p'));
+        assert_eq!(app.period, Period::Ever, "p solo en el ranking");
+        let mut app = ranking();
+        key(&mut app, KeyCode::Char('o'));
+        assert_eq!(app.order, Order::Recent, "o solo en las listas");
+    }
+
+    #[test]
+    fn enter_in_the_ranking_opens_the_agent_and_arrows_follow_the_ranking() {
+        let mut app = ranking();
+        key(&mut app, KeyCode::Char('2'));
+        key(&mut app, KeyCode::Enter);
+        assert!(app.detail);
+        assert_eq!(app.agent(app.current().unwrap().agent).name, "visual");
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.agent(app.current().unwrap().agent).name, "frontend");
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.agent(app.current().unwrap().agent).name, "frontend");
+        key(&mut app, KeyCode::Up);
+        key(&mut app, KeyCode::Up);
+        assert_eq!(app.agent(app.current().unwrap().agent).name, "docs");
+        key(&mut app, KeyCode::Esc);
+        assert!(!app.detail);
+        assert_eq!(app.mode, Mode::Ranking);
+    }
+
+    #[test]
+    fn the_filter_also_works_in_the_ranking() {
+        let mut app = ranking();
+        key(&mut app, KeyCode::Char('/'));
+        for c in "fro".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(ranked(&app), s(&[("frontend", 5, 1)]));
+        assert_eq!(app.count(), 1);
+    }
+
+    #[test]
+    fn the_ranking_scrolls_like_the_list() {
+        let mut app = many(30);
+        let runs = (0..30)
+            .map(|i| {
+                run(
+                    &format!("a{i:02}"),
+                    "/Users/x/p",
+                    "2026-11-04T09:00:00Z",
+                    60 - i,
+                    None,
+                    true,
+                )
+            })
+            .collect();
+        let mut app = {
+            app.tz = Some(utc());
+            with_runs(app, runs)
+        };
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.count(), 30);
+        frame(&mut app, 10);
+        key(&mut app, KeyCode::End);
+        assert_eq!(app.cursor, 29);
+        assert_eq!(frame(&mut app, 10), 30, "la regla en la línea 0");
+        assert_eq!(app.scroll, 21);
+        key(&mut app, KeyCode::PageUp);
+        assert_eq!(app.cursor, 19);
+        key(&mut app, KeyCode::Home);
+        frame(&mut app, 10);
+        assert_eq!(app.scroll, 0, "con la primera fila se ve la regla");
+    }
+
+    #[test]
+    fn rows_carry_ninety_local_days_oldest_first() {
+        let app = with_runs(
+            fixture(),
+            vec![
+                run("docs", STATION, "2026-11-04T09:00:00Z", 50, None, true),
+                run("docs", STATION, "2026-08-08T09:00:00Z", 22, None, true),
+                run("docs", STATION, "2026-08-07T09:00:00Z", 99, None, true),
+            ],
+        );
+        let days = row_named(&app, "docs").history;
+        assert_eq!(days.len(), MAX_DAYS);
+        assert_eq!(days[89], TimeDelta::zero(), "hoy");
+        assert_eq!(days[88], Duration::minutes(50), "ayer");
+        assert_eq!(days[0], Duration::minutes(22), "hoy - 89");
+        assert_eq!(
+            days.iter().sum::<TimeDelta>(),
+            Duration::minutes(72),
+            "hoy - 90 queda fuera"
+        );
+    }
+
+    #[test]
+    fn a_row_gives_its_last_n_days_with_today_last() {
+        let app = with_runs(
+            fixture(),
+            vec![
+                run("docs", STATION, "2026-11-04T09:00:00Z", 50, None, true),
+                run("docs", STATION, "2026-10-30T09:00:00Z", 30, None, true),
+            ],
+        );
+        let row = row_named(&app, "docs");
+        let week = row.days(7);
+        assert_eq!(week.len(), 7);
+        assert_eq!(week[6], TimeDelta::zero(), "hoy");
+        assert_eq!(week[5], Duration::minutes(50), "ayer");
+        assert_eq!(week[0], Duration::minutes(30), "hoy - 6");
+        assert_eq!(row.days(1), [TimeDelta::zero()]);
+        assert_eq!(row.days(0).len(), 0);
+        assert_eq!(row.days(500).len(), MAX_DAYS, "más de 90 se queda en 90");
+        assert_eq!(row.days(MAX_DAYS), row.history.as_slice());
+    }
+
+    #[test]
+    fn the_days_follow_the_zone_of_the_screen() {
+        let mut app = with_runs(
+            fixture(),
+            vec![run("docs", STATION, "2026-11-04T23:30:00Z", 20, None, true)],
+        );
+        assert_eq!(row_named(&app, "docs").days(2)[0], Duration::minutes(20));
+        app.tz = Some(FixedOffset::east_opt(3600).unwrap());
+        assert_eq!(row_named(&app, "docs").days(1)[0], Duration::minutes(20));
+    }
+
+    #[test]
+    fn the_detail_lists_every_run_of_the_agent_with_its_local_start() {
+        let front = format!("{STATION}/front");
+        let mut app = with_runs(
+            fixture(),
+            vec![
+                run("docs", STATION, "2026-11-04T17:12:00Z", 6, None, true),
+                run("docs", &front, "2026-11-05T11:55:00Z", 4, None, false),
+                run(
+                    "workflow-subagent",
+                    STATION,
+                    "2026-11-05T10:00:00Z",
+                    9,
+                    None,
+                    true,
+                ),
+            ],
+        );
+        app.tz = Some(FixedOffset::east_opt(3600).unwrap());
+        let docs = row_named(&app, "docs").agent;
+        let runs = app.runs_of(docs);
+        assert_eq!(runs.len(), 2, "la de workflow no es de docs");
+        let at = |s: &str| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M").unwrap();
+        assert_eq!(runs[0].start, Some(at("2026-11-05 12:55")));
+        assert!(runs[0].in_progress);
+        assert_eq!(runs[0].worked, Duration::minutes(5));
+        assert_eq!(runs[0].cwd, Some(Path::new(&front)));
+        assert_eq!(runs[0].tools, 7);
+        assert_eq!(runs[0].description, Some("docs: tarea"));
+        assert_eq!(runs[1].start, Some(at("2026-11-04 18:12")));
+        assert!(!runs[1].in_progress);
+        assert_eq!(runs[1].worked, Duration::minutes(6));
+        assert_eq!(runs[1].cwd, None, "en la raíz del proyecto no se repite");
+    }
+
+    #[test]
+    fn the_detail_counts_old_calls_without_a_run_and_the_mean() {
+        let mut app = fixture();
+        let mut linked = call("docs", STATION, "2026-11-05T09:00:00Z");
+        linked.id = Some("toolu_1".into());
+        app.update(Action::Msg(Msg::Activity {
+            calls: vec![
+                linked,
+                call("docs", STATION, "2026-10-01T09:00:00Z"),
+                call("docs", STATION, "2026-10-02T09:00:00Z"),
+            ],
+            runs: vec![
+                run(
+                    "docs",
+                    STATION,
+                    "2026-11-05T09:00:00Z",
+                    12,
+                    Some("toolu_1"),
+                    true,
+                ),
+                run("docs", STATION, "2026-11-03T09:00:00Z", 30, None, true),
+            ],
+            sessions: 1,
+        }));
+        let docs = row_named(&app, "docs");
+        assert_eq!(app.old_calls(docs.agent), 2);
+        assert_eq!(docs.mean(), Some(Duration::minutes(21)));
+        assert_eq!(row_named(&app, "frontend").mean(), None);
+    }
+
+    /// Station con `backend` ejecutado tres veces (`toolu_b1` la más antigua,
+    /// `toolu_b3` en curso y la que representa la fila) y `frontend` una.
+    fn fused() -> App {
+        let mut app = App::new(60, PathBuf::from("/Users/x"), "0.1.0", NOW.parse().unwrap());
+        app.tz = Some(utc());
+        app.update(Action::Msg(Msg::Agents(vec![
+            agent("backend", Some(STATION)),
+            agent("frontend", Some(STATION)),
+        ])));
+        let mut b3 = run(
+            "backend",
+            STATION,
+            "2026-11-05T11:55:00Z",
+            4,
+            Some("toolu_b3"),
+            false,
+        );
+        b3.task = Some("revisar el cruce".into());
+        let app = with_runs(
+            app,
+            vec![
+                run(
+                    "backend",
+                    STATION,
+                    "2026-11-05T11:10:00Z",
+                    5,
+                    Some("toolu_b1"),
+                    true,
+                ),
+                run(
+                    "backend",
+                    STATION,
+                    "2026-11-05T11:30:00Z",
+                    5,
+                    Some("toolu_b2"),
+                    true,
+                ),
+                b3,
+                run(
+                    "frontend",
+                    STATION,
+                    "2026-11-05T11:40:00Z",
+                    5,
+                    Some("toolu_f1"),
+                    true,
+                ),
+            ],
+        );
+        assert_eq!(app.mode, Mode::Active, "una App nueva abre en activos");
+        app
+    }
+
+    fn open_id(app: &App) -> String {
+        app.run_detail.as_ref().unwrap().id.clone()
+    }
+
+    #[test]
+    fn a_row_per_agent_carries_its_run_count_and_the_counters_count_rows() {
+        let app = fused();
+        let lines: Vec<(usize, String, usize, String)> = app
+            .items()
+            .into_iter()
+            .filter_map(|i| match i {
+                Item::Live { n, line, .. } => Some((n, line.name, line.runs, line.id)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                (1, "backend".into(), 3, "toolu_b3".into()),
+                (2, "frontend".into(), 1, "toolu_f1".into()),
+            ]
+        );
+        assert_eq!(app.count(), 2);
+        assert_eq!((app.live_count(), app.recent_count()), (1, 1));
+        assert_eq!(live_groups(&app), vec![(STATION_SECTION.into(), 1, 1)]);
+    }
+
+    #[test]
+    fn the_filter_works_on_rows_and_rebuilds_the_group_counters() {
+        let mut app = fused();
+        type_filter(&mut app, "front");
+        assert_eq!(live_groups(&app), vec![(STATION_SECTION.into(), 0, 1)]);
+        assert_eq!(app.count(), 1);
+        let mut app = fused();
+        type_filter(&mut app, "revisar"); // encargo del representante
+        assert_eq!(live_groups(&app), vec![(STATION_SECTION.into(), 1, 0)]);
+        assert_eq!(app.count(), 1);
+    }
+
+    #[test]
+    fn enter_opens_the_representative_run_even_with_several() {
+        let mut app = fused();
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(open_id(&app), "toolu_b3");
+        assert_eq!(app.run_nav(), Some((1, 3)));
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(app.run_nav(), None, "sin ficha no hay navegación");
+    }
+
+    #[test]
+    fn left_and_right_walk_the_runs_of_the_agent_and_stop_at_the_ends() {
+        let mut app = fused();
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Right);
+        assert_eq!(
+            (open_id(&app).as_str(), app.run_nav()),
+            ("toolu_b3", Some((1, 3)))
+        );
+        key(&mut app, KeyCode::Left);
+        assert_eq!(
+            (open_id(&app).as_str(), app.run_nav()),
+            ("toolu_b2", Some((2, 3)))
+        );
+        key(&mut app, KeyCode::Char('h'));
+        assert_eq!(
+            (open_id(&app).as_str(), app.run_nav()),
+            ("toolu_b1", Some((3, 3)))
+        );
+        key(&mut app, KeyCode::Left);
+        assert_eq!(open_id(&app), "toolu_b1", "en el extremo no se mueve");
+        key(&mut app, KeyCode::Char('l'));
+        key(&mut app, KeyCode::Right);
+        assert_eq!(open_id(&app), "toolu_b3");
+        assert_eq!(app.cursor, 0, "el cursor sigue en la fila");
+        assert!(!app.run_detail.as_ref().unwrap().ended.is_some());
+    }
+
+    #[test]
+    fn without_siblings_left_and_right_do_nothing() {
+        let mut app = fused();
+        key(&mut app, KeyCode::Char('2'));
+        key(&mut app, KeyCode::Enter);
+        assert_eq!((open_id(&app).as_str(), app.run_nav()), ("toolu_f1", None));
+        key(&mut app, KeyCode::Left);
+        key(&mut app, KeyCode::Right);
+        assert_eq!(open_id(&app), "toolu_f1");
+    }
+
+    #[test]
+    fn up_and_down_change_row_and_open_its_representative() {
+        let mut app = fused();
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Left); // toolu_b2, no es la representante
+        key(&mut app, KeyCode::Down);
+        assert_eq!((open_id(&app).as_str(), app.cursor), ("toolu_f1", 1));
+        key(&mut app, KeyCode::Down);
+        assert_eq!(open_id(&app), "toolu_f1", "extremo");
+        key(&mut app, KeyCode::Up);
+        assert_eq!((open_id(&app).as_str(), app.cursor), ("toolu_b3", 0));
+        // desde una que no representa, ↑↓ parten de su fila
+        key(&mut app, KeyCode::Left);
+        key(&mut app, KeyCode::Up);
+        assert_eq!(open_id(&app), "toolu_b2", "no hay fila anterior");
+    }
+
+    #[test]
+    fn the_refresh_keeps_the_open_run_when_the_representative_changes() {
+        let mut app = fused();
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Left);
+        key(&mut app, KeyCode::Left);
+        assert_eq!(open_id(&app), "toolu_b1");
+        let mut runs = app.runs.clone();
+        runs.push(run(
+            "backend",
+            STATION,
+            "2026-11-05T11:58:00Z",
+            1,
+            Some("toolu_b4"),
+            false,
+        ));
+        let calls = app.calls.clone();
+        app.update(Action::Msg(Msg::Activity {
+            calls,
+            runs,
+            sessions: 4,
+        }));
+        app.update(Action::Tick("2026-11-05T12:00:30Z".parse().unwrap()));
+        assert_eq!(open_id(&app), "toolu_b1");
+        assert_eq!(app.run_nav().map(|(_, total)| total), Some(4));
+        // y con ella abierta, Esc vuelve a la fila que la contiene
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.cursor, 1);
+    }
+
+    #[test]
+    fn esc_returns_to_the_row_that_contains_the_open_run() {
+        let mut app = fused();
+        key(&mut app, KeyCode::Char('2'));
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Up);
+        key(&mut app, KeyCode::Left);
+        key(&mut app, KeyCode::Left);
+        assert_eq!(open_id(&app), "toolu_b1");
+        app.cursor = 1; // fuera de sitio a propósito
+        key(&mut app, KeyCode::Esc);
+        assert!(app.run_detail.is_none());
+        assert_eq!(app.cursor, 0, "toolu_b1 vive en la fila de backend");
+    }
+
+    #[test]
+    fn the_agent_detail_opens_from_a_run_that_is_not_the_representative() {
+        let mut app = fused();
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Left);
+        assert!(app.can_open_agent());
+        key(&mut app, KeyCode::Char('a'));
+        assert!(app.detail && app.run_detail.is_none());
+        assert_eq!(app.agent(app.current().unwrap().agent).name, "backend");
+    }
+
+    #[test]
+    fn the_run_detail_exposes_the_temp_cwd_fields() {
+        let mut app = fused();
+        key(&mut app, KeyCode::Enter);
+        let d = app.run_detail.as_ref().unwrap();
+        assert_eq!((d.temp_cwd.as_deref(), d.cwd_resolved), (None, false));
+    }
+
+    /// Un uso con `total` tokens repartidos en entrada y salida, y el contexto
+    /// del último mensaje sobre una ventana de 200k.
+    fn usage(total: u64, context: u64) -> crate::runs::usage::Usage {
+        crate::runs::usage::Usage {
+            tokens: crate::runs::usage::Tokens {
+                input: total - total / 4,
+                output: total / 4,
+                cache_read: 0,
+                cache_creation: 0,
+            },
+            model: Some("claude-opus-5-5".into()),
+            context: Some(context),
+            context_window: 200_000,
+        }
+    }
+
+    /// `fused` con tokens: b1 1000, b2 2000, b3 (en curso) 4000 con 50k de
+    /// contexto, f1 300.
+    fn fused_with_tokens() -> App {
+        let mut app = fused();
+        let mut runs = app.runs.clone();
+        for r in &mut runs {
+            r.usage = match r.tool_use_id.as_deref() {
+                Some("toolu_b1") => usage(1000, 900),
+                Some("toolu_b2") => usage(2000, 1900),
+                Some("toolu_b3") => usage(4000, 50_000),
+                _ => usage(300, 200),
+            };
+        }
+        app = with_runs(app, runs);
+        app
+    }
+
+    fn live_line(app: &App, n: usize) -> NowLine {
+        app.items()
+            .into_iter()
+            .find_map(|i| match i {
+                Item::Live { n: m, line, .. } if m == n => Some(line),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn live_lines_carry_the_tokens_of_the_row_and_the_context_only_running() {
+        let app = fused_with_tokens();
+        let backend = live_line(&app, 1);
+        assert_eq!(backend.tokens, 7000, "las tres ejecuciones de la fila");
+        let ctx = backend.context.unwrap();
+        assert_eq!((ctx.used, ctx.window, ctx.percent()), (50_000, 200_000, 25));
+        let frontend = live_line(&app, 2);
+        assert_eq!((frontend.tokens, frontend.context), (300, None));
+    }
+
+    #[test]
+    fn the_active_header_sums_the_tokens_of_the_rows_it_shows() {
+        let mut app = fused_with_tokens();
+        assert_eq!(app.live_tokens(), 7300);
+        type_filter(&mut app, "front");
+        assert_eq!(app.live_tokens(), 300, "solo lo que deja el filtro");
+        let mut app = fused_with_tokens();
+        type_filter(&mut app, "nada-que-encaje");
+        assert_eq!(app.live_tokens(), 0);
+    }
+
+    /// Una ejecución con id de datos `data` y `tool_use_id` `tool`, en
+    /// station, que empezó `start` y trabajó `mins`; terminada si `finished`.
+    fn linked(agent_type: &str, data: &str, tool: &str, start: &str, mins: i64) -> Run {
+        // las que acaban a las 11:58 siguen en curso; las demás, terminadas
+        let end = start.parse::<DateTime<Utc>>().unwrap() + Duration::minutes(mins);
+        let finished = end < "2026-11-05T11:58:00Z".parse::<DateTime<Utc>>().unwrap();
+        let mut r = run(agent_type, STATION, start, mins, Some(tool), finished);
+        r.id = data.into();
+        r.session_id = Some("sess-1234abcd".into());
+        r.session_prompt = Some("arregla el ranking".into());
+        r
+    }
+
+    /// Station: `backend` (toolu_p, en curso) lanzó `frontend` (toolu_c1,
+    /// terminada) y `docs` (toolu_c2, en curso); `docs` lanzó a su vez
+    /// `visual` (toolu_g1). `backend` lo lanzó la sesión.
+    fn family() -> App {
+        let mut app = App::new(60, PathBuf::from("/Users/x"), "0.1.0", NOW.parse().unwrap());
+        app.tz = Some(utc());
+        app.update(Action::Msg(Msg::Agents(vec![
+            agent("backend", Some(STATION)),
+            agent("frontend", Some(STATION)),
+            agent("docs", Some(STATION)),
+            agent("visual", Some(STATION)),
+        ])));
+        let mut p = linked("backend", "a-p", "toolu_p", "2026-11-05T11:40:00Z", 18);
+        p.children = vec!["a-c1".into(), "a-c2".into()];
+        let mut c1 = linked("frontend", "a-c1", "toolu_c1", "2026-11-05T11:42:00Z", 3);
+        c1.parent_run = Some("a-p".into());
+        let mut c2 = linked("docs", "a-c2", "toolu_c2", "2026-11-05T11:45:00Z", 13);
+        c2.parent_run = Some("a-p".into());
+        c2.children = vec!["a-g1".into()];
+        let mut g1 = linked("visual", "a-g1", "toolu_g1", "2026-11-05T11:50:00Z", 8);
+        g1.parent_run = Some("a-c2".into());
+        with_runs(app, vec![p, c1, c2, g1])
+    }
+
+    /// Abre la ficha de la ejecución `tool` desde la lista de activos.
+    fn open_from_list(app: &mut App, tool: &str) {
+        let n = app
+            .items()
+            .into_iter()
+            .find_map(|i| match i {
+                Item::Live { n, line, .. } if line.id == tool => Some(n),
+                _ => None,
+            })
+            .unwrap();
+        app.cursor = n - 1;
+        key(app, KeyCode::Enter);
+        assert_eq!(open_id(app), tool);
+    }
+
+    #[test]
+    fn tab_walks_the_launched_runs_and_enter_opens_the_selected_one() {
+        let mut app = family();
+        open_from_list(&mut app, "toolu_p");
+        let launched: Vec<String> = app
+            .run_detail
+            .as_ref()
+            .unwrap()
+            .launched
+            .iter()
+            .map(|l| l.id.clone())
+            .collect();
+        assert_eq!(launched, vec!["toolu_c1", "toolu_c2"]);
+        assert_eq!(app.launched_sel, None, "al abrir no hay ninguna elegida");
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.launched_sel, Some(0));
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.launched_sel, Some(1));
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.launched_sel, None, "tras la última, ninguna");
+        key(&mut app, KeyCode::BackTab);
+        assert_eq!(app.launched_sel, Some(1), "shift-tab, desde el final");
+        key(&mut app, KeyCode::BackTab);
+        key(&mut app, KeyCode::BackTab);
+        assert_eq!(app.launched_sel, None);
+        key(&mut app, KeyCode::Tab);
+        key(&mut app, KeyCode::Tab);
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(open_id(&app), "toolu_c2");
+        assert_eq!(app.launched_sel, None, "la hija se abre sin elegida");
+        assert!(app.can_go_back());
+    }
+
+    #[test]
+    fn digits_in_the_run_detail_select_a_launched_run() {
+        let mut app = family();
+        open_from_list(&mut app, "toolu_p");
+        key(&mut app, KeyCode::Char('2'));
+        assert_eq!(app.launched_sel, Some(1));
+        key(&mut app, KeyCode::Char('9'));
+        assert_eq!(app.launched_sel, Some(1), "fuera de rango no cambia");
+        key(&mut app, KeyCode::Char('1'));
+        assert_eq!(app.launched_sel, Some(0));
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(open_id(&app), "toolu_c1");
+    }
+
+    #[test]
+    fn without_launched_runs_tab_and_digits_select_nothing() {
+        let mut app = family();
+        open_from_list(&mut app, "toolu_c1");
+        key(&mut app, KeyCode::Tab);
+        key(&mut app, KeyCode::Char('1'));
+        assert_eq!(app.launched_sel, None);
+        key(&mut app, KeyCode::Enter);
+        assert!(app.run_detail.is_none(), "sin elegida, Enter vuelve");
+    }
+
+    #[test]
+    fn esc_goes_back_through_the_opened_runs_and_then_to_the_list() {
+        let mut app = family();
+        open_from_list(&mut app, "toolu_p");
+        let cursor = app.cursor;
+        app.steps_scroll = 0;
+        key(&mut app, KeyCode::Char('2'));
+        key(&mut app, KeyCode::Enter); // docs
+        key(&mut app, KeyCode::Char('1'));
+        key(&mut app, KeyCode::Enter); // visual
+        assert_eq!(open_id(&app), "toolu_g1");
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(open_id(&app), "toolu_c2");
+        assert_eq!(
+            app.launched_sel,
+            Some(0),
+            "vuelve con la hija que abrió elegida"
+        );
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(open_id(&app), "toolu_p");
+        assert_eq!(app.launched_sel, Some(1));
+        assert!(!app.can_go_back());
+        key(&mut app, KeyCode::Esc);
+        assert!(app.run_detail.is_none());
+        assert_eq!(app.cursor, cursor, "el cursor sigue en la fila de partida");
+    }
+
+    #[test]
+    fn p_opens_the_parent_run_and_esc_returns_to_the_child() {
+        let mut app = family();
+        open_from_list(&mut app, "toolu_g1");
+        assert!(app.can_open_parent());
+        key(&mut app, KeyCode::Char('p'));
+        assert_eq!(open_id(&app), "toolu_c2");
+        key(&mut app, KeyCode::Char('p'));
+        assert_eq!(open_id(&app), "toolu_p");
+        assert!(!app.can_open_parent(), "a backend lo lanzó la sesión");
+        key(&mut app, KeyCode::Char('p'));
+        assert_eq!(open_id(&app), "toolu_p", "sin madre, p no hace nada");
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(open_id(&app), "toolu_c2");
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(open_id(&app), "toolu_g1");
+        key(&mut app, KeyCode::Esc);
+        assert!(app.run_detail.is_none());
+    }
+
+    #[test]
+    fn a_parent_that_is_gone_cannot_be_opened() {
+        let mut app = family();
+        let runs: Vec<Run> = app
+            .runs
+            .iter()
+            .filter(|r| r.id != "a-c2")
+            .cloned()
+            .collect();
+        app = with_runs(app, runs);
+        open_from_list(&mut app, "toolu_g1");
+        assert!(matches!(
+            app.run_detail.as_ref().unwrap().launched_by,
+            Some(status::LaunchedBy::GoneRun { .. })
+        ));
+        assert!(!app.can_open_parent());
+        key(&mut app, KeyCode::Char('p'));
+        assert_eq!(open_id(&app), "toolu_g1");
+    }
+
+    #[test]
+    fn up_and_down_leave_the_back_stack_and_left_right_keep_it() {
+        let mut app = family();
+        open_from_list(&mut app, "toolu_p");
+        key(&mut app, KeyCode::Char('1'));
+        key(&mut app, KeyCode::Enter);
+        assert!(app.can_go_back());
+        key(&mut app, KeyCode::Left); // sin hermanas: nada, la pila sigue
+        assert!(app.can_go_back());
+        key(&mut app, KeyCode::Up); // frontend es la última de la lista
+        assert_eq!(open_id(&app), "toolu_p");
+        assert!(!app.can_go_back(), "↑↓ vuelven a recorrer la lista");
+        key(&mut app, KeyCode::Esc);
+        assert!(app.run_detail.is_none());
+    }
+
+    #[test]
+    fn the_agent_key_from_a_child_clears_the_back_stack() {
+        let mut app = family();
+        open_from_list(&mut app, "toolu_p");
+        key(&mut app, KeyCode::Char('1'));
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Char('a'));
+        assert!(app.detail && app.run_detail.is_none());
+        assert_eq!(app.agent(app.current().unwrap().agent).name, "frontend");
+        assert!(!app.can_go_back());
+    }
+
+    #[test]
+    fn the_selection_shrinks_when_a_launched_run_disappears() {
+        let mut app = family();
+        open_from_list(&mut app, "toolu_p");
+        key(&mut app, KeyCode::Char('2'));
+        let runs: Vec<Run> = app
+            .runs
+            .iter()
+            .filter(|r| r.id != "a-c2")
+            .cloned()
+            .collect();
+        app = with_runs(app, runs);
+        assert_eq!(app.run_detail.as_ref().unwrap().launched.len(), 1);
+        assert_eq!(app.launched_sel, Some(0));
+    }
+
+    /// `ranking()` con tokens: docs 500 + 100 (la de hace 40 días), visual
+    /// 9000, frontend 2000; y `backend` con una ejecución de 0 min de ayer
+    /// con 50 tokens.
+    fn ranking_with_tokens() -> App {
+        let app = ranking();
+        let mut runs = app.runs.clone();
+        for r in &mut runs {
+            r.usage = match (r.agent_type.as_str(), r.worked.num_minutes()) {
+                ("docs", 50) => usage(500, 1),
+                ("docs", _) => usage(100, 1),
+                ("visual", _) => usage(9000, 1),
+                _ => usage(2000, 1),
+            };
+        }
+        let mut idle = run("backend", STATION, "2026-11-04T08:00:00Z", 0, None, true);
+        idle.usage = usage(50, 1);
+        idle.worked_slots.clear();
+        runs.push(idle);
+        with_runs(app, runs)
+    }
+
+    fn stats(app: &App) -> Vec<(String, i64, u64, usize)> {
+        app.items()
+            .iter()
+            .filter_map(|i| match i {
+                Item::Rank { row, work } => Some((
+                    app.agent(row.agent).name.clone(),
+                    work.worked.num_minutes(),
+                    work.tokens,
+                    work.runs,
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_ranking_carries_tokens_and_includes_runs_without_worked_time() {
+        let app = ranking_with_tokens();
+        assert_eq!(app.rank_key, RankKey::Worked);
+        assert_eq!(
+            stats(&app),
+            vec![
+                ("docs".into(), 72, 600, 2),
+                ("visual".into(), 30, 9000, 1),
+                ("frontend".into(), 5, 2000, 1),
+                ("backend".into(), 0, 50, 1),
+            ]
+        );
+        assert!(matches!(app.items()[0], Item::RankRule { agents: 4 }));
+        assert_eq!(
+            app.ranking_total(),
+            PeriodStats {
+                worked: Duration::minutes(107),
+                runs: 5,
+                tokens: 11_650,
+            }
+        );
+    }
+
+    #[test]
+    fn s_cycles_the_rank_key_and_reorders_the_ranking() {
+        let mut app = ranking_with_tokens();
+        let order = |app: &App| -> Vec<String> { stats(app).into_iter().map(|s| s.0).collect() };
+        key(&mut app, KeyCode::Char('s'));
+        assert_eq!(app.rank_key, RankKey::Tokens);
+        assert_eq!(order(&app), vec!["visual", "frontend", "docs", "backend"]);
+        let ns: Vec<usize> = app.rows().iter().map(|r| r.n).collect();
+        assert_eq!(ns, vec![1, 2, 3, 4]);
+        key(&mut app, KeyCode::Char('s'));
+        assert_eq!(app.rank_key, RankKey::Runs);
+        // docs 2; el resto 1, desempatados por trabajado
+        assert_eq!(order(&app), vec!["docs", "visual", "frontend", "backend"]);
+        key(&mut app, KeyCode::Char('s'));
+        assert_eq!(app.rank_key, RankKey::Worked);
+    }
+
+    #[test]
+    fn s_only_acts_in_the_ranking() {
+        let mut app = fixture();
+        key(&mut app, KeyCode::Char('s'));
+        assert_eq!(app.rank_key, RankKey::Worked);
+        let mut app = fused();
+        key(&mut app, KeyCode::Char('s'));
+        assert_eq!(app.rank_key, RankKey::Worked);
+    }
+
+    #[test]
+    fn the_ranking_counts_the_runs_kept_only_in_the_history_cache() {
+        let app = ranking();
+        assert_eq!(app.cached_only(), 0);
+        let mut runs = app.runs.clone();
+        runs[1].from_cache = true;
+        runs[3].from_cache = true;
+        let app = with_runs(app, runs);
+        assert_eq!(app.cached_only(), 2);
+    }
+}

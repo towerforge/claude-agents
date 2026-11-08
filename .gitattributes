@@ -1,0 +1,3 @@
+# LF everywhere: install.sh and the Makefile must reach Linux and macOS with
+# LF, whatever the checkout
+* text=auto eol=lf
