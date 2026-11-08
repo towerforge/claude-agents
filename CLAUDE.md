@@ -5,7 +5,8 @@ Claude Code que hay en disco y marca cuáles se han invocado hace poco, con su
 tiempo, tokens y quién los lanzó: pantalla
 ratatui al estilo de moon en una terminal, tabla con `--plain`. Corre en el host,
 sin Docker (solo `cross` usa Docker para empaquetar Linux). Se publica por
-GitHub Actions y se instala con `install.sh`. Detalle en [README.md](README.md).
+GitHub Actions y se instala con `install.sh`. Detalle en [README.md](README.md)
+y en `docs/` (pantalla, funcionamiento, releases).
 
 ## Reparto entre agentes
 
@@ -17,7 +18,7 @@ Cada instrucción va al agente de su apartado (`.claude/agents/`):
 | `backend` | El cruce y la orquestación: `src/status.rs` y `src/status/pricing.rs`, `main()` de `src/main.rs`, el bucle y el hilo de lectura de `src/tui/mod.rs` y `src/tui/scan.rs`, `Cargo.toml`, `Makefile`, `.github/workflows/`, `install.sh` |
 | `frontend` | Lo que sale y cómo se maneja: flags y ayuda (`struct Cli` en `src/main.rs`), columnas y orden, teclas, filtro y ficha (`src/tui/app.rs`) |
 | `visual` | Cómo se pinta: `src/report.rs`, `src/tui/view.rs`, `src/tui/theme.rs` y las cadenas de formato. Sin lógica |
-| `docs` | `README.md` (en inglés de EE. UU.), `CLAUDE.md` (en castellano), `docs/` (sin código) |
+| `docs` | `README.md` (en inglés de EE. UU.), `CLAUDE.md` (en castellano), `docs/` (en inglés, sin código), `assets/readme/` (imágenes del README, SVG a mano y con datos inventados) |
 
 - Si toca varios apartados, en este orden: data → backend → frontend → visual →
   docs. Pasa a cada agente lo que dejó el anterior (tipos, funciones, flags).

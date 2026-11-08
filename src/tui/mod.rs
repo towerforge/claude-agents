@@ -41,12 +41,14 @@ pub fn run(cfg: Config) -> Result<()> {
         scan::Sources {
             roots: cfg.roots,
             home: cfg.home.clone(),
-            projects: cfg.projects,
+            projects: cfg.projects.clone(),
             history: cfg.history,
         },
         rescan_rx,
     );
     let mut app = App::new(cfg.minutes, cfg.home, cfg.version, Utc::now());
+    // la carpeta que la pantalla de carga dice estar leyendo
+    app.projects = cfg.projects;
 
     let mut terminal = ratatui::init();
     let mouse = Mouse::enable();

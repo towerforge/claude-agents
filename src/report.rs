@@ -43,6 +43,17 @@ pub fn worked(d: chrono::TimeDelta) -> String {
     }
 }
 
+/// Lo que lleva una espera: "1.2 s" con una décima (truncada, nunca
+/// "60.0 s") por debajo del minuto; desde ahí, como `worked` ("2 min").
+pub fn elapsed(d: chrono::TimeDelta) -> String {
+    let tenths = d.num_milliseconds().max(0) / 100;
+    if tenths < 600 {
+        format!("{}.{} s", tenths / 10, tenths % 10)
+    } else {
+        worked(d)
+    }
+}
+
 const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
@@ -174,6 +185,18 @@ mod tests {
         let now = t("2026-11-05T12:00:00Z");
         assert_eq!(last_seen(Some(t("2026-11-05T11:57:00Z")), now), "3 min ago");
         assert_eq!(last_seen(None, now), "never");
+    }
+
+    #[test]
+    fn elapsed_in_tenths_of_a_second_then_like_worked() {
+        let ms = chrono::TimeDelta::milliseconds;
+        assert_eq!(elapsed(ms(0)), "0.0 s");
+        assert_eq!(elapsed(ms(1_200)), "1.2 s");
+        // se trunca: nunca sale «60.0 s»
+        assert_eq!(elapsed(ms(59_999)), "59.9 s");
+        assert_eq!(elapsed(ms(60_000)), "1 min");
+        assert_eq!(elapsed(ms((3 * 60 + 5) * 60_000)), "3 h 5 min");
+        assert_eq!(elapsed(ms(-500)), "0.0 s");
     }
 
     #[test]

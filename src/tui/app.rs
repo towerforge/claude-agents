@@ -347,6 +347,11 @@ pub struct App {
     /// historial, para no pintar a todos como «nunca» durante ese segundo.
     agents_in: bool,
     pub now: DateTime<Utc>,
+    /// Cuándo se abrió la pantalla: la espera de la carga cuenta desde aquí.
+    pub started: DateTime<Utc>,
+    /// Carpeta de las transcripciones (`~/.claude/projects`), la lectura que
+    /// la pantalla de carga nombra. Vacía si nadie la ha dado.
+    pub projects: PathBuf,
     /// Zona de los días y las horas: `None` es la local; los tests fijan una.
     pub tz: Option<FixedOffset>,
     pub error: Option<String>,
@@ -406,6 +411,8 @@ impl App {
             loaded: false,
             agents_in: false,
             now,
+            started: now,
+            projects: PathBuf::new(),
             tz: None,
             error: None,
             cursor: 0,

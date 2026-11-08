@@ -50,6 +50,15 @@ const RANKING_KEYS: &[(&str, &str)] = &[
 /// Las teclas del pie que se quitan, en este orden, cuando no cabe el contador.
 const MINOR_KEYS: &[&str] = &["o", "/", "enter"];
 
+/// Pie mientras carga: sin lista, mover, abrir, filtrar o cambiar de modo aún
+/// no muestran nada.
+const LOADING_KEYS: &[(&str, &str)] = &[("q", "quit")];
+/// Columnas mínimas del texto de la carga tras la estrella (una letra y `…`);
+/// con menos, solo la estrella.
+const LOADING_TEXT_MIN: usize = 2;
+/// Columnas mínimas de la ruta de la carga; con menos, solo el tiempo.
+const LOADING_PATH_MIN: usize = 4;
+
 const DETAIL_KEYS: &[(&str, &str)] = &[("esc", "back"), ("↑↓", "other agent"), ("q", "quit")];
 
 /// Pie de la ficha de ejecución. Cada una sale solo si vale (`run_footer`).
@@ -108,10 +117,9 @@ const BAR_MIN: usize = 8;
 const CHART_ROWS: usize = 4;
 /// Bloques del gráfico de la ficha, de un octavo a lleno.
 const LEVELS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-/// La barrita de «todos» en braille, que no llena la celda y no se pega a la
-/// fila de abajo: el cero y los cuatro cuartiles del máximo de la fila.
-const SPARK_ZERO: char = '·';
-const SPARK_LEVELS: [char; 4] = ['⣀', '⣤', '⣶', '⣿'];
+/// El cero de la barrita de «todos»: raya fina, como una regla. Lo demás usa
+/// las rayas del ranking (`RANK_HALF` y `RANK_FULL`), un carácter por día.
+const SPARK_ZERO: char = '─';
 /// Fracciones de la barra horizontal, de un octavo a siete.
 const EIGHTHS: [char; 7] = ['▏', '▎', '▍', '▌', '▋', '▊', '▉'];
 /// La barra del ranking: raya gruesa por celda llena y media raya por media
@@ -220,25 +228,27 @@ fn ratio(v: TimeDelta, max: TimeDelta) -> f64 {
     }
 }
 
-/// Barrita de días: un carácter por día. `·` es el cero; lo demás, el
-/// cuartil del máximo de la fila en que cae (`⣀` hasta un cuarto, `⣿` el
-/// último), así que lo poco que no sea cero nunca se confunde con él.
+/// Barrita de días: un carácter por día, con el estilo de la barra del
+/// ranking. `─` es el cero; hasta la mitad del máximo de la fila, media raya
+/// `╸`; por encima, raya entera `━`. Lo poco que no sea cero nunca se
+/// confunde con él.
 fn spark(days: &[TimeDelta]) -> String {
     let max = days.iter().copied().max().unwrap_or_default();
     days.iter()
         .map(|&d| {
             if d <= TimeDelta::zero() {
                 SPARK_ZERO
+            } else if ratio(d, max) <= 0.5 {
+                RANK_HALF
             } else {
-                let q = (ratio(d, max) * 4.0).ceil() as usize;
-                SPARK_LEVELS[q.clamp(1, 4) - 1]
+                RANK_FULL
             }
         })
         .collect()
 }
 
-/// La barrita en tramos de un color: el cero en `subtle`, lo demás en
-/// `claude-soft`.
+/// La barrita en tramos de un color: el cero (`─`) en `subtle`, las rayas
+/// en `claude-soft`.
 fn spark_spans(days: &[TimeDelta], t: &Theme) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     let mut run = String::new();
@@ -439,7 +449,7 @@ pub fn render(app: &mut App, frame: &mut Frame, t: &Theme) {
             scrollbar = Some((body, items.len()));
         }
         if !app.loaded {
-            lines.push(Line::from(Span::styled(" loading agents…", t.muted())));
+            lines.extend(loading_lines(app, t, w, body_h));
         } else if items.is_empty() {
             let why = match (app.mode, app.filter.is_empty()) {
                 // sin filtro, el monitor vacío es `Item::Quiet`
@@ -476,7 +486,12 @@ pub fn render(app: &mut App, frame: &mut Frame, t: &Theme) {
                 )));
             }
         }
-        footer_line(app, t, w, items.len(), body_h)
+        if app.loaded {
+            footer_line(app, t, w, items.len(), body_h)
+        } else {
+            let keys = keys_spans(app, t, LOADING_KEYS, false, false);
+            footer_with_version(app, t, w, keys, None)
+        }
     };
     while lines.len() < 2 + body_h {
         lines.push(Line::default());
@@ -487,6 +502,56 @@ pub fn render(app: &mut App, frame: &mut Frame, t: &Theme) {
     if let Some((body, total)) = scrollbar {
         render_scrollbar(frame, t, body, total, body_h, app.scroll);
     }
+}
+
+/// ```text
+///                      ✦ loading agents
+///                ~/.claude/projects · 1.2 s
+/// ```
+///
+/// El cuerpo mientras llega la primera lectura, centrado en los dos ejes: la
+/// estrella que parpadea en `claude` y el texto en `ink`; debajo, en gris, la
+/// carpeta de las transcripciones (la lectura más larga) y lo que se lleva
+/// esperando. Estrecha, la ruta se corta con `…` y luego se va, quedando el
+/// tiempo; el texto se corta igual y, si no queda ni una letra, solo la
+/// estrella. Baja, sin sitio para dos líneas, solo la primera.
+fn loading_lines(app: &App, t: &Theme, w: usize, body_h: usize) -> Vec<Line<'static>> {
+    // una columna libre a cada lado, como el resto de la pantalla
+    let room = w.saturating_sub(2);
+    let mut first = vec![Span::styled(star(app.now), t.accent())];
+    if room >= 2 + LOADING_TEXT_MIN {
+        first.push(Span::styled(
+            format!(" {}", truncate("loading agents", room - 2)),
+            t.text(),
+        ));
+    }
+    let mut shown = vec![centered(first, w)];
+    let time = report::elapsed(app.now - app.started);
+    let path_room = room.saturating_sub(width(&time) + 3);
+    let second = match app.projects.as_os_str().is_empty() {
+        false if path_room >= LOADING_PATH_MIN => {
+            let path = report::shorten(&app.projects, &app.home);
+            format!("{} · {time}", truncate(&path, path_room))
+        }
+        _ => time,
+    };
+    if body_h >= 2 && width(&second) <= room {
+        shown.push(centered(vec![Span::styled(second, t.muted())], w));
+    }
+    if body_h < shown.len() {
+        shown.truncate(body_h);
+        return shown;
+    }
+    let mut lines = vec![Line::default(); (body_h - shown.len()) / 2];
+    lines.extend(shown);
+    lines
+}
+
+/// Una línea centrada en `w` columnas: el hueco sobrante, a medias delante.
+fn centered(mut spans: Vec<Span<'static>>, w: usize) -> Line<'static> {
+    let pad = w.saturating_sub(spans_width(&spans)) / 2;
+    spans.insert(0, Span::raw(" ".repeat(pad)));
+    Line::from(spans)
 }
 
 /// ` ✦ visual [propio] vía workflow · station              lleva 4 min · 38 herr.`
@@ -1571,7 +1636,7 @@ fn item_lines(app: &App, item: &Item, cols: &Columns, t: &Theme, w: usize) -> Ve
     vec![line]
 }
 
-/// ` station · 6 agentes · 1 en curso ──   ⣀⣿⣶·  6 h 12 min      51            `
+/// ` station · 6 agentes · 1 en curso ──   ╸━━─  6 h 12 min      51            `
 ///
 /// La regla de un grupo abierto: carpeta en `claude`, cuántos agentes en
 /// `ink-muted` y, si alguno está en curso, cuántos en `claude`; la regla acaba
@@ -2724,14 +2789,30 @@ mod tests {
     }
 
     #[test]
-    fn spark_is_braille_by_quartiles_of_the_row_max() {
+    fn spark_is_half_or_full_dash_by_half_of_the_row_max() {
         let days = mins(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 22, 50, 0]);
-        assert_eq!(spark(&days), format!("{}⣤⣿·", "·".repeat(11)));
-        // un cuartil por altura; el máximo, lleno
-        assert_eq!(spark(&mins(&[10, 20, 30, 40])), "⣀⣤⣶⣿");
+        assert_eq!(spark(&days), format!("{}╸━─", "─".repeat(11)));
+        // hasta la mitad del máximo, media raya; por encima, raya entera
+        assert_eq!(spark(&mins(&[10, 20, 30, 40])), "╸╸━━");
         // lo poco que no sea cero no se confunde con el cero
-        assert_eq!(spark(&mins(&[1, 100])), "⣀⣿");
-        assert_eq!(spark(&mins(&[0; 14])), "·".repeat(14));
+        assert_eq!(spark(&mins(&[1, 100])), "╸━");
+        // un agente nunca usado: catorce ceros
+        assert_eq!(spark(&mins(&[0; 14])), "─".repeat(14));
+    }
+
+    #[test]
+    fn spark_spans_put_zeros_in_subtle_and_the_rest_in_claude_soft() {
+        let t = Theme::claude_256();
+        let spans = spark_spans(&mins(&[0, 0, 22, 50, 0]), &t);
+        let got: Vec<(&str, Style)> = spans.iter().map(|s| (&*s.content, s.style)).collect();
+        assert_eq!(
+            got,
+            vec![("──", t.line()), ("╸━", t.soft()), ("─", t.line())]
+        );
+        let spans = spark_spans(&mins(&[0; 14]), &t);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content, "─".repeat(14));
+        assert_eq!(spans[0].style, t.line());
     }
 
     #[test]
@@ -3030,7 +3111,12 @@ mod tests {
             assert!(line_of(&lines, "frontend").ends_with("2 min ago"));
             assert_eq!(end_of(station), edge, "{w}: {station:?}");
             // la regla acaba dos columnas antes del bloque de la derecha
-            let rule_end = width(&station[..station.rfind('─').unwrap()]) + 1;
+            // (en ancha, la barrita del grupo acaba en `─`: se busca antes de ella)
+            let before = match station.find(&format!("  {}╸━─", "─".repeat(11))) {
+                Some(i) if w >= 100 => &station[..i],
+                _ => station.as_str(),
+            };
+            let rule_end = width(&before[..before.rfind('─').unwrap()]) + 1;
             let block = if w >= 100 {
                 col(head, "last 14 days") as usize - (spark_w() - width("last 14 days"))
             } else {
@@ -3038,8 +3124,8 @@ mod tests {
             };
             assert_eq!(rule_end + 2, block, "{w}:\n{head}\n{station}");
             if w >= 100 {
-                // la barrita del grupo, en braille y bajo su cabecera
-                let spark = format!("{}⣤⣿·", "·".repeat(11));
+                // la barrita del grupo, en rayas y bajo su cabecera
+                let spark = format!("{}╸━─", "─".repeat(11));
                 assert!(station.contains(&spark), "{w}: {station:?}");
                 assert_eq!(end_col(station, &spark), end_col(head, "last 14 days"));
             }
@@ -3122,9 +3208,13 @@ mod tests {
             .contains(ratatui::style::Modifier::BOLD));
         let at = col(station, "3    2 min");
         assert_eq!(buf[(at, y)].style().fg, Some(t.ink_muted));
-        assert_eq!(buf[(col(station, "⣿"), y)].style().fg, Some(t.claude_soft));
-        let zero = col(station, "⣿") + 1;
-        assert_eq!(buf[(zero, y)].symbol(), "·");
+        assert_eq!(buf[(col(station, "╸━"), y)].style().fg, Some(t.claude_soft));
+        assert_eq!(
+            buf[(col(station, "╸━") + 1, y)].style().fg,
+            Some(t.claude_soft)
+        );
+        let zero = col(station, "╸━") + 2;
+        assert_eq!(buf[(zero, y)].symbol(), "─");
         assert_eq!(buf[(zero, y)].style().fg, Some(t.subtle));
     }
 
@@ -3133,12 +3223,12 @@ mod tests {
         let lines = draw(&mut worked(), 110, 16);
         let head = &lines[2];
         let docs = line_of(&lines, "docs");
-        assert!(docs.contains(&format!("{}⣤⣿·", "·".repeat(11))), "{docs:?}");
+        assert!(docs.contains(&format!("{}╸━─", "─".repeat(11))), "{docs:?}");
         assert!(docs.ends_with("1 h 12 min      2    8 min ago"), "{docs:?}");
         // cada columna bajo su cabecera; la de la barrita, alineada a la derecha
         assert_eq!(
             end_col(head, "days"),
-            end_col(docs, "⣤⣿·"),
+            end_col(docs, "╸━─"),
             "{head:?}\n{docs:?}"
         );
         let end = |l: &str, pat: &str| col(l, pat) + width(pat) as u16;
@@ -3148,10 +3238,10 @@ mod tests {
         assert!(head.ends_with("last used"), "{head:?}");
         // sin ejecuciones: barrita a cero y columnas vacías
         let visual = line_of(&lines, "visual");
-        assert!(visual.contains(&"·".repeat(14)), "{visual:?}");
+        assert!(visual.contains(&"─".repeat(14)), "{visual:?}");
         let gap = SPARK_GAP + 10 + COL_GAP + 4 + COL_GAP + 3;
         assert!(
-            visual.ends_with(&format!("·{}5 s ago", " ".repeat(gap))),
+            visual.ends_with(&format!("─{}5 s ago", " ".repeat(gap))),
             "{visual:?}"
         );
     }
@@ -3162,7 +3252,7 @@ mod tests {
         let mut app = worked();
         let lines = draw(&mut app, 110, 16);
         let docs = line_of(&lines, "docs");
-        let (y, x) = (y_of(&lines, docs), col(docs, "⣤"));
+        let (y, x) = (y_of(&lines, docs), col(docs, "╸━"));
         let buf = draw_buf(&mut app, 110, 16);
         assert_eq!(buf[(x, y)].style().fg, Some(t.claude_soft));
         assert_eq!(buf[(x - 1, y)].style().fg, Some(t.subtle));
@@ -3174,7 +3264,7 @@ mod tests {
         assert!(!lines[2].contains("last 14"), "{:?}", lines[2]);
         assert!(lines[2].contains("runs"), "{:?}", lines[2]);
         let docs = line_of(&lines, "docs");
-        assert!(!docs.contains('·') && !docs.contains('⣿'), "{docs:?}");
+        assert!(!docs.contains(['─', '╸', '━']), "{docs:?}");
         assert!(docs.ends_with("1 h 12 min      2    8 min ago"), "{docs:?}");
         let lines = draw(&mut worked(), 79, 16);
         assert!(!lines[2].contains("runs"), "{:?}", lines[2]);
@@ -3266,7 +3356,7 @@ mod tests {
             assert_eq!(end_col(docs, "8 min ago"), edge, "{w}: {docs:?}");
             if w >= 100 {
                 // la barrita acaba dos antes de lo trabajado, y su cabecera con ella
-                let spark_end = end_col(docs, "⣤⣿·");
+                let spark_end = end_col(docs, "╸━─");
                 assert_eq!(spark_end + SPARK_GAP, col(docs, "1 h 12 min") as usize);
                 assert_eq!(end_col(head, "last 14 days"), spark_end, "{head:?}");
                 // el hueco sobrante, entre el nombre y la barrita
@@ -3275,7 +3365,7 @@ mod tests {
                 assert!(gap >= NAME_GAP, "{w}: {docs:?}");
                 gaps.push(gap);
             } else {
-                assert!(!docs.contains('⣿'), "{w}: {docs:?}");
+                assert!(!docs.contains(['─', '╸', '━']), "{w}: {docs:?}");
             }
         }
         // cuarenta columnas más, cuarenta más de hueco
@@ -4745,7 +4835,7 @@ mod tests {
         assert!(lines[y].starts_with(" ❯  6. ▾ _argibox"), "{:?}", lines[y]);
         let row = &lines[y + 1];
         assert!(row.starts_with("    7. ai-engineer"), "{row:?}");
-        assert!(row.contains(&"·".repeat(14)), "{row:?}");
+        assert!(row.contains(&"─".repeat(14)), "{row:?}");
         assert!(row.ends_with("never"), "{row:?}");
     }
 
@@ -4822,13 +4912,125 @@ mod tests {
             "2026-11-05T12:00:00Z".parse().unwrap(),
         );
         let lines = draw(&mut app, 100, 8);
-        assert_eq!(lines[2], " loading agents…");
+        assert!(lines[3].ends_with("✦ loading agents"), "{lines:#?}");
         app.update(Action::Msg(Msg::Agents(vec![])));
         let lines = draw(&mut app, 100, 8);
-        assert_eq!(
-            lines[2], " loading agents…",
-            "sin la primera pasada del historial todo saldría como nunca"
+        assert!(
+            lines[3].ends_with("✦ loading agents"),
+            "sin la primera pasada del historial todo saldría como nunca: {lines:#?}"
         );
+    }
+
+    /// Una pantalla recién abierta que aún lee `~/.claude/projects`, con el
+    /// reloj `ms` milisegundos después del arranque.
+    fn loading(ms: i64) -> App {
+        let start: chrono::DateTime<chrono::Utc> = "2026-11-05T12:00:00Z".parse().unwrap();
+        let mut app = App::new(10, PathBuf::from("/Users/x"), "0.1.0", start);
+        app.projects = PathBuf::from("/Users/x/.claude/projects");
+        app.update(Action::Tick(start + TimeDelta::milliseconds(ms)));
+        app
+    }
+
+    #[test]
+    fn loading_is_centered_in_the_body() {
+        let mut app = loading(1_200);
+        // 13 filas: cabecera, segunda línea, 10 de cuerpo y el pie
+        let lines = draw(&mut app, 60, 13);
+        let star = "✦ loading agents";
+        let path = "~/.claude/projects · 1.2 s";
+        assert_eq!(
+            lines[6],
+            format!("{}{star}", " ".repeat((60 - width(star)) / 2))
+        );
+        assert_eq!(
+            lines[7],
+            format!("{}{path}", " ".repeat((60 - width(path)) / 2))
+        );
+        for (i, l) in lines.iter().enumerate().take(12).skip(2) {
+            if i != 6 && i != 7 {
+                assert_eq!(l, "", "fila {i}: {lines:#?}");
+            }
+        }
+    }
+
+    #[test]
+    fn loading_star_blinks_every_half_second() {
+        let lines = draw(&mut loading(1_200), 60, 13);
+        assert!(lines[6].ends_with("✦ loading agents"), "{:?}", lines[6]);
+        let lines = draw(&mut loading(1_700), 60, 13);
+        assert!(lines[6].ends_with("✧ loading agents"), "{:?}", lines[6]);
+        assert!(
+            lines[7].ends_with("~/.claude/projects · 1.7 s"),
+            "{:?}",
+            lines[7]
+        );
+    }
+
+    #[test]
+    fn loading_time_from_a_minute_on_is_like_worked() {
+        let lines = draw(&mut loading(125_000), 60, 13);
+        assert!(
+            lines[7].ends_with("~/.claude/projects · 2 min"),
+            "{:?}",
+            lines[7]
+        );
+    }
+
+    #[test]
+    fn loading_colors() {
+        let t = Theme::claude_256();
+        let mut app = loading(1_200);
+        let buf = draw_buf(&mut app, 60, 13);
+        let lines = draw(&mut app, 60, 13);
+        let star = col(&lines[6], "✦");
+        assert_eq!(buf[(star, 6)].style().fg, Some(t.claude));
+        let text = col(&lines[6], "loading");
+        for x in text..text + "loading agents".len() as u16 {
+            assert_eq!(buf[(x, 6)].style().fg, Some(t.ink), "columna {x}");
+        }
+        let path = col(&lines[7], "~");
+        let end = path + width("~/.claude/projects · 1.2 s") as u16;
+        for x in path..end {
+            assert_eq!(buf[(x, 7)].style().fg, Some(t.ink_muted), "columna {x}");
+        }
+    }
+
+    #[test]
+    fn loading_footer_only_quits() {
+        let lines = draw(&mut loading(1_200), 60, 13);
+        assert!(lines[12].starts_with(" q quit"), "{:?}", lines[12]);
+        assert!(!lines[12].contains("move"), "{:?}", lines[12]);
+        assert!(!lines[12].contains("tab"), "{:?}", lines[12]);
+    }
+
+    #[test]
+    fn loading_narrow_truncates_without_overflowing() {
+        // 20 columnas: el texto cabe, la ruta se corta y el tiempo se queda
+        let lines = draw(&mut loading(1_200), 20, 13);
+        assert!(lines[6].ends_with("✦ loading agents"), "{lines:#?}");
+        assert!(lines[7].ends_with("… · 1.2 s"), "{lines:#?}");
+        assert!(lines[7].contains("~/"), "{lines:#?}");
+        // la cabecera no es de la carga: se miran las dos líneas del cuerpo
+        for l in &lines[6..8] {
+            assert!(width(l) <= 19, "{l:?} desborda");
+        }
+        // 12 columnas: el texto se corta con `…`; sin sitio para la ruta,
+        // solo el tiempo
+        let lines = draw(&mut loading(1_200), 12, 13);
+        assert!(lines[6].trim_start().starts_with("✦ load"), "{lines:#?}");
+        assert!(lines[6].ends_with('…'), "{lines:#?}");
+        assert_eq!(lines[7].trim_start(), "1.2 s", "{lines:#?}");
+        // 4 columnas: solo la estrella
+        let lines = draw(&mut loading(1_200), 4, 13);
+        assert_eq!(lines[6].trim(), "✦", "{lines:#?}");
+    }
+
+    #[test]
+    fn loading_low_keeps_only_the_first_line() {
+        // 4 filas: una sola de cuerpo
+        let lines = draw(&mut loading(1_200), 60, 4);
+        assert!(lines[2].ends_with("✦ loading agents"), "{lines:#?}");
+        assert!(!lines.join("\n").contains("projects"), "{lines:#?}");
     }
 
     // --- ranking ---

@@ -1,0 +1,321 @@
+# How it works
+
+What claude-agents reads from disk and how it turns it into the screen's
+figures. The screen itself is described in [interface.md](interface.md).
+
+## How it decides an agent is active
+
+A subagent is not a process: a Claude Code session launches it with the `Agent`
+tool. That is why «active» is a heuristic:
+
+1. It reads all the transcripts (`~/.claude/projects/**/*.jsonl`). The first
+   pass reads them whole; after that, the screen only reads what was appended to
+   each file since the previous round (they are append-only: if one shrinks it
+   is reread from the start). Before parsing the JSON, it discards the lines
+   that do not contain `subagent_type"`.
+2. From each line with an `Agent` `tool_use` it takes `subagent_type`, the
+   session's `cwd` and the `timestamp`, and also the block's `id`, the
+   `input.description` (`description` in `Invocation`) and the first clean line
+   of the `input.prompt` (`prompt_line`; see [What is read from each
+   run](#what-is-read-from-each-run)).
+3. A **global** agent matches any session. A **project** agent only matches
+   sessions whose `cwd` is inside that project: two projects with a `frontend`
+   agent do not contaminate each other.
+4. The last call that matches is the agent's «last time». If it falls within the
+   window, the agent shows as `ACTIVE`.
+5. If it has a **running** run (see below), it shows as `RUNNING` and counts as
+   active even if it has no call in the window.
+
+The name comes from the frontmatter's `name:` field; if missing, from the file
+name.
+
+«Open Claude sessions» counts the processes whose executable is named `claude`
+(terminal, VS Code...), without the desktop app or its helpers.
+
+## How worked time is calculated
+
+Each subagent run has its own transcript and, next to it, a meta:
+
+```
+~/.claude/projects/<project>/<session>/subagents/**/agent-<id>.jsonl
+~/.claude/projects/<project>/<session>/subagents/**/agent-<id>.meta.json
+```
+
+(`**` because the ones launched by a workflow hang from
+`subagents/workflows/<run>/…`). From the meta it reads `agentType` (required:
+without it the run does not show), `description`, `toolUseId` and `finished`;
+from each line of the `.jsonl`, `timestamp`, `cwd`, `sessionId`, the
+`tool_use` blocks of `message.content` and, on assistant lines, `message.id`,
+`message.model` and `message.usage`.
+
+1. **Time worked** of a run: the sum of the gaps between consecutive
+   `timestamp`s, not counting those over **5 minutes**. This way a run resumed
+   hours later does not count the wait.
+2. **Tools**: the number of `tool_use` blocks in its transcript.
+3. **Running**: the meta says `finished: false` and the `.jsonl` was modified
+   less than **10 minutes** ago. What it shows is the time worked plus, if the
+   gap from the last line to now is under 5 min, that gap. With `finished:
+   false` but more than 10 min untouched, it is **interrupted**: it adds up the
+   time worked and does not show as running. Without `finished` in the meta
+   (the ones launched by a workflow), it is running as long as the `.jsonl` was
+   written less than **2 minutes** ago.
+4. **Which agent it goes to**: the same rule as calls, with `agentType` as the
+   name: a global agent matches any `cwd`, a project one only runs whose `cwd`
+   is inside the project. If the run's `cwd` is Claude's temp folder, the real
+   project's is used (see [Temporary `cwd` from
+   Claude](#temporary-cwd-from-claude)).
+5. **Total** of an agent: the sum of all its runs (running ones, up to now),
+   including those that only remain in the [history cache](#kept-history).
+6. **Split by day** (for the 14-day bar, the details chart and the ranking
+   periods): each gap counts whole in the **local** day where it starts, even if
+   it ends past midnight. When reading, each gap is recorded in the 15-minute
+   UTC slot where it starts, and the slots are grouped afterwards by local date;
+   since all current time zones have an offset that is a multiple of 15 min, a
+   slot never crosses a local midnight and the split is exact without rereading
+   anything. The sum of the days is the total. What a running run adds since its
+   last line goes to that line's local day.
+7. **Link with its call**: the `id` of the `Agent` `tool_use` block in the
+   parent transcript is the meta's `toolUseId`. The calls that do not link to
+   any run are the ones in the details' `+ N old calls with no recorded
+   duration`.
+
+## What is read from each run
+
+For the active monitor, the following is also taken from each run's transcript:
+
+- **Task** (`task`): the first line with content of the first user message with
+  text (if `content` is a list, the `text` blocks count; a `tool_result` is not
+  a prompt). The leading `#`s and the boilerplate `ENCARGO (de …):` (or `TASK
+  (from …):`) are removed and whitespace is collapsed: `# ENCARGO (de Ana,
+  05-11-2026): copia de seguridad de TODO` becomes `copia de seguridad de
+  TODO`. The boilerplate is input data (the prompt's literal text): both
+  spellings are recognized as they are.
+- **Last tool** (`last_tool`): the last `tool_use` block in the transcript, as
+  `Name · short argument`. `Bash`, its `command` on one line; `Read`, `Edit` and
+  `Write`, their `file_path` relative to the `cwd` if it hangs from it and,
+  otherwise, only the last component (`NotebookEdit`, the same with
+  `notebook_path`); `Grep` and `Glob`, their `pattern`; the rest, only the name.
+
+For the run details, also:
+
+- **Full task** (`task_full`): the same first user message, but whole and with
+  its line breaks, without the leading `ENCARGO (de …):` (or `TASK (from …):`)
+  and with a maximum of 2000 characters (if exceeded, it ends in `…`).
+- **Steps** (`steps`): the last 200 `tool_use` blocks, each with the time of its
+  line and its `Name · argument`, with the argument as above and uncut (the view
+  cuts it to the width).
+- **Tools** (`tool_counts`): uses per tool across the whole run, not only the
+  200 steps, from most to least used and, on a tie, by name. The sum is
+  `tools`.
+
+Steps and counts are stored shared (`Arc`), so refreshing the screen does not
+copy them.
+
+It is read like the history: the first pass whole and then only what was
+appended to each `.jsonl`; the meta is reread if its date or size changes. The
+two reads run in parallel.
+
+From the `Agent` call in the parent transcript (`Invocation`), in addition to
+`agent`, `cwd`, `at` and `id`, two fields are read that the monitor uses for
+calls that do not link to any run:
+
+- **`description`**: the call's `input.description`; discarded if empty.
+- **`prompt_line`**: the first line with content of the `input.prompt`, cleaned
+  like a run's task (without leading `#`s or `ENCARGO (de …):` / `TASK (from
+  …):`, with whitespace collapsed) and uncut. The task of that monitor line is
+  `prompt_line` or, if there is none, `description`.
+
+## Tokens, context and cost
+
+From the assistant lines of each run's transcript (`Run.usage`):
+
+- **Tokens**: the four counters of `message.usage`, `input_tokens`,
+  `output_tokens`, `cache_read_input_tokens` and `cache_creation_input_tokens`;
+  their sum is the `tokens`/`tok` figure on screen. Claude Code writes one line
+  per content block (`thinking`, `text`, `tool_use`…) and repeats the same
+  `usage` on each one, so every message counts once, with the last `usage` seen
+  for its `message.id` (the line's `uuid` if it has no id). `<synthetic>`
+  messages (made up by Claude Code, with zero usage) are ignored. A fork starts
+  with a copy of the parent's message that launched it, with the fork's own
+  call (its `toolUseId`) inside: that line's usage is not the fork's and is
+  skipped.
+- **Model**: the latest `message.model` seen.
+- **Context**: `input + cache_read + cache_creation` of the latest assistant
+  message. The window is 1M if the model id contains `[1m]` or if the run ever
+  went over 200k of context; otherwise 200k. The percentage is context over
+  window, rounded.
+- **Cost** (`status::pricing`): an estimate at the API list prices of a table
+  of known models, with cache writes at the 5-minute rate. A model that is not
+  in the table (or no model) has no cost: it is never guessed.
+
+Token figures go in short form: `999`, `1.5k` (one decimal below 10k), `86k`,
+`1M`, `1.1M`, `31.4M`, `142M`, without a trailing `.0`. The cost reads `≈
+$0.62`, or `< $0.01` below a cent.
+
+## Who launched whom
+
+- **The session**: the run's `sessionId` (or, for reading, the folder its file
+  hangs from: `<project>/<session>/subagents/…`), whose transcript is
+  `<project>/<session>.jsonl`. From it the tool takes
+  its first real prompt line (`Run.session_prompt`): it skips meta lines (the
+  body of a skill), compact summaries and the blocks that start with `<`
+  (`<system-reminder>`, `<command-name>`…). With no prompt, the first slash
+  command (`/review 123`) is used. Like the temporary `cwd` below, only the
+  first lines of the session are looked at.
+- **Another run** (`Run.parent_run`, `Run.children`): a run whose meta
+  `toolUseId` is the id of an `Agent` or `Task` `tool_use` block inside another
+  run's transcript was launched by that run. This nested case has only been
+  seen in test fixtures, not yet in real transcripts.
+
+The details say `launched by` the parent run if it is still in the data (on
+disk or in the history cache), `a run no longer on disk` if not, or the session
+otherwise.
+
+## Temporary `cwd` from Claude
+
+Some runs and calls carry a Claude temp folder as `cwd`
+(`/tmp/claude-<uid>/…` or `/private/tmp/claude-<uid>/…`, with a numeric
+`<uid>`). That folder is not a project, so it is replaced by the real
+directory:
+
+- **Run** (`Run.cwd`): the first non-temporary `cwd` in the parent session's
+  transcript (`~/.claude/projects/<project>/<session>.jsonl`). Only its first
+  lines are looked at (200 at most or 4 MB) and only those containing `"cwd"`
+  (or `"user"`, for the [session's first prompt](#who-launched-whom)). The
+  result is stored per session. If the parent cannot be read, the temporary
+  one is kept and retried on the next refresh. In addition, `Run.temp_cwd` keeps
+  the temporary `cwd` the run was launched with, whether or not it was resolved
+  (`None` if it was never temporary); `RunDetail.temp_cwd` carries it to the
+  details, along with `cwd_resolved` (`true` if `cwd` is already another: the
+  session's was taken). With that the details paint the [temp folder
+  notice](interface.md#run-details). A call without a run does not have it.
+- **Call** (`Invocation.cwd`): the first non-temporary `cwd` in the very file
+  where the call is.
+
+If there is no real `cwd`, the temporary one is kept: none is made up. With the
+`cwd` resolved, the run is grouped under its project and matches its project
+agents like any other.
+
+## Kept history
+
+Claude Code deletes old transcripts (`cleanupPeriodDays`, 30 days by default),
+and with them the runs would vanish from the totals. So the tool keeps finished
+runs in its own cache:
+
+```
+$XDG_CACHE_HOME/claude-agents/runs.jsonl    # if XDG_CACHE_HOME is an absolute path
+~/.cache/claude-agents/runs.jsonl           # otherwise
+```
+
+It is the only file the tool writes; the screen and `--plain` both update it.
+
+- One JSON object per line and per run, with `"v":1` (a line of another
+  version, or a broken one, is skipped). Only runs that are not in progress go
+  in; a running one goes in once it ends. It stores what the views need: agent,
+  description, session and its first prompt, links, `cwd`, times, worked time
+  and its 15-minute slots, tool counts, task, tokens, model and context. Not the
+  steps, the last tool or the temporary `cwd`. Around 1 MB for some 400 runs.
+- It is rewritten whole and atomically (a temporary file next to it, then
+  `rename`), only when some run is new or changed, and merged first with what
+  is on disk, so another instance's runs are not lost.
+- Read and write errors are ignored: the tool goes on without it. If the file
+  exists but cannot be read, it is never overwritten.
+- When reading, the transcript wins: the cache only adds the runs whose
+  transcript is gone. Those count wherever the history counts (worked time,
+  runs, the per-day chart, last use and the ranking), but they have no steps:
+  their details say `from the history cache · steps are not kept`. The ranking
+  says how many there are (`history kept: N runs older than Claude's cleanup`).
+- Tests never write there: they use their own temporary folders, or no cache.
+
+To start over, delete the file.
+
+## Limitations
+
+- «Running» relies on the meta's `finished` and the `.jsonl`'s date: a run that
+  waits more than 10 min without writing anything (an unanswered permission, a
+  long tool) shows as interrupted until it writes again. A workflow run, whose
+  meta carries no `finished`, stops showing as running after 2 min without
+  writing, and keeps showing for up to 2 min after finishing.
+- Active merges the runs of the same agent in a project into a single row: they
+  can only be seen one by one from the details, with `←` `→`, and the counters
+  in the header and in the rules count rows, not runs. An own agent and a
+  `[claude]` one with the same name, or a `visual [workflow]`, are different
+  rows. The window (`-m`) decides which runs get in: one
+  older than it does not count in the `×N`.
+- Old calls, from before Claude Code stored one transcript per run, have no run
+  of their own: they add no time or days, and in the details they only count in
+  `+ N old calls with no recorded duration`. If they fall within the window, the
+  active monitor does show them, as a finished run without tools (merged with
+  those of its agent).
+- Claude Code agents (`general-purpose`, `Explore`, `fork`…) have no definition
+  on disk and do not show in all or in the ranking, even if they have runs. They
+  do show in active, running and as finished within the window, but they add no
+  time or runs to any agent; there `Enter` opens the run details, but there are
+  no agent details (`a` does nothing). The same goes for a project agent
+  launched from outside its project, unless the `cwd` was Claude's temp folder:
+  that one is resolved to the session's project (see [Temporary `cwd` from
+  Claude](#temporary-cwd-from-claude)).
+- If the parent session's transcript cannot be read (or has no real `cwd` in its
+  first lines), a run with a temporary `cwd` keeps the temporary one: it matches
+  no project agent and shows as `[claude]` under a group named after that
+  temporary folder.
+- Workflow runs with `agentType` `workflow-subagent` are not assigned to any
+  agent for time, runs or ranking. They show in active, running and as finished
+  within the window, and there the agent is resolved by the `description` (and
+  `a` in the run details opens that agent's details), but that run does not add
+  to the agent's details or mark it with `✦` in all.
+- A workflow run launched with an explicit `agentType` adds time to that agent
+  and shows in the «Runs» of its details, but it has no `Agent` call in the
+  parent transcript: its last use comes from the run's last step.
+- The run details keep only the last 200 steps (the per-tool count does count
+  all) and the full task is cut at 2000 characters; in the details, the task
+  shows 8 lines at most and the tools 3. Its header uses the project's short
+  name, without the list's disambiguation of twin folders.
+- Time worked is an approximation: it counts the time between transcript lines,
+  not CPU or model time, and discards any pause over 5 min even if it was work
+  (a long tool).
+- In the split by day, a gap of up to 5 min that crosses midnight counts whole
+  in the day it starts. If some time zone had an offset that is not a multiple
+  of 15 min (none today), a gap next to midnight could fall in the neighboring
+  day.
+- Days, ranking periods and the details' times use the machine's local time
+  zone.
+- Run transcripts that are symbolic links are skipped (they point to the same run
+  from another session).
+- It depends on the current transcript format (`message.content[].name ==
+  "Agent"` and `input.subagent_type`). If a future version changes it,
+  everything will show as inactive.
+- When walking the home, hidden directories (except `.claude`), `node_modules`,
+  `target`, `.venv`, `venv`, `vendor` and `Library` are skipped. Inside a
+  `.claude` only `agents` is looked at, so agents copied into `worktrees` are
+  not duplicated.
+- macOS/Linux only: sessions are counted with `ps`. There is no Windows build;
+  use WSL. Prebuilt binaries cover x86_64 and aarch64 only.
+- It reads the whole history of transcripts and runs. With ~1 GB in ~480 files
+  (about 290 of them subagent runs), `--plain` takes 1.3–1.8 s in both release
+  and with the debug binary (which uses `opt-level = 1` for this), and pays it
+  on every execution. On the screen, later rounds only read what was appended
+  (a few ms).
+- The «last time» only goes as far as the transcripts and the [history
+  cache](#kept-history) do: runs seen once are kept, but `Agent` calls are not,
+  so an agent whose only uses were old calls without a run of their own may
+  show as `never` once those transcripts are deleted. Runs whose transcripts
+  were deleted before the tool ever ran are not in the cache either.
+- Runs from the history cache have no steps or last tool, and nothing in them
+  changes any more.
+- The cost is an estimate at API list prices, from a fixed table in the code:
+  on a subscription you do not pay per token, cache writes are counted at the
+  5-minute rate (Claude Code's 1-hour cache writes cost twice the input, so it
+  can fall short), and a model missing from the table has no cost at all.
+- The context window is not written anywhere: it is 1M if the model id carries
+  `[1m]` or the run went over 200k, and 200k otherwise. A 1M run whose model id
+  lacks `[1m]` and that never went over 200k shows its percentage over 200k.
+- A run launched by another run is only detected through the parent's `Agent`
+  or `Task` call in its transcript; that case has only been tested with
+  fixtures, never seen in real transcripts.
+- The ranking's tokens are not split by day: a run that crosses the start of
+  the period counts its tokens whole if it started inside, and none otherwise.
+- The screen captures the mouse: without `Shift` (or `Option` in iTerm2) text
+  cannot be selected by dragging.
+- `-v` only has an effect with `--plain`; on the screen the sessions show as a
+  counter in the header.
