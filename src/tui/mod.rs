@@ -4,6 +4,7 @@
 pub mod app;
 pub mod scan;
 pub mod theme;
+pub mod update;
 pub mod view;
 
 use anyhow::Result;
@@ -15,6 +16,7 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::execute;
 use ratatui::DefaultTerminal;
+use std::ffi::OsStr;
 use std::io::stdout;
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -30,6 +32,33 @@ pub struct Config {
     pub history: Option<PathBuf>,
     pub minutes: i64,
     pub version: &'static str,
+    /// Carpeta de la nota diaria de versiones (`update::cache::default_dir`).
+    /// `None` no comprueba nada: `CLAUDE_AGENTS_NO_UPDATE_CHECK=1` o los tests.
+    pub update_cache: Option<PathBuf>,
+}
+
+/// La variable que apaga el aviso de versión nueva.
+pub const NO_UPDATE_CHECK: &str = "CLAUDE_AGENTS_NO_UPDATE_CHECK";
+
+/// Si se comprueba la versión al abrir la pantalla, según el valor de
+/// `CLAUDE_AGENTS_NO_UPDATE_CHECK`: sin ella, vacía o `0`, sí.
+pub fn update_check_enabled(value: Option<&OsStr>) -> bool {
+    value.is_none_or(|v| v.is_empty() || v == "0")
+}
+
+/// Pregunta en otro hilo si hay versión nueva (`check`, que no debe fallar
+/// nunca) y la deja en el canal sin la `v`. El bucle no espera a nadie: si no
+/// hay red, el hilo tarda lo que tarde y no manda nada.
+fn spawn_update_check(
+    check: impl FnOnce() -> Option<crate::update::Version> + Send + 'static,
+) -> mpsc::Receiver<String> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        if let Some(v) = check() {
+            let _ = tx.send(v.to_string());
+        }
+    });
+    rx
 }
 
 /// Cada cuánto se repinta aunque no pase nada: los «hace N s» avanzan solos.
@@ -47,6 +76,13 @@ pub fn run(cfg: Config) -> Result<()> {
         },
         rescan_rx,
     );
+    // Sin la versión en marcha bien escrita no hay con qué comparar.
+    let updates = match (cfg.update_cache, cfg.version.parse()) {
+        (Some(dir), Ok(current)) => Some(spawn_update_check(move || {
+            crate::update::cache::newer_than(&current, Some(&dir), crate::update::cache::TTL)
+        })),
+        _ => None,
+    };
     let mut app = App::new(cfg.minutes, cfg.home, cfg.version, Utc::now());
     // la carpeta que la pantalla de carga dice estar leyendo
     app.projects = cfg.projects;
@@ -60,7 +96,14 @@ pub fn run(cfg: Config) -> Result<()> {
         mouse.disable();
         prev(info);
     }));
-    let result = event_loop(&mut app, &mut terminal, &theme, &msgs, &rescan_tx);
+    let result = event_loop(
+        &mut app,
+        &mut terminal,
+        &theme,
+        &msgs,
+        updates.as_ref(),
+        &rescan_tx,
+    );
     mouse.disable();
     ratatui::restore();
     result
@@ -91,11 +134,15 @@ fn event_loop(
     terminal: &mut DefaultTerminal,
     theme: &Theme,
     msgs: &mpsc::Receiver<app::Msg>,
+    updates: Option<&mpsc::Receiver<String>>,
     rescan: &mpsc::Sender<()>,
 ) -> Result<()> {
     loop {
         while let Ok(msg) = msgs.try_recv() {
             app.update(Action::Msg(msg));
+        }
+        if let Some(v) = updates.and_then(|rx| rx.try_recv().ok()) {
+            app.update(Action::UpdateAvailable(v));
         }
         app.update(Action::Tick(Utc::now()));
         if app.take_rescan() {
@@ -150,6 +197,27 @@ mod tests {
             row,
             modifiers: KeyModifiers::NONE,
         }
+    }
+
+    #[test]
+    fn the_update_check_is_on_unless_the_variable_says_otherwise() {
+        assert!(update_check_enabled(None));
+        assert!(update_check_enabled(Some(OsStr::new(""))));
+        assert!(update_check_enabled(Some(OsStr::new("0"))));
+        assert!(!update_check_enabled(Some(OsStr::new("1"))));
+        assert!(!update_check_enabled(Some(OsStr::new("yes"))));
+    }
+
+    #[test]
+    fn the_update_check_hands_over_the_version_without_the_v() {
+        let rx = spawn_update_check(|| "v1.1.0".parse().ok());
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).as_deref(),
+            Ok("1.1.0")
+        );
+        // sin versión nueva (o sin red) no llega nada y el canal se cierra
+        let none = spawn_update_check(|| None);
+        assert!(none.recv_timeout(Duration::from_secs(5)).is_err());
     }
 
     #[test]

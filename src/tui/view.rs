@@ -141,12 +141,12 @@ const NAME_GAP: usize = 2;
 const SPARK_GAP: usize = 2;
 const COL_GAP: usize = 3;
 
-fn width(s: &str) -> usize {
+pub(super) fn width(s: &str) -> usize {
     UnicodeWidthStr::width(s)
 }
 
 /// Corta a `max` columnas y termina en `…` si hubo que cortar.
-fn truncate(s: &str, max: usize) -> String {
+pub(super) fn truncate(s: &str, max: usize) -> String {
     if width(s) <= max {
         return s.to_string();
     }
@@ -167,7 +167,7 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 /// Parte un texto en líneas de como mucho `max` columnas, por palabras.
-fn wrap(text: &str, max: usize) -> Vec<String> {
+pub(super) fn wrap(text: &str, max: usize) -> Vec<String> {
     let mut lines = Vec::new();
     let mut line = String::new();
     for word in text.split_whitespace() {
@@ -338,7 +338,7 @@ fn star_slot(running: bool, now: DateTime<Utc>, t: &Theme) -> Span<'static> {
 }
 
 /// La marca de lo que está en curso: `✦` y `✧` cada medio segundo.
-fn star(now: DateTime<Utc>) -> &'static str {
+pub(super) fn star(now: DateTime<Utc>) -> &'static str {
     if now.timestamp_subsec_millis() < 500 {
         "✦"
     } else {
@@ -1778,7 +1778,13 @@ fn split_at_width(s: &str, w: usize) -> (String, String) {
 }
 
 /// ` título ─────────── info `
-fn section_line(t: &Theme, title: &str, style: Style, info: &str, w: usize) -> Line<'static> {
+pub(super) fn section_line(
+    t: &Theme,
+    title: &str,
+    style: Style,
+    info: &str,
+    w: usize,
+) -> Line<'static> {
     let title = format!(" {title}");
     let fill = w.saturating_sub(width(&title) + 1 + width(info) + 2);
     Line::from(vec![
@@ -2678,10 +2684,12 @@ fn footer_line(app: &App, t: &Theme, w: usize, total: usize, rows: usize) -> Lin
     footer_with_version(app, t, w, keys_spans(app, t, &keys, periods, sorts), pos)
 }
 
-/// Pie con lo que hay a la derecha: el contador de scroll, si lo hay, y la
-/// versión (`1-27/30  v0.1.0`), todo en `ink-muted` y con una columna libre al
-/// borde. Si no caben las teclas y la versión, se quita la versión (el
-/// contador se queda); las teclas se recortan antes, por quien llama.
+/// Pie con lo que hay a la derecha: el contador de scroll, si lo hay, el
+/// aviso de versión nueva y la versión (`1-27/30  ↑ v1.2.0 available ·
+/// claude-agents update  v1.1.0`), en `ink-muted` salvo `↑ v1.2.0`, que va en
+/// `claude`, y con una columna libre al borde. Lo que no cabe se va en este
+/// orden: el aviso largo pasa a `↑ v1.2.0`, luego se va el aviso, luego la
+/// versión (el contador se queda); las teclas se recortan antes, por quien llama.
 fn footer_with_version(
     app: &App,
     t: &Theme,
@@ -2690,18 +2698,33 @@ fn footer_with_version(
     pos: Option<String>,
 ) -> Line<'static> {
     let version = format!("v{}", app.version);
-    let right = match &pos {
-        Some(p) => format!("{p}  {version}"),
-        None => version,
-    };
-    // un hueco mínimo entre las teclas y lo de la derecha, y la última columna
-    let text = if spans_width(&left) + width(&right) + 2 <= w {
-        Some(right)
-    } else {
-        pos
-    };
-    match text {
-        Some(text) => split_line(left, vec![Span::styled(text, t.muted())], w, t),
+    let lead = pos.as_ref().map(|p| format!("{p}  ")).unwrap_or_default();
+    let mut candidates: Vec<Vec<Span<'static>>> = Vec::new();
+    if let Some(next) = &app.update_available {
+        let arrow = format!("↑ v{next}");
+        for tail in [" available · claude-agents update", ""] {
+            candidates.push(vec![
+                Span::styled(lead.clone(), t.muted()),
+                Span::styled(arrow.clone(), t.accent()),
+                Span::styled(format!("{tail}  {version}"), t.muted()),
+            ]);
+        }
+    }
+    candidates.push(vec![Span::styled(format!("{lead}{version}"), t.muted())]);
+    if let Some(p) = pos {
+        candidates.push(vec![Span::styled(p, t.muted())]);
+    }
+    // un hueco mínimo entre las teclas y lo de la derecha, y la última columna;
+    // el contador, si es lo último que queda, se pone aunque no quepa el hueco
+    let lw = spans_width(&left);
+    let last = candidates.len() - 1;
+    let right = candidates
+        .into_iter()
+        .enumerate()
+        .find(|(i, c)| lw + spans_width(c) + 2 <= w || (*i == last && !lead.is_empty()))
+        .map(|(_, c)| c);
+    match right {
+        Some(right) => split_line(left, right, w, t),
         None => Line::from(left),
     }
 }
@@ -3021,6 +3044,42 @@ mod tests {
         assert_eq!(fits[13], format!("{keys} {v}"), "{:?}", fits[13]);
         let tight = draw(&mut app, (kw + v.len() + 1) as u16, 14);
         assert_eq!(tight[13], keys, "{:?}", tight[13]);
+    }
+
+    /// Con versión nueva, el pie la anuncia a la izquierda de la versión en
+    /// marcha: `↑ v1.2.0` en `claude`, el resto en `ink-muted`.
+    #[test]
+    fn a_new_release_is_announced_left_of_the_version() {
+        let t = Theme::claude_256();
+        let mut app = fixture();
+        app.update_available = Some("1.2.0".into());
+        let v = format!("v{}", app.version);
+        let lines = draw(&mut app, 140, 14);
+        let notice = format!("↑ v1.2.0 available · claude-agents update  {v}");
+        assert!(lines[13].ends_with(&notice), "{:?}", lines[13]);
+        let buf = draw_buf(&mut app, 140, 14);
+        let x = 140 - 1 - width(&notice) as u16;
+        assert_eq!(buf[(x, 13)].symbol(), "↑");
+        assert_eq!(buf[(x, 13)].style().fg, Some(t.claude));
+        assert_eq!(buf[(x + 9, 13)].style().fg, Some(t.ink_muted));
+    }
+
+    /// Estrecha, el aviso se acorta y luego se va, antes que las teclas y que
+    /// la versión en marcha.
+    #[test]
+    fn a_narrow_footer_shortens_the_notice_before_the_keys() {
+        let mut app = fixture();
+        let v = format!("v{}", app.version);
+        let keys = bare(&draw(&mut app, 110, 14)[13]);
+        let kw = width(&keys);
+        app.update_available = Some("1.2.0".into());
+        let short = format!("↑ v1.2.0  {v}");
+        let fits = draw(&mut app, (kw + 1 + width(&short) + 1) as u16, 14);
+        assert_eq!(fits[13], format!("{keys} {short}"), "{:?}", fits[13]);
+        let tight = draw(&mut app, (kw + width(&short) + 1) as u16, 14);
+        assert!(tight[13].starts_with(&keys), "{:?}", tight[13]);
+        assert!(tight[13].ends_with(&format!(" {v}")), "{:?}", tight[13]);
+        assert!(!tight[13].contains("↑ v"), "{:?}", tight[13]);
     }
 
     /// Las fichas (agente y ejecución) llevan la versión en su pie.

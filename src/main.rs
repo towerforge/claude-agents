@@ -8,11 +8,12 @@ mod sessions;
 mod status;
 mod transcripts;
 mod tui;
+mod update;
 
 use agents::Agent;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
@@ -38,10 +39,42 @@ struct Cli {
     /// This also happens when the output is not a terminal.
     #[arg(short, long)]
     plain: bool,
+
+    /// Sin subcomando: la pantalla o la tabla de siempre.
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+}
+
+#[derive(Subcommand, Debug, PartialEq)]
+enum Cmd {
+    /// Update claude-agents: checks GitHub and installs the new release
+    Update(UpdateArgs),
+}
+
+/// Opciones de `claude-agents update`, las mismas que `moon update`. Es lo
+/// que `main()` pasa a la lógica de actualización (backend).
+#[derive(Args, Debug, PartialEq)]
+struct UpdateArgs {
+    /// Say what there is and install nothing
+    #[arg(long)]
+    check: bool,
+    /// Install without asking
+    #[arg(long, short = 'y')]
+    yes: bool,
+    /// Install over a cargo install or a build under target/, and
+    /// reinstall a version that is already there
+    #[arg(long)]
+    force: bool,
+    /// A specific version instead of the latest one
+    #[arg(long, value_name = "VERSION")]
+    to: Option<String>,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Some(Cmd::Update(args)) = &cli.cmd {
+        return update_cmd(args);
+    }
     let home = std::env::home_dir().context("cannot determine the home directory")?;
     let claude_dir = home.join(".claude");
 
@@ -64,7 +97,56 @@ fn main() -> Result<()> {
         history: runs::history::default_path(),
         minutes: cli.minutes,
         version: env!("CARGO_PKG_VERSION"),
+        // Solo la pantalla avisa de versiones; --plain no pregunta nada.
+        update_cache: tui::update_check_enabled(std::env::var_os(tui::NO_UPDATE_CHECK).as_deref())
+            .then(update::cache::default_dir)
+            .flatten(),
     })
+}
+
+/// `claude-agents update`, como `moon update`: la lógica en `update::flow`,
+/// lo que se ve en `tui::update` (el panel) o en `update::plain` (sin
+/// terminal). Sale con 1 solo si falla; lo que fue mal ya lo ha dicho la vista.
+fn update_cmd(args: &UpdateArgs) -> Result<()> {
+    let to = args
+        .to
+        .as_deref()
+        .map(str::parse::<update::Version>)
+        .transpose()
+        .context("--to")?;
+    let interactive = std::io::stdout().is_terminal() && std::io::stdin().is_terminal();
+    let opts = update::flow::Options {
+        current: env!("CARGO_PKG_VERSION")
+            .parse()
+            .context("CARGO_PKG_VERSION is not a version")?,
+        to,
+        check_only: args.check,
+        yes: args.yes,
+        force: args.force,
+        interactive,
+        state_dir: update::cache::default_dir(),
+    };
+    let mut state = update::flow::State::new(
+        opts.current.clone(),
+        update::Target::current()?,
+        update::install::current_exe()?,
+    );
+    // con terminal, el panel; sin ella (o si no se deja abrir), unas líneas
+    let panel = interactive
+        .then(|| tui::update::run(&opts, &mut state))
+        .flatten();
+    let outcome = panel.unwrap_or_else(|| {
+        update::flow::drive(
+            &opts,
+            &update::Client::new(),
+            &mut state,
+            &mut update::plain::Plain::new(interactive),
+        )
+    });
+    match outcome.exit_code() {
+        0 => Ok(()),
+        code => std::process::exit(code),
+    }
 }
 
 /// Una fila de `--plain`: el agente, su última llamada de todo el historial,
@@ -338,6 +420,65 @@ mod tests {
                 ("parado", false, false, 10, 1),
             ]
         );
+    }
+
+    #[test]
+    fn no_subcommand_keeps_the_screen_and_plain_as_today() {
+        let cli = Cli::try_parse_from(["claude-agents", "-p", "-m", "5", "-v"]).unwrap();
+        assert!(cli.cmd.is_none());
+        assert!(cli.plain && cli.verbose);
+        assert_eq!(cli.minutes, 5);
+    }
+
+    #[test]
+    fn update_subcommand_defaults_to_asking_before_installing_the_latest() {
+        let cli = Cli::try_parse_from(["claude-agents", "update"]).unwrap();
+        assert_eq!(
+            cli.cmd,
+            Some(Cmd::Update(UpdateArgs {
+                check: false,
+                yes: false,
+                force: false,
+                to: None,
+            }))
+        );
+    }
+
+    #[test]
+    fn update_subcommand_parses_the_same_flags_as_moon() {
+        let cli = Cli::try_parse_from([
+            "claude-agents",
+            "update",
+            "--check",
+            "-y",
+            "--force",
+            "--to",
+            "1.0.0",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.cmd,
+            Some(Cmd::Update(UpdateArgs {
+                check: true,
+                yes: true,
+                force: true,
+                to: Some("1.0.0".into()),
+            }))
+        );
+        let long = Cli::try_parse_from(["claude-agents", "update", "--yes"]).unwrap();
+        assert!(matches!(
+            long.cmd,
+            Some(Cmd::Update(UpdateArgs { yes: true, .. }))
+        ));
+        assert!(Cli::try_parse_from(["claude-agents", "update", "--to"]).is_err());
+    }
+
+    #[test]
+    fn help_lists_the_update_subcommand() {
+        use clap::CommandFactory;
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("update"), "{help}");
+        assert!(help.contains("Update claude-agents"), "{help}");
     }
 
     #[test]

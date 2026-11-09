@@ -31,20 +31,21 @@ No configuration: it looks for agents under your home directory (`~/.claude/agen
 <details>
 <summary><b>Installer options, manual download, from source, updating</b></summary>
 
-[`install.sh`](install.sh) downloads the archive for your OS and architecture from the latest release, checks its SHA-256 against `checksums.txt` (a missing checksum warns, a mismatch stops it) and asks for `Enter` before installing. It needs `curl` and `tar`.
+[`install.sh`](install.sh) downloads the archive for your OS and architecture from the latest release, checks its SHA-256 against `checksums.txt` (a missing checksum warns, a mismatch stops it) and asks for `Enter` before installing. It needs `curl` and `tar`, and paints with the same palette as the screen. It is for the first install: if it finds a `claude-agents` that can update itself (in the install directory or on your `PATH`), it points you to `claude-agents update` and installs nothing, unless `CLAUDE_AGENTS_FORCE=1`.
 
 | Variable | Effect | Default |
 |---|---|---|
 | `CLAUDE_AGENTS_VERSION` | Installs that version (`0.2.0` or `v0.2.0`) | the latest release |
 | `CLAUDE_AGENTS_INSTALL_DIR` | Directory to install into | `~/.local/bin`, or `/usr/local/bin` as root |
 | `CLAUDE_AGENTS_VARIANT` | `musl` (static, no glibc) or `gnu`. Linux only | `musl` if `ldd` reports musl, `gnu` otherwise |
+| `CLAUDE_AGENTS_FORCE` | Any value installs even over a `claude-agents` that can update itself | |
 | `NO_COLOR` | No colors in the installer's output | |
 
 **Manual download:** the [releases page](https://github.com/towerforge/claude-agents/releases/latest) has archives for Linux x86_64 and ARM64 (glibc and musl) and macOS Intel and Apple Silicon; see [docs/releases.md](docs/releases.md#archives). No Windows build: use WSL.
 
 **From source** (Rust 1.88 or newer): `cargo install --git https://github.com/towerforge/claude-agents`.
 
-**Updating:** run the installer again.
+**Updating:** `claude-agents update`; see [Updating](#updating). A copy from before `claude-agents update` existed is upgraded by running the installer again.
 
 </details>
 
@@ -59,6 +60,7 @@ No configuration: it looks for agents under your home directory (`~/.claude/agen
 - **Ranking** by time, tokens or runs over 7 days, 30 days or all time.
 - **Kept history**: finished runs survive Claude Code's transcript cleanup.
 - **`--plain`** prints a table and exits; so does piping.
+- **Updates itself** with `claude-agents update`, and the screen says when a new release is out.
 
 ## Using claude-agents
 
@@ -100,16 +102,37 @@ inactive  docs      3 d ago        4 min  ~/code/shop/web/.claude/agents/docs.md
 
 Details: [docs/interface.md](docs/interface.md#the---plain-table).
 
+## Updating
+
+```sh
+claude-agents update            # what the new release brings, and it installs it once you say yes
+claude-agents update --check    # says what there is and installs nothing
+```
+
+It downloads the archive for your OS and architecture from the GitHub release, checks its SHA-256 against `checksums.txt` (a mismatch stops it and leaves the old binary; if the release has no checksum it installs and says `not verified`) and swaps the running binary in place.
+
+| Flag | Meaning |
+|---|---|
+| `--check` | Says what there is and installs nothing |
+| `-y`, `--yes` | Installs without asking |
+| `--force` | Installs over a `cargo install` or a build under `target/`, and reinstalls the version you already have |
+| `--to <VERSION>` | That version instead of the latest one (`1.0.0` or `v1.0.0`), downgrades included |
+
+In a terminal it opens a small panel below the prompt: the current and new version, the package, where it installs and what is new, then a question, the download bar and the result; `esc`, `q` or `n` cancel before anything is touched. Without a terminal it prints a few lines and needs `--yes` to install. A binary from `cargo install` or a local build is left alone, and it says what updates it instead. Where you cannot write, run it with `sudo`, or set `CLAUDE_AGENTS_INSTALL_DIR` and use `install.sh`. It exits with 1 only if something fails; a new release found by `--check` is not a failure.
+
+The screen asks GitHub in the background at most once a day and, if there is something newer, says so in the footer: `↑ v1.2.0 available · claude-agents update`. `CLAUDE_AGENTS_NO_UPDATE_CHECK=1` turns that check off. Details: [docs/how-it-works.md](docs/how-it-works.md#updating) and [docs/interface.md](docs/interface.md#the-update-panel).
+
 ## How it works
 
-It only reads Claude Code's files, plus `ps` for open sessions:
+It only reads Claude Code's files, plus `ps` for open sessions; the network is only for [updates](#updating):
 
 - [Active](docs/how-it-works.md#how-it-decides-an-agent-is-active): an `Agent` call within the window, or a run in progress.
 - [Time worked](docs/how-it-works.md#how-worked-time-is-calculated): gaps between transcript lines, minus pauses over 5 minutes.
 - [Tokens and context](docs/how-it-works.md#tokens-and-context): from `message.usage`.
 - [Who launched whom](docs/how-it-works.md#who-launched-whom): the meta's `toolUseId`.
 - [Launch folder](docs/how-it-works.md#launch-folder): the first real `cwd` of the session's main transcript; it decides the group and which project agents match.
-- [Kept history](docs/how-it-works.md#kept-history): `~/.cache/claude-agents/runs.jsonl`, the only file it writes.
+- [Kept history](docs/how-it-works.md#kept-history): `~/.cache/claude-agents/runs.jsonl`.
+- [Updates and network](docs/how-it-works.md#updating): `api.github.com`, once a day from the screen and on `claude-agents update`; the date of the last check goes in `~/.cache/claude-agents/update-check.json`. Those two files, and its own binary on `update`, are all it writes.
 
 Limitations: [docs/how-it-works.md](docs/how-it-works.md#limitations).
 
@@ -120,6 +143,8 @@ Limitations: [docs/how-it-works.md](docs/how-it-works.md#limitations).
 **Why don't `general-purpose` or `Explore` show in all or in the ranking?** They have no definition on disk. They show in active, but add no time to any agent.
 
 **An agent I used shows as `never`.** Old `Agent` calls are not kept once Claude Code deletes their transcripts; only runs are.
+
+**How do I keep it off the network?** Set `CLAUDE_AGENTS_NO_UPDATE_CHECK=1` and do not run `claude-agents update`; `--plain` never checks. Without a connection the screen just shows no notice.
 
 **I cannot select text with the mouse.** The screen captures the mouse for the wheel and clicks. Hold `Shift` while dragging (`Option` in iTerm2).
 

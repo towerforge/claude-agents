@@ -5,7 +5,7 @@ use ratatui::style::{Color, Modifier, Style};
 
 /// (token, hex, índice xterm-256 más cercano): los colores de Claude Code.
 /// `claude` es el naranja de la marca; `claude-soft`, su versión clara.
-const TOKENS: [(&str, &str, u8); 8] = [
+const TOKENS: [(&str, &str, u8); 9] = [
     ("subtle", "#505050", 239),
     ("claude", "#d77757", 173),
     ("claude-soft", "#eb9f7f", 216),
@@ -15,6 +15,8 @@ const TOKENS: [(&str, &str, u8); 8] = [
     ("on-claude", "#141413", 233),
     // ámbar de aviso: el contexto casi lleno
     ("warning", "#e5b567", 179),
+    // el verde de éxito de Claude Code: la actualización instalada
+    ("success", "#4eba65", 71),
 ];
 
 pub struct Theme {
@@ -26,6 +28,7 @@ pub struct Theme {
     pub alert: Color,
     pub on_claude: Color,
     pub warning: Color,
+    pub success: Color,
 }
 
 pub fn parse_hex(s: &str) -> Option<Color> {
@@ -48,6 +51,7 @@ impl Theme {
             alert: color(5),
             on_claude: color(6),
             warning: color(7),
+            success: color(8),
         }
     }
 
@@ -101,6 +105,10 @@ impl Theme {
     pub fn warn(&self) -> Style {
         Style::new().fg(self.warning)
     }
+    /// Lo que salió bien: `✓` de `claude-agents update`.
+    pub fn ok(&self) -> Style {
+        Style::new().fg(self.success)
+    }
     pub fn line(&self) -> Style {
         Style::new().fg(self.subtle)
     }
@@ -151,6 +159,13 @@ mod tests {
             Theme::claude().warn().fg,
             Some(Color::Rgb(0xe5, 0xb5, 0x67))
         );
+    }
+
+    #[test]
+    fn success_is_green_in_both_palettes() {
+        assert_eq!(Theme::claude().success, Color::Rgb(0x4e, 0xba, 0x65));
+        assert_eq!(Theme::claude_256().success, Color::Indexed(71));
+        assert_eq!(Theme::claude().ok().fg, Some(Color::Rgb(0x4e, 0xba, 0x65)));
     }
 
     #[test]

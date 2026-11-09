@@ -63,6 +63,9 @@ pub enum Action {
         column: u16,
         row: u16,
     },
+    /// Hay una versión más nueva publicada (sin la `v`): la manda el hilo de
+    /// comprobación de versiones, como `Action::UpdateAvailable` en moon.
+    UpdateAvailable(String),
 }
 
 /// Zonas clicables del último fotograma. Las rellena la vista al pintar
@@ -444,6 +447,9 @@ pub struct App {
     rescan: bool,
     /// Zonas clicables del último fotograma (las rellena la vista).
     pub hits: Hits,
+    /// Versión más nueva publicada (sin la `v`), si la comprobación encontró
+    /// una; `None` mientras no llegue `Action::UpdateAvailable`.
+    pub update_available: Option<String>,
 }
 
 impl App {
@@ -483,6 +489,7 @@ impl App {
             quit: false,
             rescan: false,
             hits: Hits::default(),
+            update_available: None,
         }
     }
 
@@ -1415,6 +1422,7 @@ impl App {
             Action::Scroll(_) if self.detail || self.run_detail.is_some() => {}
             Action::Scroll(delta) => self.scroll_by(delta.into()),
             Action::Click { column, row } => self.click(column, row),
+            Action::UpdateAvailable(v) => self.update_available = Some(v),
         }
         self.clamp();
     }
@@ -1587,6 +1595,14 @@ pub(crate) mod tests {
             scope,
             description: Some(format!("Agente {name}")),
         }
+    }
+
+    #[test]
+    fn update_available_starts_empty_and_keeps_the_new_version() {
+        let mut app = App::new(10, PathBuf::from("/Users/x"), "0.1.0", NOW.parse().unwrap());
+        assert_eq!(app.update_available, None);
+        app.update(Action::UpdateAvailable("0.2.0".into()));
+        assert_eq!(app.update_available.as_deref(), Some("0.2.0"));
     }
 
     pub(crate) fn call(agent: &str, cwd: &str, at: &str) -> Invocation {
