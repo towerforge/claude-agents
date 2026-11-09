@@ -1,8 +1,9 @@
 #!/bin/sh
 # claude-agents installer
 #
-# Installs claude-agents and, run again, upgrades it: the tool does not update
-# itself, re-running this script IS the update.
+# Installs claude-agents. From then on it updates itself with
+# `claude-agents update`; run again over an installation that can do that, this
+# script sends you there unless CLAUDE_AGENTS_FORCE=1.
 #
 # Usage (latest):
 #   curl -fsSL https://raw.githubusercontent.com/towerforge/claude-agents/main/install.sh | sh
@@ -12,6 +13,8 @@
 #   CLAUDE_AGENTS_INSTALL_DIR=/opt/bin  install to a custom directory
 #   CLAUDE_AGENTS_VARIANT=musl          force the static musl binary on Linux (no glibc dep)
 #   CLAUDE_AGENTS_VARIANT=gnu           force the glibc binary on Linux
+#   CLAUDE_AGENTS_FORCE=1               install even if claude-agents is already
+#                                       there and can update itself
 #   NO_COLOR=1                          no colour, whatever the terminal says
 
 set -e
@@ -22,27 +25,68 @@ GITHUB_API="https://api.github.com/repos/${REPO}"
 GITHUB_RELEASES="https://github.com/${REPO}/releases/download"
 INSTALL_URL="https://raw.githubusercontent.com/${REPO}/main/install.sh"
 
-# ── colours ──────────────────────────────────────────────────────────────────
-# Plain ANSI, only when the output is a terminal and NO_COLOR is not set.
+# ── the claude-agents palette ────────────────────────────────────────────────
+# The same tokens as the screen (src/tui/theme.rs): the full hex when the
+# terminal announces truecolor, the xterm-256 approximation otherwise, and
+# nothing at all when the output is not a terminal or NO_COLOR is set.
 
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-}" != "dumb" ]; then
   BOLD='\033[1m'; DIM='\033[2m'; RESET='\033[0m'
-  GREEN='\033[32m'; RED='\033[31m'; YELLOW='\033[33m'
+  case "${COLORTERM:-}" in
+    truecolor|24bit)
+      CLAUDE='\033[38;2;215;119;87m'   # claude       #d77757
+      SOFT='\033[38;2;235;159;127m'    # claude-soft  #eb9f7f
+      INK='\033[38;2;250;249;245m'     # ink          #faf9f5
+      MUTED='\033[38;2;153;153;153m'   # ink-muted    #999999
+      LINE='\033[38;2;80;80;80m'       # subtle       #505050
+      RED='\033[38;2;255;107;128m'     # alert        #ff6b80
+      AMBER='\033[38;2;229;181;103m'   # warning      #e5b567
+      ;;
+    *)
+      CLAUDE='\033[38;5;173m'; SOFT='\033[38;5;216m'; INK='\033[38;5;255m'
+      MUTED='\033[38;5;246m'; LINE='\033[38;5;239m'; RED='\033[38;5;204m'
+      AMBER='\033[38;5;179m'
+      ;;
+  esac
 else
   BOLD=''; DIM=''; RESET=''
-  GREEN=''; RED=''; YELLOW=''
+  CLAUDE=''; SOFT=''; INK=''; MUTED=''; LINE=''; RED=''; AMBER=''
 fi
 
-# Column the descriptions of a command list line up at.
-CMD_W=30
+# ── the pieces every block is drawn with ─────────────────────────────────────
 
-section() { printf "\n  ${BOLD}%s${RESET}\n" "$*"; }
-kv()      { printf "     ${DIM}%-13s${RESET}%b\n" "$1" "$2"; }
-note()    { printf "     ${DIM}%s${RESET}\n" "$*"; }
-cmd()     { printf "     %-${CMD_W}s${DIM}%s${RESET}\n" "$1" "$2"; }
-ok()      { printf "     ${GREEN}✓${RESET} %b\n" "$*"; }
-warn()    { printf "     ${YELLOW}!${RESET} %s\n" "$*"; }
-die()     { printf "\n  ${RED}✗${RESET} %s\n\n" "$*" >&2; exit 1; }
+# Columns a rule spans, the two-space indent aside.
+RULE_W=66
+# Column the descriptions of a command list line up at.
+CMD_W=34
+
+_dashes() {
+  _n=$1; _s=''
+  while [ "$_n" -gt 0 ]; do _s="${_s}─"; _n=$((_n - 1)); done
+  printf '%s' "$_s"
+}
+
+# Section heading, like the screen's: ` 2 · release ───…`, the title in claude
+# over a solid rule in subtle. The number is optional. The labels are ASCII, so
+# bytes count as columns.
+rule() {
+  if [ -n "$1" ]; then
+    _label="$1 · $2"; _cols=$(( ${#1} + 3 + ${#2} ))
+  else
+    _label="$2"; _cols=${#2}
+  fi
+  _fill=$(( RULE_W - _cols - 1 ))
+  [ "$_fill" -lt 0 ] && _fill=0
+  printf "\n  ${CLAUDE}${BOLD}%s${RESET} ${LINE}%s${RESET}\n" \
+    "$_label" "$(_dashes "$_fill")"
+}
+
+kv()   { printf "     ${MUTED}%-13s${RESET}${INK}%b${RESET}\n" "$1" "$2"; }
+note() { printf "     ${MUTED}%s${RESET}\n" "$*"; }
+cmd()  { printf "     ${SOFT}%-${CMD_W}s${RESET}${MUTED}%s${RESET}\n" "$1" "$2"; }
+ok()   { printf "     ${CLAUDE}✓${RESET} %b\n" "$*"; }
+warn() { printf "     ${AMBER}!${RESET} ${MUTED}%s${RESET}\n" "$*"; }
+die()  { printf "\n  ${RED}✗${RESET} %s\n\n" "$*" >&2; exit 1; }
 
 # ── requirements ─────────────────────────────────────────────────────────────
 
@@ -140,12 +184,16 @@ default_install_dir() {
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 
-printf "\n  ${BOLD}claude-agents${RESET}  ${DIM}installer · github.com/${REPO}${RESET}\n"
-printf "  ${DIM}lists your Claude Code subagents and marks the ones in use${RESET}\n"
+# The header block: the screen's star in claude, the name, what it does, and
+# where it comes from.
+printf "\n"
+printf "  ${CLAUDE}✦${RESET}  ${INK}${BOLD}claude-agents${RESET}\n"
+printf "     ${MUTED}lists your Claude Code subagents and marks the ones in use${RESET}\n"
+printf "     ${LINE}installer · github.com/${REPO}${RESET}\n"
 
 # ── step 1: detect platform ──────────────────────────────────────────────────
 
-section "1 · platform"
+rule 1 platform
 
 OS=$(detect_os)
 ARCH=$(detect_arch)
@@ -174,20 +222,45 @@ fi
 
 # ── step 2: resolve version ──────────────────────────────────────────────────
 
-section "2 · release"
+rule 2 release
 
 INSTALL_DIR="${CLAUDE_AGENTS_INSTALL_DIR:-$(default_install_dir)}"
 
 # An existing installation: `claude-agents --version` prints
 # "claude-agents 0.1.0", the version is the last word.
 CURRENT_VERSION=""
+EXISTING_PATH=""
 for _candidate in "${INSTALL_DIR}/${BINARY}" "$(command -v ${BINARY} 2>/dev/null || true)"; do
   [ -z "$_candidate" ] && continue
   if [ -x "$_candidate" ]; then
+    EXISTING_PATH="$_candidate"
     CURRENT_VERSION=$("$_candidate" --version 2>/dev/null | awk '{print $NF}' || true)
     break
   fi
 done
+
+# claude-agents updates itself, so this script is for the first install.
+# Whether the one that is there can do it is asked of the binary and not of its
+# version number: one from before `claude-agents update` existed is upgraded
+# here as always.
+if [ -n "$CURRENT_VERSION" ] && [ -z "${CLAUDE_AGENTS_FORCE:-}" ] \
+   && "$EXISTING_PATH" update --help >/dev/null 2>&1; then
+  kv "version" "v${CURRENT_VERSION}"
+  kv "path" "${EXISTING_PATH}"
+  ok "claude-agents is already installed"
+  printf "\n"
+  printf "     ${INK}It updates itself.${RESET} ${MUTED}From here on:${RESET}\n"
+  printf "\n"
+  cmd "claude-agents update" "the latest release"
+  cmd "claude-agents update --check" "is there a new one?"
+  cmd "claude-agents update --to 1.0.0" "that version, downgrades included"
+  cmd "claude-agents update --force" "reinstall the one you have"
+  printf "\n"
+  note "to install with this script anyway:"
+  note "curl -fsSL ${INSTALL_URL} | CLAUDE_AGENTS_FORCE=1 sh"
+  printf "\n"
+  exit 0
+fi
 
 VERSION="${CLAUDE_AGENTS_VERSION:-}"
 VERSION="${VERSION#v}"
@@ -209,7 +282,7 @@ elif [ "$CURRENT_VERSION" = "$VERSION" ]; then
   kv "version" "v${VERSION}  ${DIM}(already installed)${RESET}"
 else
   MODE="upgrade"
-  kv "version" "${DIM}v${CURRENT_VERSION}${RESET}  →  ${BOLD}v${VERSION}${RESET}"
+  kv "version" "${MUTED}v${CURRENT_VERSION}${RESET}  ${LINE}→${RESET}  ${CLAUDE}v${VERSION}${RESET}"
 fi
 kv "package" "$PACKAGE"
 kv "install to" "${INSTALL_DIR}/${BINARY}"
@@ -220,23 +293,23 @@ kv "install to" "${INSTALL_DIR}/${BINARY}"
 if [ -t 0 ] || { [ -c /dev/tty ] && (: </dev/tty) 2>/dev/null; }; then
   printf "\n"
   if [ "$MODE" = "reinstall" ]; then
-    printf "     ${DIM}already at v${VERSION} · reinstall?${RESET} [y/N] "
+    printf "     ${MUTED}already at v${VERSION} · reinstall?${RESET} ${INK}[y/N]${RESET} "
     read -r _reply </dev/tty
     case "$_reply" in
       [yY]*) ;;
-      *) printf "\n     ${DIM}nothing was touched${RESET}\n\n"; exit 0 ;;
+      *) printf "\n     ${MUTED}nothing was touched${RESET}\n\n"; exit 0 ;;
     esac
   else
     _action="install"
     [ "$MODE" = "upgrade" ] && _action="upgrade"
-    printf "     ${DIM}press${RESET} enter ${DIM}to ${_action}, or${RESET} ctrl+c ${DIM}to cancel${RESET} "
+    printf "     ${MUTED}press${RESET} ${INK}enter${RESET} ${MUTED}to ${_action}, or${RESET} ${INK}ctrl+c${RESET} ${MUTED}to cancel${RESET} "
     read -r _ </dev/tty
   fi
 fi
 
 # ── step 3: download & verify ────────────────────────────────────────────────
 
-section "3 · download"
+rule 3 download
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT INT TERM
@@ -254,7 +327,7 @@ fi
 
 # ── step 4: install ──────────────────────────────────────────────────────────
 
-section "4 · install"
+rule 4 install
 
 tar -xzf "${TMP}/${PACKAGE}" -C "$TMP"
 [ -f "${TMP}/${BINARY}" ] || die "Binary '${BINARY}' not found inside the archive"
@@ -279,15 +352,16 @@ esac
 
 # ── done ─────────────────────────────────────────────────────────────────────
 
-section "ready"
+rule "" ready
 
 cmd "claude-agents" "interactive screen (agents used in the last 10 min)"
 cmd "claude-agents -m 60" "widen the active window to 60 minutes"
 cmd "claude-agents --plain" "print the table and exit"
 cmd "claude-agents --plain -v" "the table plus open Claude sessions"
 cmd "claude-agents -r ~/code" "search ~/code instead of your home (repeatable)"
+cmd "claude-agents update" "when there is a new release"
 cmd "claude-agents --help" "every flag"
 printf "\n"
-note "to upgrade later, run the installer again:"
-note "curl -fsSL ${INSTALL_URL} | sh"
+note "the screen tells you when a new release is out;"
+note "CLAUDE_AGENTS_NO_UPDATE_CHECK=1 turns that check off."
 printf "\n"

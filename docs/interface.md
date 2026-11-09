@@ -1,7 +1,8 @@
 # The interface
 
-The interactive screen, view by view, and the `--plain` table. How the
-figures on it are computed is in [how-it-works.md](how-it-works.md).
+The interactive screen, view by view, the `--plain` table and the panel of
+`claude-agents update`. How the figures on it are computed, and how the update
+works, is in [how-it-works.md](how-it-works.md).
 
 ## The screen
 
@@ -39,6 +40,14 @@ right with one free column of margin; with the scroll counter it reads
 `1-5/11  v0.1.0`. It shows in the three views and in both detail screens (these,
 without the counter). The keys take priority: the version is omitted if it does
 not fit next to them (keys width + right-hand width + 2 <= screen width).
+
+When the [daily check](how-it-works.md#the-daily-check) finds a newer release,
+the footer announces it left of the version, on every screen that carries it:
+`1-5/11  ↑ v1.2.0 available · claude-agents update  v1.1.0`, with `↑ v1.2.0` in
+`claude` and the rest in gray. It arrives whenever the background check
+answers, without blocking anything. When it does not fit, it shortens to
+`↑ v1.2.0  v1.1.0`, then goes away, and only then does the version; the keys
+are still cut first.
 
 The history is refreshed every 2 s and the definitions every 30 s or on pressing
 `r`. At startup, until the definitions and the first reading of the
@@ -691,3 +700,69 @@ RUNNING   demo    7 min ago           7 min  ~/.claude/agents/demo.md
 With `-v`, the open Claude sessions follow the summary line, one per line, with
 their pid and command. `-v` only has an effect with `--plain`: on the screen the
 sessions are a counter in the header.
+
+## The update panel
+
+`claude-agents update` in a terminal opens a panel of 11 rows below the
+prompt, without taking over the screen (excerpt with made-up data):
+
+```
+ claude-agents update ──────────────────────────────── released 2 d ago
+
+   1.1.0  →  1.2.0                         what's new in 1.2.0
+   package     macos · aarch64 · 2.1 MB    · feat: update command
+   install to  ~/.local/bin/claude-agents  · fix: narrow terminals
+
+ ████████████░░░░░░░░░░░░   50%  1.1 MB / 2.1 MB
+
+ esc cancel
+```
+
+- **Rule**: `claude-agents update` and, if it fits, how long ago the release
+  was published.
+- **Data**: the running version `→` the new one; the package (platform,
+  architecture, `musl` if it applies, and size); where it installs, with `~`
+  for the home and cut from the front (`…/bin/claude-agents`) if it does not
+  fit. Up to date, the first line reads `claude-agents 1.1.0`.
+- **What's new**: on the right, the first three bullets of the release notes
+  (without GitHub's `by @who in <url>`), or `no release notes`. It goes away
+  when there is no room for it.
+- **Status**, one line per phase: `✦ checking GitHub for a new release…`; `✓
+  claude-agents 1.1.0 is the latest version`; `↑ claude-agents 1.2.0 is
+  available` (with `--check`); `↑ install claude-agents 1.2.0?`; the download
+  bar in `claude` with percent and MB (only MB if the size is unknown; on a
+  narrow terminal the bar shortens and then goes, the figures stay); `✦
+  verifying sha-256`; `✦ installing to <path>`; `✓ claude-agents 1.2.0
+  installed`, plus `· checksum not published: not verified` in amber when it
+  could not be checked; `✗ cancelled · nothing was touched`. A refusal reads
+  `✗ this claude-agents came from cargo · --force overwrites it` (or `is a local
+  build under target/`), and any other error goes in red over up to three
+  lines.
+- **Keys**, last row: `enter update · esc cancel` at the question; `esc
+  cancel` while checking and downloading; afterwards, what to type next
+  (`claude-agents update` after `--check`, `claude-agents` after installing, or
+  the command that updates a refused copy).
+
+`Enter` or `y` install; `Esc`, `q`, `n` or `Ctrl+C` cancel while checking, at
+the question and during the download: nothing has been written yet. Verifying
+and installing cannot be interrupted. When it ends, the last frame stays in the
+terminal above the prompt.
+
+Without a terminal (stdin or stdout redirected), or if the terminal does not
+answer the query for the cursor position, the same steps come out as plain
+lines (errors to stderr):
+
+```
+claude-agents 1.1.0 → 1.2.0
+  package     claude-agents-macos-aarch64.tar.gz (2.1 MB)
+  install to  ~/.local/bin/claude-agents
+  · feat: update command
+install it? [y/N]
+```
+
+In a terminal that answer is read from the keyboard (`y`, `Y` or `yes`) and the
+download shows MB and percent on one line. Without a terminal there is no
+question: it needs `--yes`, or it stops with `no interactive terminal: pass
+--yes to update without asking`. With `--check` and no terminal, the only line
+is the result: ``claude-agents 1.2.0 is available · run `claude-agents
+update` ``.

@@ -1,6 +1,6 @@
 [package]
 name = "claude-agents"
-version = "1.1.0"
+version = "1.1.1"
 edition = "2021"
 rust-version = "1.88"
 description = "Lists Claude Code subagents on disk and flags which ones were invoked recently"
@@ -9,9 +9,18 @@ description = "Lists Claude Code subagents on disk and flags which ones were inv
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4.5", features = ["derive"] }
-serde_json = "1"
+# `claude-agents update`: descomprime el .tar.gz de la release
+flate2 = "1.1.11"
 ratatui = "0.30.2"
+serde_json = "1"
+# `claude-agents update`: comprueba el archivo contra checksums.txt
+sha2 = "0.10.9"
+# `claude-agents update`: saca el binario del archivo (sin xattr: solo se lee)
+tar = { version = "0.4.46", default-features = false }
 unicode-width = "0.2.2"
+# `claude-agents update`: HTTP síncrono contra GitHub, sin tokio; rustls con
+# los certificados de webpki-roots dentro, así funciona igual en musl
+ureq = { version = "3.5.1", default-features = false, features = ["rustls"] }
 walkdir = "2"
 
 [profile.release]

@@ -1,7 +1,8 @@
 # How it works
 
 What claude-agents reads from disk and how it turns it into the screen's
-figures. The screen itself is described in [interface.md](interface.md).
+figures, and how it updates itself. The screen itself is described in
+[interface.md](interface.md).
 
 ## How it decides an agent is active
 
@@ -238,7 +239,9 @@ $XDG_CACHE_HOME/claude-agents/runs.jsonl    # if XDG_CACHE_HOME is an absolute p
 ~/.cache/claude-agents/runs.jsonl           # otherwise
 ```
 
-It is the only file the tool writes; the screen and `--plain` both update it.
+The screen and `--plain` both update it. Besides it, the tool only writes the
+[update note](#the-daily-check) next to it and, on `claude-agents update`, its
+own binary.
 
 - One JSON object per line and per run, with `"v":1` (a line of another
   version, or a broken one, is skipped). Only runs that are not in progress go
@@ -263,6 +266,80 @@ It is the only file the tool writes; the screen and `--plain` both update it.
 - Tests never write there: they use their own temporary folders, or no cache.
 
 To start over, delete the file.
+
+## Updating
+
+`claude-agents update` replaces the running binary with the one from a GitHub
+release. The panel and the text it prints are in
+[interface.md](interface.md#the-update-panel).
+
+1. It asks the GitHub API (`api.github.com`, anonymous) for the latest release,
+   or for the tag `vX.Y.Z` with `--to`. No release, a missing tag, no
+   connection or the API's rate limit end it with an error.
+2. It decides whether the release is worth installing: a newer one always; the
+   one named with `--to` if it differs from the running version (downgrades
+   included); and anything with `--force`, the same version too. Otherwise it
+   says the running version is the latest and stops.
+3. With `--check` it stops here and says what is available.
+4. Before downloading anything it looks at where the running binary lives (with
+   symbolic links resolved). Under `.cargo/bin` (a `cargo install`) or under
+   `target/debug`, `target/release` or `target/<triple>/...` (a local build)
+   it stops and names what updates that copy instead (`cargo install --git
+   https://github.com/towerforge/claude-agents` or `make build`); `--force`
+   goes on anyway. It then checks it can write in that folder: if not, it stops
+   and suggests `sudo`, or `CLAUDE_AGENTS_INSTALL_DIR` with `install.sh`.
+5. It asks before installing, unless `--yes`. Without a terminal there is no
+   one to ask: without `--yes` it stops with an error.
+6. It downloads the archive for the platform it was built for
+   (`claude-agents-<os>-<arch>[-musl].tar.gz`, the same names as
+   [releases.md](releases.md#archives); a musl build stays on musl), in memory.
+7. It checks its SHA-256 against the archive's line in `checksums.txt`. A
+   mismatch stops it with nothing written. If the release has no
+   `checksums.txt`, or no line for that archive, it installs anyway and says
+   `checksum not published: not verified`.
+8. It takes the `claude-agents` binary out of the archive, writes it to a
+   temporary file in the same folder with mode `755` and moves it over the old
+   one with a `rename`, so a failure halfway leaves the old binary intact. The
+   copy that is running keeps working until it exits.
+
+The exit code is 1 only when something fails (including a refusal in step 4);
+up to date, available with `--check`, installed and cancelled are 0.
+
+### The daily check
+
+When the interactive screen opens, a background thread asks whether there is
+a newer release; `--plain` never asks. The answer is kept in a note next to the
+[history cache](#kept-history):
+
+```
+$XDG_CACHE_HOME/claude-agents/update-check.json    # if XDG_CACHE_HOME is an absolute path
+~/.cache/claude-agents/update-check.json           # otherwise
+```
+
+It holds the time of the check and the latest version GitHub had
+(`{"checked_at": "...", "latest": "1.2.0"}`). While it is less than 24 h old,
+the screen answers from it without going to the network; after that it asks
+GitHub again and rewrites it (a temporary file and `rename`). A note dated in
+the future, or one it cannot read, counts as no note.
+
+- If the latest release is newer than the running version, the footer
+  announces it ([interface.md](interface.md#the-screen)).
+- Any failure (no connection, rate limit, an unreadable note) shows no notice
+  and no error; the screen does not wait for the thread.
+- `claude-agents update` rewrites the note whenever it learns the latest
+  release (not with `--to`), and deletes it after installing, so the notice
+  does not outlive the update.
+- `CLAUDE_AGENTS_NO_UPDATE_CHECK` turns the screen's check off with any value
+  except empty or `0`. It does not affect `claude-agents update`.
+- Tests never touch the real note: they use their own temporary folders.
+
+### Network
+
+The tool goes to the network only for updates: `api.github.com` for the
+release data, and GitHub's download URLs for the archive and `checksums.txt`.
+That happens on the screen's daily check and on `claude-agents update`. To keep
+it off the network, set `CLAUDE_AGENTS_NO_UPDATE_CHECK=1` and do not run
+`claude-agents update`.
 
 ## Limitations
 
@@ -352,3 +429,9 @@ To start over, delete the file.
   cannot be selected by dragging.
 - `-v` only has an effect with `--plain`; on the screen the sessions show as a
   counter in the header.
+- `claude-agents update` uses GitHub's API without a token, which allows 60
+  requests per hour per address; past that it fails with `rate limit reached`
+  until the limit resets.
+- The screen learns of a new release at most once a day: one published right
+  after a check shows up to 24 h later (`claude-agents update --check` asks
+  right away).
