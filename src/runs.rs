@@ -65,6 +65,13 @@ pub struct Run {
     pub tool_use_id: Option<String>,
     pub session_id: Option<String>,
     pub cwd: Option<PathBuf>,
+    /// Carpeta donde se lanzó la sesión de Claude Code a la que pertenece:
+    /// primer `cwd` no temporal de la transcripción principal
+    /// (`<proyecto>/<sesión>.jsonl`), igual para los subagentes anidados y los
+    /// pasos de workflow. Distinta de `cwd` si el principal hizo `cd` antes de
+    /// lanzarla. `None` si aún no se ha podido leer (se reintenta) o si viene de
+    /// una entrada del historial anterior a este campo.
+    pub launch_dir: Option<PathBuf>,
     /// `cwd` temporal de Claude con el que se lanzó (resuelto o no); `None` si nunca lo fue.
     pub temp_cwd: Option<PathBuf>,
     /// Primer y último `timestamp` de la transcripción.
@@ -248,6 +255,8 @@ struct Transcript {
     offset: u64,
     cwd: Option<PathBuf>,
     pub(super) temp_cwd: Option<PathBuf>,
+    /// De la sesión principal, puesto por `resolve_sessions`.
+    launch_dir: Option<PathBuf>,
     session_id: Option<String>,
     start: Option<DateTime<Utc>>,
     /// Último `timestamp` en orden de fichero: de él se mide el siguiente hueco.
@@ -476,6 +485,7 @@ impl Runs {
                     session_id: t.session_id.clone(),
                     cwd: t.cwd.clone(),
                     temp_cwd: t.temp_cwd.clone(),
+                    launch_dir: t.launch_dir.clone(),
                     start: t.start,
                     last: t.last,
                     worked: t.worked,

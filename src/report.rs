@@ -109,15 +109,6 @@ pub fn tokens(n: u64) -> String {
     }
 }
 
-/// Coste estimado en dólares: "≈ $0.62"; por debajo del céntimo, "< $0.01".
-pub fn cost(usd: f64) -> String {
-    if usd < 0.01 {
-        "< $0.01".to_string()
-    } else {
-        format!("≈ ${usd:.2}")
-    }
-}
-
 /// Nombre del modelo sin el prefijo `claude-` ni la fecha final
 /// (`claude-haiku-4-5-20251001` → `haiku-4-5`).
 pub fn model(name: &str) -> String {
@@ -265,14 +256,6 @@ mod tests {
         assert_eq!(tokens(31_400_000), "31.4M");
         assert_eq!(tokens(99_960_000), "100M");
         assert_eq!(tokens(142_300_000), "142M");
-    }
-
-    #[test]
-    fn cost_in_dollars_with_two_decimals_or_under_a_cent() {
-        assert_eq!(cost(0.62), "≈ $0.62");
-        assert_eq!(cost(0.005), "< $0.01");
-        assert_eq!(cost(0.0), "< $0.01");
-        assert_eq!(cost(12.345), "≈ $12.35");
     }
 
     #[test]

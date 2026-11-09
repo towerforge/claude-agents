@@ -56,6 +56,45 @@ pub enum Action {
     /// Rueda del ratón: líneas que se mueve la vista (negativo, hacia arriba).
     /// El cursor se arrastra si se sale de la vista.
     Scroll(i32),
+    /// Clic izquierdo en la celda (`column`, `row`) de la pantalla, contando
+    /// desde 0 arriba a la izquierda, tal cual llega de crossterm. Se busca en
+    /// `App::hits`.
+    Click {
+        column: u16,
+        row: u16,
+    },
+}
+
+/// Zonas clicables del último fotograma. Las rellena la vista al pintar
+/// (vaciándolas antes) con lo que de verdad se ve, así las posiciones no se
+/// calculan dos veces; `update(Action::Click)` solo las consulta.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Hits {
+    /// Las pestañas de la fila superior.
+    pub tabs: Vec<TabHit>,
+    /// Una entrada por cada línea de pantalla de la lista que pertenece a una
+    /// fila seleccionable; ocupa todo el ancho.
+    pub rows: Vec<RowHit>,
+}
+
+/// Una pestaña: un clic en la fila `row` con la columna dentro de `cols`
+/// (final excluido) abre `mode`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TabHit {
+    pub mode: Mode,
+    pub row: u16,
+    pub cols: std::ops::Range<u16>,
+}
+
+/// Una línea de la lista: la fila de pantalla `row` es de la línea
+/// seleccionable `cursor` (el valor de `App::cursor` que la elige, es decir,
+/// `Item::n() - 1`). Las cuatro líneas de un bloque de activos llevan una
+/// entrada cada una con el mismo `cursor`; las cabeceras de sección, las
+/// líneas en blanco y las notas no llevan ninguna.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RowHit {
+    pub row: u16,
+    pub cursor: usize,
 }
 
 /// La pestaña abierta: la lista de los activos, la de todos o el ranking por
@@ -174,6 +213,8 @@ pub struct NowLine {
     pub id: String,
     /// `agentType`, con «workflow» para las de workflow (`status::display_name`).
     pub name: String,
+    /// El `cwd` real del subagente (`status::NowRun::cwd`): la cuarta línea
+    /// del bloque (`Item::LiveCwd`). El grupo va por la carpeta de lanzamiento.
     pub cwd: Option<PathBuf>,
     pub since: Option<DateTime<Utc>>,
     /// Lo que lleva trabajado hasta ahora.
@@ -246,12 +287,12 @@ pub enum Item {
         running: usize,
         recent: usize,
     },
-    /// Activos: primera línea de un bloque de tres (agente, tipo, tiempo,
+    /// Activos: primera línea de un bloque de cuatro (agente, tipo, tiempo,
     /// herramientas), en curso o terminado (`line.state`). Es la fila
     /// seleccionable; `row` es la del agente definido si lo hay (un agente
     /// definido, o un workflow cuyo agente real lo es) y `None` si es built-in
     /// o un workflow sin agente definido. Enter abre en cualquier caso la ficha
-    /// de la ejecución (`line.id`). Le siguen `LiveTask` y `LiveNow`.
+    /// de la ejecución (`line.id`). Le siguen `LiveTask`, `LiveNow` y `LiveCwd`.
     Live {
         n: usize,
         line: NowLine,
@@ -263,6 +304,11 @@ pub enum Item {
     /// Activos: tercera línea del bloque, «ahora …» (`line.last_tool`). No se
     /// selecciona; va siempre detrás de su `LiveTask`.
     LiveNow(NowLine),
+    /// Activos: cuarta línea del bloque, el `cwd` real del subagente
+    /// (`line.cwd`, que puede no coincidir con la carpeta del grupo). Sale
+    /// siempre, aunque no se sepa (`None`), para que todos los bloques midan
+    /// lo mismo. No se selecciona; va siempre detrás de su `LiveNow`.
+    LiveCwd(NowLine),
     /// Activos sin nada en curso ni en la ventana (y sin filtro): el último
     /// uso de cualquier agente definido, o `None` si no hay ninguno.
     Quiet {
@@ -396,6 +442,8 @@ pub struct App {
     pending: Option<usize>,
     pub quit: bool,
     rescan: bool,
+    /// Zonas clicables del último fotograma (las rellena la vista).
+    pub hits: Hits,
 }
 
 impl App {
@@ -434,6 +482,7 @@ impl App {
             pending: None,
             quit: false,
             rescan: false,
+            hits: Hits::default(),
         }
     }
 
@@ -628,17 +677,23 @@ impl App {
     /// final: los grupos por su actividad más reciente; dentro, primero las en
     /// curso y luego las terminadas en la ventana), numerado de corrido por
     /// todo. El filtro se aplica sobre las líneas antes de agrupar: nombre,
-    /// proyecto o encargo; los contadores `running`/`recent` del grupo se
+    /// carpeta del grupo (`group_dir`, lo que se ve en la regla), `cwd` real o
+    /// encargo; los contadores `running`/`recent` del grupo se
     /// rehacen con lo que queda y un grupo sin líneas no sale. Cada ejecución
-    /// es un bloque de tres líneas que cuenta como una fila; entre bloques, y
+    /// es un bloque de cuatro líneas (nombre, encargo, ahora/última y `cwd`)
+    /// que cuenta como una fila; entre bloques, y
     /// antes de la regla de cada grupo menos el primero, un `Item::Blank`
     /// (que no es parte de ningún bloque para el scroll). Si su agente es
     /// uno definido (`NowRun::owner`), lleva su fila para la ficha.
     fn live_items(&self, needle: &str, n: &mut usize) -> Vec<Item> {
         let keep = |r: &status::NowRun| {
-            let cwd = r.cwd.map(|c| report::shorten(c, &self.home));
+            let dir = |d: Option<&Path>| {
+                d.map(|d| report::shorten(d, &self.home))
+                    .is_some_and(|d| contains(&d, needle))
+            };
             contains(r.name, needle)
-                || cwd.is_some_and(|c| contains(&c, needle))
+                || dir(r.group_dir)
+                || dir(r.cwd)
                 || r.task.is_some_and(|t| contains(t, needle))
         };
         let mut items = Vec::new();
@@ -693,7 +748,8 @@ impl App {
                     row,
                 });
                 items.push(Item::LiveTask(line.clone()));
-                items.push(Item::LiveNow(line));
+                items.push(Item::LiveNow(line.clone()));
+                items.push(Item::LiveCwd(line));
             }
         }
         items
@@ -986,13 +1042,13 @@ impl App {
         }
     }
 
-    /// Última línea de la fila de la línea `line`: la tercera de un bloque de
+    /// Última línea de la fila de la línea `line`: la cuarta de un bloque de
     /// activos, o ella misma.
     fn row_end(items: &[Item], line: usize) -> usize {
         let mut end = line;
         while matches!(
             items.get(end + 1),
-            Some(Item::LiveTask(_) | Item::LiveNow(_))
+            Some(Item::LiveTask(_) | Item::LiveNow(_) | Item::LiveCwd(_))
         ) {
             end += 1;
         }
@@ -1358,8 +1414,54 @@ impl App {
             // En la ficha no hay lista que mover.
             Action::Scroll(_) if self.detail || self.run_detail.is_some() => {}
             Action::Scroll(delta) => self.scroll_by(delta.into()),
+            Action::Click { column, row } => self.click(column, row),
         }
         self.clamp();
+    }
+
+    /// Clic en la pantalla. Una pestaña cambia de modo como Tab; una fila
+    /// mueve el cursor a ella y, si ya estaba, hace lo mismo que Enter. Con la
+    /// ficha de agente abierta solo responden las pestañas (y la cierran);
+    /// con la de ejecución o el filtro en edición no responde nada.
+    fn click(&mut self, column: u16, row: u16) {
+        if self.run_detail.is_some() || self.filtering {
+            return;
+        }
+        self.pending = None;
+        if let Some(tab) = self
+            .hits
+            .tabs
+            .iter()
+            .find(|t| t.row == row && t.cols.contains(&column))
+        {
+            self.mode = tab.mode;
+            self.detail = false;
+            return;
+        }
+        if self.detail {
+            return;
+        }
+        if let Some(hit) = self.hits.rows.iter().find(|h| h.row == row) {
+            if hit.cursor == self.cursor {
+                self.activate();
+            } else {
+                self.cursor = hit.cursor;
+            }
+        }
+    }
+
+    /// Enter sobre la línea del cursor: despliega o pliega un grupo, abre la
+    /// ejecución de un bloque de activos o la ficha del agente.
+    fn activate(&mut self) {
+        if let Some(title) = self.folded_at_cursor() {
+            if !self.open.remove(&title) {
+                self.open.insert(title);
+            }
+        } else if let Some((line, _)) = self.live_at_cursor() {
+            self.open_run(&line.id);
+        } else if self.current().is_some() {
+            self.detail = true;
+        }
     }
 
     fn clamp(&mut self) {
@@ -1409,17 +1511,7 @@ impl App {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Esc if self.detail => self.detail = false,
             KeyCode::Enter if self.detail => self.detail = false,
-            KeyCode::Enter => {
-                if let Some(title) = self.folded_at_cursor() {
-                    if !self.open.remove(&title) {
-                        self.open.insert(title);
-                    }
-                } else if let Some((line, _)) = self.live_at_cursor() {
-                    self.open_run(&line.id);
-                } else if self.current().is_some() {
-                    self.detail = true;
-                }
-            }
+            KeyCode::Enter => self.activate(),
             KeyCode::Down | KeyCode::Char('j') if self.detail => self.step_agent(1),
             KeyCode::Up | KeyCode::Char('k') if self.detail => self.step_agent(-1),
             KeyCode::Down | KeyCode::Char('j') => self.cursor += 1,
@@ -1505,6 +1597,7 @@ pub(crate) mod tests {
             id: None,
             description: None,
             prompt_line: None,
+            launch_dir: None,
         }
     }
 
@@ -2596,17 +2689,17 @@ pub(crate) mod tests {
     #[test]
     fn the_blank_between_blocks_keeps_the_cursor_block_in_view() {
         let mut app = active(busy());
-        // bloque 2: líneas 6-8; con 3 de alto, la vista empieza en su nombre
+        // bloque 2: líneas 7-10; con 4 de alto, la vista empieza en su nombre
         app.cursor = 1;
-        assert_eq!(frame(&mut app, 3), 6);
-        assert_eq!(app.scroll, 6);
-        // el último (8): regla en 32, bloque 33-35; la vista acaba en el 35
+        assert_eq!(frame(&mut app, 4), 7);
+        assert_eq!(app.scroll, 7);
+        // el último (8): regla en 39, bloque 40-43; la vista acaba en el 43
         app.cursor = 7;
-        assert_eq!(frame(&mut app, 4), 33);
-        assert_eq!(app.scroll, 32);
+        assert_eq!(frame(&mut app, 5), 40);
+        assert_eq!(app.scroll, 39);
         // y de vuelta al primero, con las columnas y su regla
         app.cursor = 0;
-        assert_eq!(frame(&mut app, 4), 2);
+        assert_eq!(frame(&mut app, 5), 2);
         assert_eq!(app.scroll, 0);
     }
 
@@ -2625,28 +2718,31 @@ pub(crate) mod tests {
             ],
             "grupos por su actividad más reciente; running y recent por grupo"
         );
-        // columnas, regla, bloque 1 (2-4), blanco, bloque 2 (6-8), blanco,
+        // columnas, regla, bloque 1 (2-5), blanco, bloque 2 (7-10), blanco,
         // regla de station...: un blanco entre bloques y antes de cada regla
-        // salvo la primera; nunca al final
+        // salvo la primera; nunca al final. Cada bloque, cuatro líneas:
+        // nombre, encargo, ahora/última y cwd (siempre, aunque no lo haya)
         assert!(matches!(items[1], Item::LiveGroup { .. }));
         assert!(matches!(items[2], Item::Live { n: 1, .. }));
         assert!(matches!(items[3], Item::LiveTask(_)));
         assert!(matches!(items[4], Item::LiveNow(_)));
-        assert!(matches!(items[5], Item::Blank));
-        assert!(matches!(items[6], Item::Live { n: 2, .. }));
-        assert!(matches!(items[9], Item::Blank));
-        assert!(matches!(items[10], Item::LiveGroup { .. }));
-        assert!(matches!(items[11], Item::Live { n: 3, .. }));
-        assert!(matches!(items[14], Item::Blank));
-        assert!(matches!(items[23], Item::Live { n: 6, .. }));
-        assert!(matches!(items[26], Item::Blank));
-        assert!(matches!(items[27], Item::LiveGroup { .. }));
-        assert!(matches!(items[28], Item::Live { n: 7, .. }));
-        assert!(matches!(items[31], Item::Blank));
-        assert!(matches!(items[32], Item::LiveGroup { .. }));
-        assert!(matches!(items[33], Item::Live { n: 8, .. }));
-        assert!(matches!(items[35], Item::LiveNow(_)));
-        assert_eq!(items.len(), 36);
+        assert!(matches!(items[5], Item::LiveCwd(_)));
+        assert!(matches!(items[6], Item::Blank));
+        assert!(matches!(items[7], Item::Live { n: 2, .. }));
+        assert!(matches!(items[11], Item::Blank));
+        assert!(matches!(items[12], Item::LiveGroup { .. }));
+        assert!(matches!(items[13], Item::Live { n: 3, .. }));
+        assert!(matches!(items[17], Item::Blank));
+        assert!(matches!(items[28], Item::Live { n: 6, .. }));
+        assert!(matches!(items[32], Item::Blank));
+        assert!(matches!(items[33], Item::LiveGroup { .. }));
+        assert!(matches!(items[34], Item::Live { n: 7, .. }));
+        assert!(matches!(items[38], Item::Blank));
+        assert!(matches!(items[39], Item::LiveGroup { .. }));
+        assert!(matches!(items[40], Item::Live { n: 8, .. }));
+        assert!(matches!(items[42], Item::LiveNow(_)));
+        assert!(matches!(items[43], Item::LiveCwd(_)));
+        assert_eq!(items.len(), 44);
         assert_eq!(
             monitor(&app),
             vec![
@@ -2673,7 +2769,7 @@ pub(crate) mod tests {
         assert_eq!(ended(&app, 3), RunState::Running);
         assert_eq!(ended(&app, 6), ended_at("2026-11-05T11:58:00Z"));
         assert_eq!(ended(&app, 7), RunState::Running);
-        let Item::LiveTask(wf) = &items[16] else {
+        let Item::LiveTask(wf) = &items[19] else {
             panic!("segunda línea de workflow")
         };
         assert_eq!(wf.name, "workflow-subagent: tarea");
@@ -2684,7 +2780,7 @@ pub(crate) mod tests {
         assert_eq!(wf.task, None, "en un workflow la description es el nombre");
         assert_eq!(wf.last_tool, None);
         assert_eq!(wf.since, Some("2026-11-05T11:56:00Z".parse().unwrap()));
-        let Item::Live { line, .. } = &items[11] else {
+        let Item::Live { line, .. } = &items[13] else {
             panic!("Explore")
         };
         assert_eq!(line.kind, RunKind::BuiltIn);
@@ -2879,7 +2975,7 @@ pub(crate) mod tests {
         let mut app = active(with_runs(fixture(), vec![wf]));
         let items = app.items();
         // taskflow (2 terminadas) va antes; el workflow abre station: la 3
-        let Item::Live { n, line, row } = &items[11] else {
+        let Item::Live { n, line, row } = &items[13] else {
             panic!("el workflow abre el grupo de station")
         };
         assert_eq!(*n, 3);
@@ -3077,6 +3173,58 @@ pub(crate) mod tests {
         );
     }
 
+    /// Una sesión lanzada en `~/lanzadera` cuyo subagente trabaja en
+    /// `~/obrador`: el grupo es la lanzadera y la cuarta línea, el obrador.
+    fn moved_run() -> App {
+        let mut r = run(
+            "Explore",
+            "/Users/x/obrador",
+            "2026-11-05T11:56:00Z",
+            2,
+            None,
+            false,
+        );
+        r.launch_dir = Some(PathBuf::from("/Users/x/lanzadera"));
+        active(with_runs(fixture(), vec![r]))
+    }
+
+    #[test]
+    fn the_fourth_line_of_a_block_carries_the_real_cwd() {
+        let app = moved_run();
+        let items = app.items();
+        assert!(
+            live_groups(&app).contains(&("~/lanzadera".to_string(), 1, 0)),
+            "agrupa por donde se lanzó la sesión"
+        );
+        let rule = items
+            .iter()
+            .position(|i| matches!(i, Item::LiveGroup { section, .. } if section == "~/lanzadera"))
+            .unwrap();
+        assert!(matches!(items[rule + 1], Item::Live { .. }));
+        assert!(matches!(items[rule + 2], Item::LiveTask(_)));
+        assert!(matches!(items[rule + 3], Item::LiveNow(_)));
+        let Item::LiveCwd(line) = &items[rule + 4] else {
+            panic!("cuarta línea del bloque")
+        };
+        assert_eq!(line.cwd.as_deref(), Some(Path::new("/Users/x/obrador")));
+    }
+
+    #[test]
+    fn the_filter_in_active_matches_the_group_dir_and_the_real_cwd() {
+        let filtered = |f: &str| {
+            let mut app = moved_run();
+            type_filter(&mut app, f);
+            (live_groups(&app), monitor(&app).len())
+        };
+        let lanzadera = vec![("~/lanzadera".to_string(), 1, 0)];
+        assert_eq!(
+            filtered("lanzadera"),
+            (lanzadera.clone(), 1),
+            "regla del grupo"
+        );
+        assert_eq!(filtered("obrador"), (lanzadera, 1), "cwd real");
+    }
+
     #[test]
     fn a_filter_that_leaves_only_finished_runs_rebuilds_the_group_counters() {
         let mut app = active(busy());
@@ -3137,23 +3285,23 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_block_scrolls_into_view_with_its_three_lines_running_or_finished() {
+    fn a_block_scrolls_into_view_with_its_four_lines_running_or_finished() {
         let mut app = active(busy());
         key(&mut app, KeyCode::Char('7'));
-        // 0 columnas; general-purpose en la 28 y sus otras dos líneas en la 29 y la 30
-        assert_eq!(frame(&mut app, 5), 28);
-        assert_eq!(app.scroll, 26, "se ven las tres líneas del bloque");
+        // 0 columnas; general-purpose en la 34 y sus otras tres líneas de la 35 a la 37
+        assert_eq!(frame(&mut app, 5), 34);
+        assert_eq!(app.scroll, 33, "se ven las cuatro líneas del bloque");
         key(&mut app, KeyCode::Char('1'));
         frame(&mut app, 5);
         assert_eq!(app.scroll, 0, "el primero arrastra la regla y las columnas");
-        // una terminada (la 6, líneas 23 a 25) también se ve entera
+        // una terminada (la 6, líneas 28 a 31) también se ve entera
         key(&mut app, KeyCode::Char('6'));
-        assert_eq!(frame(&mut app, 5), 23);
-        assert_eq!(app.scroll, 21);
-        // la última (la 8, líneas 33 a 35): scroll mínimo, con la regla de su grupo (32) a la vista
+        assert_eq!(frame(&mut app, 5), 28);
+        assert_eq!(app.scroll, 27);
+        // la última (la 8, líneas 40 a 43): scroll mínimo, con la regla de su grupo (39) a la vista
         key(&mut app, KeyCode::Char('8'));
         frame(&mut app, 5);
-        assert_eq!(app.scroll, 31);
+        assert_eq!(app.scroll, 39);
         key(&mut app, KeyCode::Home);
         frame(&mut app, 5);
         assert_eq!(app.scroll, 0);
@@ -4087,5 +4235,173 @@ pub(crate) mod tests {
         runs[3].from_cache = true;
         let app = with_runs(app, runs);
         assert_eq!(app.cached_only(), 2);
+    }
+
+    // --- ratón: clics sobre el mapa `hits` que rellena la vista ---
+
+    fn click(app: &mut App, column: u16, row: u16) {
+        app.update(Action::Click { column, row });
+    }
+
+    /// Pestañas en la fila 0 tal como las pintaría la vista.
+    fn tab_hits() -> Vec<TabHit> {
+        vec![
+            TabHit {
+                mode: Mode::Active,
+                row: 0,
+                cols: 2..8,
+            },
+            TabHit {
+                mode: Mode::All,
+                row: 0,
+                cols: 10..13,
+            },
+            TabHit {
+                mode: Mode::Ranking,
+                row: 0,
+                cols: 15..22,
+            },
+        ]
+    }
+
+    /// Una línea de pantalla por fila seleccionable: la `i` en la fila `3 + i`.
+    fn row_hits(n: usize) -> Vec<RowHit> {
+        (0..n)
+            .map(|i| RowHit {
+                row: 3 + i as u16,
+                cursor: i,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn clicking_a_tab_switches_to_that_mode_like_tab() {
+        let mut app = fixture();
+        app.hits.tabs = tab_hits();
+        app.cursor = 2;
+        click(&mut app, 16, 0);
+        assert_eq!(app.mode, Mode::Ranking);
+        click(&mut app, 10, 0);
+        assert_eq!(app.mode, Mode::All);
+        click(&mut app, 7, 0);
+        assert_eq!(app.mode, Mode::Active);
+        click(&mut app, 7, 0);
+        assert_eq!(app.mode, Mode::Active, "la pestaña abierta no cambia nada");
+    }
+
+    #[test]
+    fn a_tab_click_needs_the_right_row_and_column() {
+        let mut app = fixture();
+        app.mode = Mode::Active;
+        app.hits.tabs = tab_hits();
+        click(&mut app, 9, 0); // entre «active» y «all»
+        click(&mut app, 13, 0); // el final del rango no cuenta
+        click(&mut app, 11, 1); // otra fila
+        assert_eq!(app.mode, Mode::Active);
+    }
+
+    #[test]
+    fn clicking_a_row_moves_the_cursor_and_a_second_click_opens_it() {
+        let mut app = many(5);
+        app.hits.rows = row_hits(5);
+        click(&mut app, 40, 6);
+        assert_eq!(app.cursor, 3);
+        assert!(!app.detail, "el primer clic solo mueve el cursor");
+        click(&mut app, 0, 6);
+        assert!(app.detail, "clic en la fila ya elegida = enter");
+        assert_eq!(app.agent(app.current().unwrap().agent).name, "a03");
+    }
+
+    #[test]
+    fn clicking_outside_any_zone_does_nothing() {
+        let mut app = many(5);
+        app.hits.tabs = tab_hits();
+        app.hits.rows = row_hits(5);
+        app.cursor = 1;
+        click(&mut app, 0, 2);
+        click(&mut app, 0, 40);
+        assert_eq!((app.cursor, app.mode, app.detail), (1, Mode::All, false));
+    }
+
+    #[test]
+    fn every_line_of_a_live_block_counts_as_its_row() {
+        let mut app = fused();
+        // dos bloques de cuatro líneas: el 0 en 3..7 y el 1 en 7..11
+        app.hits.rows = (0..8)
+            .map(|i| RowHit {
+                row: 3 + i as u16,
+                cursor: i as usize / 4,
+            })
+            .collect();
+        click(&mut app, 5, 9);
+        assert_eq!(app.cursor, 1);
+        assert!(app.run_detail.is_none());
+        click(&mut app, 5, 10);
+        assert_eq!(open_id(&app), "toolu_f1", "otro clic en el bloque lo abre");
+    }
+
+    #[test]
+    fn a_second_click_on_a_folded_group_unfolds_it_like_enter() {
+        let mut app = history();
+        app.hits.rows = row_hits(app.count());
+        click(&mut app, 1, 9);
+        assert_eq!(app.cursor, 6);
+        click(&mut app, 1, 9);
+        assert!(folded(&app)[0].3, "desplegado");
+        assert!(!app.detail);
+    }
+
+    #[test]
+    fn with_the_agent_detail_open_only_tabs_answer_and_they_close_it() {
+        let mut app = many(5);
+        app.hits.tabs = tab_hits();
+        app.hits.rows = row_hits(5);
+        key(&mut app, KeyCode::Enter);
+        assert!(app.detail);
+        click(&mut app, 0, 5);
+        assert_eq!(
+            (app.cursor, app.detail),
+            (0, true),
+            "las filas no responden"
+        );
+        click(&mut app, 16, 0);
+        assert_eq!((app.mode, app.detail), (Mode::Ranking, false));
+    }
+
+    #[test]
+    fn with_the_run_detail_open_clicks_are_ignored() {
+        let mut app = fused();
+        app.hits.tabs = tab_hits();
+        app.hits.rows = row_hits(2);
+        key(&mut app, KeyCode::Enter);
+        click(&mut app, 16, 0);
+        click(&mut app, 0, 4);
+        assert_eq!(app.mode, Mode::Active);
+        assert_eq!(open_id(&app), "toolu_b3");
+    }
+
+    #[test]
+    fn while_typing_the_filter_clicks_are_ignored() {
+        let mut app = many(5);
+        app.hits.tabs = tab_hits();
+        app.hits.rows = row_hits(5);
+        key(&mut app, KeyCode::Char('/'));
+        click(&mut app, 16, 0);
+        click(&mut app, 0, 5);
+        assert_eq!((app.mode, app.cursor, app.filtering), (Mode::All, 0, true));
+    }
+
+    #[test]
+    fn a_click_ends_a_pending_digit() {
+        let mut app = many(12);
+        app.hits.rows = row_hits(12);
+        key(&mut app, KeyCode::Char('1')); // podría ser 10, 11 o 12
+        click(&mut app, 0, 5);
+        assert_eq!(app.cursor, 2);
+        key(&mut app, KeyCode::Char('2'));
+        assert_eq!(
+            app.cursor, 1,
+            "el 1 de antes ya no espera: es el 2, no el 12"
+        );
     }
 }

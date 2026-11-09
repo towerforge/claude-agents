@@ -10,6 +10,11 @@ pub struct Invocation {
     pub agent: String,
     pub cwd: PathBuf,
     pub at: DateTime<Utc>,
+    /// Carpeta donde se lanzó la sesión principal a la que pertenece el
+    /// fichero de la llamada (la del principal también si la llamada sale de
+    /// un subagente): primer `cwd` no temporal de `<proyecto>/<sesión>.jsonl`.
+    /// La pone `History`; `None` mientras no se pueda leer (se reintenta).
+    pub launch_dir: Option<PathBuf>,
     /// `id` del bloque `tool_use` (`toolu_…`): coincide con el `toolUseId` del
     /// `.meta.json` de la ejecución que lanzó (ver `runs`).
     pub id: Option<String>,
@@ -20,7 +25,7 @@ pub struct Invocation {
     pub prompt_line: Option<String>,
 }
 
-use crate::runs::cwd::{first_real_cwd, is_claude_temp};
+use crate::runs::cwd::{first_real_cwd, is_claude_temp, session_transcript};
 use crate::runs::first_task_line;
 use anyhow::Result;
 use serde_json::Value;
@@ -67,6 +72,7 @@ pub fn parse_line(line: &str) -> Vec<Invocation> {
                     .pointer("/input/prompt")
                     .and_then(Value::as_str)
                     .and_then(first_task_line),
+                launch_dir: None,
             })
         })
         .collect()
@@ -91,6 +97,10 @@ struct FileState {
 #[derive(Debug, Default)]
 pub struct History {
     files: HashMap<PathBuf, FileState>,
+    /// Carpeta de lanzamiento de cada transcripción principal, con su tamaño
+    /// cuando se miró: encontrada no se vuelve a leer; sin encontrar, solo si
+    /// el fichero ha crecido.
+    launch_dirs: HashMap<PathBuf, (u64, Option<PathBuf>)>,
 }
 
 impl History {
@@ -123,6 +133,20 @@ impl History {
             fix_temp_cwds(path, state);
         }
         self.files.retain(|p, _| seen.contains(p));
+        self.launch_dirs.retain(|p, _| seen.contains(p));
+        // Después del recorrido: la principal puede haber cambiado sin que lo
+        // haga el fichero de la llamada (un subagente ya terminado).
+        for (path, state) in &mut self.files {
+            if state.calls.iter().all(|c| c.launch_dir.is_some()) {
+                continue;
+            }
+            let main = session_transcript(path);
+            if let Some(dir) = launch_dir_of(&mut self.launch_dirs, &main) {
+                for c in state.calls.iter_mut() {
+                    c.launch_dir = Some(dir.clone());
+                }
+            }
+        }
         Ok(())
     }
 
@@ -135,6 +159,24 @@ impl History {
             .flat_map(|f| f.calls.iter())
             .filter(move |c| c.id.as_deref().is_none_or(|id| seen.insert(id)))
     }
+}
+
+/// Primer `cwd` no temporal de la transcripción principal `main`, con
+/// `cache`. Si `main` no existe o aún no lo tiene, `None`.
+fn launch_dir_of(
+    cache: &mut HashMap<PathBuf, (u64, Option<PathBuf>)>,
+    main: &Path,
+) -> Option<PathBuf> {
+    if let Some((_, Some(dir))) = cache.get(main) {
+        return Some(dir.clone());
+    }
+    let len = std::fs::metadata(main).ok()?.len();
+    if cache.get(main).is_some_and(|(seen, _)| *seen == len) {
+        return None;
+    }
+    let dir = first_real_cwd(main);
+    cache.insert(main.to_path_buf(), (len, dir.clone()));
+    dir
 }
 
 /// Una llamada hecha desde la carpeta temporal de Claude toma el `cwd` real de
@@ -384,6 +426,93 @@ mod tests {
         std::fs::remove_file(&a).unwrap();
         h.refresh(&tmp.0).unwrap();
         assert_eq!(names(&h), vec!["data"]);
+    }
+
+    fn launches(h: &History) -> Vec<(String, PathBuf, Option<PathBuf>)> {
+        let mut v: Vec<_> = h
+            .invocations()
+            .map(|i| (i.agent.clone(), i.cwd.clone(), i.launch_dir.clone()))
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn call_at(agent: &str, cwd: &str) -> String {
+        call(agent, "2026-11-05T10:00:00Z").replace("\"/p\"", &format!("\"{cwd}\""))
+    }
+
+    #[test]
+    fn a_call_keeps_its_cwd_and_takes_the_launch_dir_of_its_main_session() {
+        let tmp = TempDir::new("launch");
+        // El principal arranca en la temporal de Claude, pasa a /Users/x/app y
+        // luego hace `cd` a src/css antes de lanzar.
+        let main = tmp.0.join("proj/s1.jsonl");
+        let first = r#"{"cwd":"/private/tmp/claude-501/-Users-x-app/s1","timestamp":"2026-11-05T09:00:00Z"}"#;
+        let real = r#"{"cwd":"/Users/x/app","timestamp":"2026-11-05T09:00:01Z"}"#;
+        append(
+            &main,
+            &format!(
+                "{first}\n{real}\n{}\n",
+                call_at("docs", "/Users/x/app/src/css")
+            ),
+        );
+        // Un subagente de esa sesión (y un paso de workflow) que lanza otro:
+        // carpeta del principal, no el primer cwd del propio subagente.
+        let sub = tmp.0.join("proj/s1/subagents/agent-a1.jsonl");
+        let wf = tmp
+            .0
+            .join("proj/s1/subagents/workflows/wf_1/agent-b1.jsonl");
+        std::fs::create_dir_all(wf.parent().unwrap()).unwrap();
+        append(&sub, &format!("{}\n", call_at("data", "/Users/x/app/src")));
+        append(&wf, &format!("{}\n", call_at("visual", "/tmp")));
+        let mut h = History::default();
+        h.refresh(&tmp.0).unwrap();
+        let app = Some(PathBuf::from("/Users/x/app"));
+        assert_eq!(
+            launches(&h),
+            vec![
+                (
+                    "data".into(),
+                    PathBuf::from("/Users/x/app/src"),
+                    app.clone()
+                ),
+                (
+                    "docs".into(),
+                    PathBuf::from("/Users/x/app/src/css"),
+                    app.clone()
+                ),
+                ("visual".into(), PathBuf::from("/tmp"), app),
+            ]
+        );
+    }
+
+    #[test]
+    fn without_its_main_session_a_call_has_no_launch_dir_until_it_appears() {
+        let tmp = TempDir::new("nolaunch");
+        let sub = tmp.0.join("proj/s1/subagents/agent-a1.jsonl");
+        std::fs::create_dir_all(sub.parent().unwrap()).unwrap();
+        append(&sub, &format!("{}\n", call_at("data", "/Users/x/app/src")));
+        let mut h = History::default();
+        h.refresh(&tmp.0).unwrap();
+        assert_eq!(launches(&h)[0].2, None);
+        // Solo con cwd temporal tampoco vale.
+        let main = tmp.0.join("proj/s1.jsonl");
+        append(
+            &main,
+            "{\"cwd\":\"/private/tmp/claude-501/-Users-x-app/s1\"}\n",
+        );
+        h.refresh(&tmp.0).unwrap();
+        assert_eq!(launches(&h)[0].2, None);
+        // Aparece el cwd real en el principal: se recoge aunque el fichero del
+        // subagente no haya cambiado.
+        append(&main, "{\"cwd\":\"/Users/x/app\"}\n");
+        h.refresh(&tmp.0).unwrap();
+        assert_eq!(launches(&h)[0].2, Some(PathBuf::from("/Users/x/app")));
+    }
+
+    #[test]
+    fn parse_line_leaves_the_launch_dir_to_the_history() {
+        assert_eq!(parse_line(LINE)[0].launch_dir, None);
     }
 
     #[test]

@@ -1,8 +1,6 @@
 //! Cruce entre definiciones, invocaciones y ejecuciones: qué agente está
 //! activo, desde cuándo y cuánto ha trabajado.
 
-pub mod pricing;
-
 use crate::agents::{Agent, Scope};
 use crate::runs::usage::Usage;
 use crate::runs::{Run, ToolStep};
@@ -14,23 +12,36 @@ use std::ops::AddAssign;
 use std::path::{Path, PathBuf};
 
 /// La regla común a llamadas y ejecuciones: mismo nombre; un agente global
-/// encaja con cualquier `cwd`, uno de proyecto solo con un `cwd` dentro del
-/// proyecto (por componentes enteros). Sin `cwd`, solo encaja uno global.
-fn belongs_to(agent: &Agent, name: &str, cwd: Option<&Path>) -> bool {
+/// encaja con cualquier carpeta, uno de proyecto solo con una carpeta dentro
+/// del proyecto (por componentes enteros). Sin carpeta, solo encaja uno global.
+/// La carpeta es la de lanzamiento de la sesión (`run_dir`/`call_dir`): Claude
+/// Code carga `.claude/agents/` de ahí, no del `cwd` del subagente.
+fn belongs_to(agent: &Agent, name: &str, dir: Option<&Path>) -> bool {
     name == agent.name
         && match &agent.scope {
             Scope::Global => true,
-            Scope::Project(dir) => cwd.is_some_and(|c| c.starts_with(dir)),
+            Scope::Project(root) => dir.is_some_and(|d| d.starts_with(root)),
         }
+}
+
+/// Carpeta de una ejecución para el dueño y el grupo: donde se lanzó la sesión
+/// (`Run::launch_dir`) o, si no se sabe, su `cwd`.
+fn run_dir(r: &Run) -> Option<&Path> {
+    r.launch_dir.as_deref().or(r.cwd.as_deref())
+}
+
+/// Lo mismo para una llamada: `Invocation::launch_dir` o, si no, su `cwd`.
+fn call_dir(c: &Invocation) -> &Path {
+    c.launch_dir.as_deref().unwrap_or(&c.cwd)
 }
 
 /// Invocaciones que encajan con el agente, de la más reciente a la más antigua.
 /// Un agente global encaja con cualquier sesión; uno de proyecto, solo con las
-/// sesiones cuyo `cwd` está dentro del proyecto.
+/// sesiones lanzadas dentro del proyecto (o, sin ese dato, con `cwd` dentro).
 pub fn invocations_of<'a>(agent: &Agent, calls: &'a [Invocation]) -> Vec<&'a Invocation> {
     let mut found: Vec<&Invocation> = calls
         .iter()
-        .filter(|c| belongs_to(agent, &c.agent, Some(&c.cwd)))
+        .filter(|c| belongs_to(agent, &c.agent, Some(call_dir(c))))
         .collect();
     found.sort_by_key(|c| std::cmp::Reverse(c.at));
     found
@@ -54,7 +65,7 @@ pub fn last_use(agent: &Agent, calls: &[Invocation], runs: &[Run]) -> Option<Dat
 pub fn runs_of<'a>(agent: &Agent, runs: &'a [Run]) -> Vec<&'a Run> {
     let mut found: Vec<&Run> = runs
         .iter()
-        .filter(|r| belongs_to(agent, &r.agent_type, r.cwd.as_deref()))
+        .filter(|r| belongs_to(agent, &r.agent_type, run_dir(r)))
         .collect();
     found.sort_by_key(|r| std::cmp::Reverse(r.start));
     found
@@ -304,10 +315,10 @@ pub fn total_worked<'a>(works: impl IntoIterator<Item = &'a Work>) -> TimeDelta 
 pub fn ever_used(agent: &Agent, calls: &[Invocation], runs: &[Run]) -> bool {
     calls
         .iter()
-        .any(|c| belongs_to(agent, &c.agent, Some(&c.cwd)))
+        .any(|c| belongs_to(agent, &c.agent, Some(call_dir(c))))
         || runs
             .iter()
-            .any(|r| belongs_to(agent, &r.agent_type, r.cwd.as_deref()))
+            .any(|r| belongs_to(agent, &r.agent_type, run_dir(r)))
 }
 
 /// Llamadas del agente que no enlazan con ninguna ejecución (las antiguas, sin
@@ -387,7 +398,11 @@ pub struct NowRun<'a> {
     /// Índice del agente definido al que corresponde (también en un workflow
     /// cuyo agente real es uno definido): lo que abre la ficha.
     pub owner: Option<usize>,
+    /// El `cwd` real del subagente (donde estaba el agente principal al lanzarlo).
     pub cwd: Option<&'a Path>,
+    /// La carpeta del grupo y del dueño: donde se lanzó la sesión de Claude Code
+    /// (`launch_dir`) o, si no se sabe, `cwd`. Igual a `cwd` si no hubo `cd`.
+    pub group_dir: Option<&'a Path>,
     pub since: Option<DateTime<Utc>>,
     /// Lo que lleva trabajado hasta `now`.
     pub worked: TimeDelta,
@@ -444,7 +459,11 @@ pub struct RunDetail {
     pub name: String,
     pub kind: RunKind,
     pub owner: Option<usize>,
+    /// El `cwd` real del subagente.
     pub cwd: Option<PathBuf>,
+    /// Donde se lanzó la sesión de Claude Code (`Run::launch_dir`,
+    /// `Invocation::launch_dir`); `None` si no se sabe.
+    pub launch_dir: Option<PathBuf>,
     pub since: Option<DateTime<Utc>>,
     pub worked: TimeDelta,
     pub tools: usize,
@@ -514,11 +533,6 @@ pub enum LaunchedBy {
 }
 
 impl RunDetail {
-    /// Coste estimado en USD (`pricing::cost`); `None` sin modelo conocido.
-    pub fn cost(&self) -> Option<f64> {
-        pricing::cost(&self.usage)
-    }
-
     /// Pone al día la ficha con `run_detail`: con `Some` toma la lectura nueva
     /// (que trae `ended` si la ejecución terminó); con `None` (ya no está en
     /// disco) conserva la última foto.
@@ -546,6 +560,7 @@ pub fn run_detail(
         kind: n.kind,
         owner: n.owner,
         cwd: r.cwd.clone(),
+        launch_dir: r.launch_dir.clone(),
         since: n.since,
         worked: n.worked,
         tools: n.tools,
@@ -617,7 +632,7 @@ fn launched(agents: &[Agent], runs: &[Run], r: &Run, now: DateTime<Utc>) -> Vec<
 
 /// Quién es de verdad una ejecución: `(nombre, tipo, agente definido)`.
 fn identity<'a>(agents: &'a [Agent], r: &'a Run) -> (&'a str, RunKind, Option<usize>) {
-    let cwd = r.cwd.as_deref();
+    let cwd = run_dir(r);
     if r.agent_type == "workflow-subagent" {
         let desc = r.description.as_deref().filter(|d| !d.is_empty());
         return match desc {
@@ -647,6 +662,7 @@ fn now_run<'a>(agents: &'a [Agent], r: &'a Run, now: DateTime<Utc>) -> NowRun<'a
         kind,
         owner,
         cwd: r.cwd.as_deref(),
+        group_dir: run_dir(r),
         since: r.start,
         worked: r.worked_until(now),
         tools: r.tools,
@@ -666,7 +682,8 @@ fn now_run<'a>(agents: &'a [Agent], r: &'a Run, now: DateTime<Utc>) -> NowRun<'a
 /// Las ejecuciones en curso de un proyecto.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveGroup<'a> {
-    /// Clave del grupo, como `Row::section`: «global» sin `cwd`, o el `cwd`
+    /// Clave del grupo, como `Row::section`: «global» sin carpeta, o
+    /// `NowRun::group_dir` (donde se lanzó la sesión; si no se sabe, el `cwd`)
     /// acortado con `~`. Su nombre corto y la desambiguación entre carpetas
     /// iguales son de la vista (`short_project`/`group_title`).
     pub section: String,
@@ -719,9 +736,9 @@ pub fn sibling_ids(groups: &[LiveGroup], id: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Clave de grupo de una línea: como `Row::section`.
-fn section_of(cwd: Option<&Path>, home: &Path) -> String {
-    cwd.map_or_else(|| "global".to_string(), |c| crate::report::shorten(c, home))
+/// Clave de grupo de una línea (`NowRun::group_dir`): como `Row::section`.
+fn section_of(dir: Option<&Path>, home: &Path) -> String {
+    dir.map_or_else(|| "global".to_string(), |c| crate::report::shorten(c, home))
 }
 
 /// Identificador estable de una llamada sin ejecución: su `id` si lo tiene; las
@@ -737,7 +754,7 @@ pub fn call_id(c: &Invocation) -> String {
 /// (duración 0, sin herramientas ni pasos), terminada en el instante de la
 /// llamada. El encargo es la primera línea del prompt o, si no hay, la descripción.
 fn lone_call_line<'a>(agents: &'a [Agent], c: &'a Invocation) -> NowRun<'a> {
-    let owner = owner_of(agents, &c.agent, Some(&c.cwd));
+    let owner = owner_of(agents, &c.agent, Some(call_dir(c)));
     let (name, kind) = match owner {
         Some(i) => (agents[i].name.as_str(), RunKind::Defined),
         None => (c.agent.as_str(), RunKind::BuiltIn),
@@ -748,6 +765,7 @@ fn lone_call_line<'a>(agents: &'a [Agent], c: &'a Invocation) -> NowRun<'a> {
         kind,
         owner,
         cwd: Some(&c.cwd),
+        group_dir: Some(call_dir(c)),
         since: Some(c.at),
         worked: TimeDelta::zero(),
         tools: 0,
@@ -818,7 +836,7 @@ pub fn active_groups<'a>(
     // fila de cada (proyecto, agente): índices de grupo y de línea
     let mut rows: HashMap<(String, AgentKey<'a>), (usize, usize)> = HashMap::new();
     for line in lines {
-        let section = section_of(line.cwd, home);
+        let section = section_of(line.group_dir, home);
         // `lines` ya va ordenada, así que la primera de cada agente es la
         // que lo representa y las demás solo suman a `runs`/`run_ids`
         let key = (section.clone(), agent_key(&line));
@@ -885,6 +903,7 @@ pub fn activity_detail(
         kind: n.kind,
         owner: n.owner,
         cwd: Some(c.cwd.clone()),
+        launch_dir: c.launch_dir.clone(),
         since: n.since,
         worked: n.worked,
         tools: 0,
@@ -905,14 +924,15 @@ pub fn activity_detail(
     })
 }
 
-/// El agente definido al que pertenece un nombre lanzado desde `cwd`: si
+/// El agente definido al que pertenece un nombre lanzado desde `dir` (la
+/// carpeta de lanzamiento de la sesión o, sin ella, el `cwd`): si
 /// encajan varios (uno global y otro de proyecto con el mismo nombre), el más
 /// específico, el del proyecto más hondo; a igualdad, el primero.
-pub fn owner_of(agents: &[Agent], name: &str, cwd: Option<&Path>) -> Option<usize> {
+pub fn owner_of(agents: &[Agent], name: &str, dir: Option<&Path>) -> Option<usize> {
     agents
         .iter()
         .enumerate()
-        .filter(|(_, a)| belongs_to(a, name, cwd))
+        .filter(|(_, a)| belongs_to(a, name, dir))
         .rev()
         .max_by_key(|(_, a)| match &a.scope {
             Scope::Global => 0,
@@ -960,6 +980,7 @@ mod tests {
             id: None,
             description: None,
             prompt_line: None,
+            launch_dir: None,
         }
     }
 
@@ -1166,6 +1187,7 @@ mod tests {
                 kind: RunKind::WorkflowStep,
                 owner: None,
                 cwd: Some(Path::new("/p")),
+                group_dir: Some(Path::new("/p")),
                 since: Some(t("2026-11-05T11:55:00Z")),
                 worked: mins(4),
                 tools: 4,
@@ -1997,7 +2019,7 @@ mod tests {
     }
 
     #[test]
-    fn detail_carries_usage_cost_and_who_launched_it() {
+    fn detail_carries_usage_and_who_launched_it() {
         let now = t("2026-11-05T12:00:00Z");
         let agents = defined();
         let mut parent = at_app(run("docs", None, "2026-11-05T11:00:00Z", 30), "toolu_p");
@@ -2035,7 +2057,6 @@ mod tests {
                 window: 200_000
             })
         );
-        assert_eq!(d.cost(), Some(4.0));
         assert!(!d.from_cache);
         assert_eq!(
             d.launched_by,
@@ -2090,7 +2111,10 @@ mod tests {
         // sin sesión ni madre, no se sabe
         let lone = [call("docs", "/p", "2026-11-05T11:20:00Z")];
         let l = activity_detail(&agents, &lone, &[], &call_id(&lone[0]), now).unwrap();
-        assert_eq!((l.cost(), l.launched_by, l.tokens), (None, None, 0));
+        assert_eq!(
+            (l.usage.model.as_deref(), l.launched_by, l.tokens),
+            (None, None, 0)
+        );
     }
 
     #[test]
@@ -2233,5 +2257,139 @@ mod tests {
         let lone = [call("docs", "/Users/x/app", "2026-11-05T11:10:00Z")];
         let l = activity_detail(&[], &lone, &[], &call_id(&lone[0]), now).unwrap();
         assert_eq!((l.temp_cwd, l.cwd_resolved), (None, false));
+    }
+
+    /// Una ejecución terminada en `cwd` de una sesión lanzada en `launch`.
+    fn launched_in(agent_type: &str, cwd: &str, launch: &str, start: &str, id: &str) -> Run {
+        Run {
+            launch_dir: Some(launch.into()),
+            tool_use_id: Some(id.into()),
+            ..run(agent_type, Some(cwd), start, 5)
+        }
+    }
+
+    #[test]
+    fn a_session_is_one_group_by_its_launch_dir_whatever_the_cwd_of_its_subagents() {
+        let agents = defined();
+        let now = t("2026-11-05T12:00:00Z");
+        let since = t("2026-11-05T11:00:00Z");
+        let app = "/Users/x/app";
+        let runs = [
+            launched_in(
+                "docs",
+                "/Users/x/app/src",
+                app,
+                "2026-11-05T11:10:00Z",
+                "t1",
+            ),
+            launched_in(
+                "Explore",
+                "/Users/x/app/src/css",
+                app,
+                "2026-11-05T11:20:00Z",
+                "t2",
+            ),
+            // tras un `cd /tmp`: sigue siendo de la sesión y el agente es el del proyecto
+            launched_in("backend", "/private/tmp", app, "2026-11-05T11:30:00Z", "t3"),
+        ];
+        let mut lone = call("general-purpose", "/private/tmp", "2026-11-05T11:40:00Z");
+        lone.id = Some("t4".into());
+        lone.launch_dir = Some(app.into());
+        let calls = [lone];
+        let groups = active_groups(&agents, &calls, &runs, since, now, home());
+        let sections: Vec<_> = groups.iter().map(|g| g.section.as_str()).collect();
+        assert_eq!(sections, vec!["~/app"]);
+        let lines = &groups[0].lines;
+        assert_eq!(lines.len(), 4);
+        let backend = lines.iter().find(|l| l.id == "t3").unwrap();
+        assert_eq!(
+            (backend.name, backend.kind, backend.owner),
+            ("backend", RunKind::Defined, Some(1))
+        );
+        // el cwd real del subagente se conserva aparte de la carpeta del grupo
+        assert_eq!(backend.cwd, Some(Path::new("/private/tmp")));
+        assert_eq!(backend.group_dir, Some(Path::new(app)));
+        let l = lines.iter().find(|l| l.id == "t4").unwrap();
+        assert_eq!(
+            (l.cwd, l.group_dir),
+            (Some(Path::new("/private/tmp")), Some(Path::new(app)))
+        );
+    }
+
+    #[test]
+    fn without_launch_dir_the_group_and_owner_fall_back_to_the_cwd() {
+        let agents = defined();
+        let now = t("2026-11-05T12:00:00Z");
+        let since = t("2026-11-05T11:00:00Z");
+        let mut a = run("docs", Some("/Users/x/app/src"), "2026-11-05T11:10:00Z", 5);
+        a.tool_use_id = Some("t1".into());
+        let mut tmp = run("backend", Some("/private/tmp"), "2026-11-05T11:20:00Z", 5);
+        tmp.tool_use_id = Some("t2".into());
+        let runs = [a, tmp];
+        let groups = active_groups(&agents, &[], &runs, since, now, home());
+        let got: Vec<_> = groups
+            .iter()
+            .map(|g| (g.section.as_str(), g.lines[0].kind, g.lines[0].group_dir))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "/private/tmp",
+                    RunKind::BuiltIn,
+                    Some(Path::new("/private/tmp"))
+                ),
+                (
+                    "~/app/src",
+                    RunKind::Defined,
+                    Some(Path::new("/Users/x/app/src"))
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_project_agent_launched_after_a_cd_out_of_the_project_is_still_its_own() {
+        let backend = &defined()[1];
+        let r = launched_in(
+            "backend",
+            "/private/tmp",
+            "/Users/x/app",
+            "2026-11-05T11:10:00Z",
+            "t1",
+        );
+        let mut c = call("backend", "/private/tmp", "2026-11-05T11:10:00Z");
+        c.launch_dir = Some("/Users/x/app".into());
+        // y al revés: lanzada fuera del proyecto, un cwd dentro no la hace suya
+        let mut outside = call("backend", "/Users/x/app", "2026-11-05T11:50:00Z");
+        outside.launch_dir = Some("/Users/x/otro".into());
+        let calls = [c.clone(), outside.clone()];
+        let runs = [r];
+        assert_eq!(last_invocation(backend, &calls), Some(c.at));
+        assert_eq!(runs_of(backend, &runs).len(), 1);
+        assert!(ever_used(backend, std::slice::from_ref(&c), &[]));
+        assert!(!ever_used(backend, &[outside], &[]));
+        assert_eq!(work_of(backend, &runs, t("2026-11-05T12:00:00Z")).runs, 1);
+        let d = run_detail(&defined(), &runs, "t1", t("2026-11-05T12:00:00Z")).unwrap();
+        assert_eq!(
+            (d.owner, d.cwd, d.launch_dir),
+            (
+                Some(1),
+                Some(PathBuf::from("/private/tmp")),
+                Some(PathBuf::from("/Users/x/app"))
+            )
+        );
+        let l = activity_detail(
+            &defined(),
+            &calls,
+            &[],
+            &call_id(&calls[0]),
+            t("2026-11-05T12:00:00Z"),
+        )
+        .unwrap();
+        assert_eq!(
+            (l.owner, l.launch_dir),
+            (Some(1), Some(PathBuf::from("/Users/x/app")))
+        );
     }
 }

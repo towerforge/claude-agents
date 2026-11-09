@@ -130,6 +130,17 @@ fn session_dir(run: &Path) -> Option<&Path> {
         .parent()
 }
 
+/// Transcripción principal de la sesión a la que pertenece `path`: la de
+/// `<proyecto>/<sesión>/subagents/**/agent-*.jsonl` es `<proyecto>/<sesión>.jsonl`;
+/// cualquier otra es ella misma.
+pub fn session_transcript(path: &Path) -> PathBuf {
+    let main = session_dir(path).and_then(|dir| {
+        let name = dir.file_name()?.to_str()?;
+        Some(dir.with_file_name(format!("{name}.jsonl")))
+    });
+    main.unwrap_or_else(|| path.to_path_buf())
+}
+
 /// Transcripción padre de una ejecución: `<proyecto>/<sesión>.jsonl`.
 fn parent_transcript(run: &Path, session_id: &str) -> Option<PathBuf> {
     let project = session_dir(run)?.parent()?;
@@ -169,7 +180,8 @@ impl SessionCwds {
 }
 
 impl Runs {
-    /// Con la cabecera de la sesión padre: cambia el `cwd` temporal de Claude
+    /// Con la cabecera de la sesión padre: apunta su primer `cwd` real como
+    /// carpeta de lanzamiento (`launch_dir`), cambia el `cwd` temporal de Claude
     /// por el real (si aún no se puede leer, queda el temporal y se reintenta
     /// en la próxima pasada) y apunta el primer prompt de la sesión.
     pub(super) fn resolve_sessions(&mut self) {
@@ -182,6 +194,7 @@ impl Runs {
                 continue;
             };
             let head = self.session_cwds.head(path, session);
+            t.launch_dir = head.cwd.clone();
             t.session_prompt = head.prompt.or(head.command);
             if let Some(cwd) = t.cwd.take() {
                 if t.temp_cwd.is_none() && is_claude_temp(&cwd) {
@@ -292,6 +305,63 @@ mod tests {
         runs.refresh(&root).unwrap();
         assert_eq!(cwd_of(&runs), Some(PathBuf::from("/Users/x/app")));
         assert_eq!(runs.runs()[0].temp_cwd, Some(PathBuf::from(temp)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn launch_of(runs: &Runs, id: &str) -> Option<PathBuf> {
+        runs.runs().into_iter().find(|r| r.id == id)?.launch_dir
+    }
+
+    #[test]
+    fn the_launch_dir_is_the_first_cwd_of_the_main_session() {
+        // El principal hizo `cd` a src/css antes de lanzarlo: el cwd del
+        // subagente se conserva, la carpeta de lanzamiento es la del principal.
+        let parent = r#"{"type":"queue-operation","sessionId":"sess1"}
+{"cwd":"/private/tmp/claude-501/-Users-x-app/sess1","sessionId":"sess1","type":"user"}
+{"cwd":"/Users/x/app","sessionId":"sess1","type":"user"}
+{"cwd":"/Users/x/app/src/css","sessionId":"sess1","type":"assistant"}
+"#;
+        let (root, _) = fixture("launch", "/Users/x/app/src/css", Some(parent));
+        let mut runs = Runs::default();
+        runs.refresh(&root).unwrap();
+        assert_eq!(cwd_of(&runs), Some(PathBuf::from("/Users/x/app/src/css")));
+        assert_eq!(launch_of(&runs, "a1"), Some(PathBuf::from("/Users/x/app")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn nested_and_workflow_runs_share_the_launch_dir_of_their_session() {
+        let (root, _) = fixture("nested", "/Users/x/app/src", Some(PARENT));
+        // Lanzada por a1 (misma carpeta `subagents`) y un paso de workflow.
+        let nested = root.join("proj/sess1/subagents/agent-b1.jsonl");
+        let wf = root.join("proj/sess1/subagents/workflows/wf_1/agent-c1.jsonl");
+        std::fs::create_dir_all(wf.parent().unwrap()).unwrap();
+        for (path, cwd) in [(&nested, "/tmp/other"), (&wf, "/Users/x/app/docs")] {
+            std::fs::write(path, run_line(cwd)).unwrap();
+            std::fs::write(path.with_extension("meta.json"), r#"{"agentType":"docs"}"#).unwrap();
+        }
+        let mut runs = Runs::default();
+        runs.refresh(&root).unwrap();
+        for id in ["a1", "b1", "c1"] {
+            assert_eq!(
+                launch_of(&runs, id),
+                Some(PathBuf::from("/Users/x/app")),
+                "{id}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn without_a_readable_parent_there_is_no_launch_dir_until_it_appears() {
+        let (root, _) = fixture("nolaunch", "/Users/x/app/src", None);
+        let mut runs = Runs::default();
+        runs.refresh(&root).unwrap();
+        assert_eq!(launch_of(&runs, "a1"), None);
+        assert_eq!(cwd_of(&runs), Some(PathBuf::from("/Users/x/app/src")));
+        std::fs::write(root.join("proj/sess1.jsonl"), PARENT).unwrap();
+        runs.refresh(&root).unwrap();
+        assert_eq!(launch_of(&runs, "a1"), Some(PathBuf::from("/Users/x/app")));
         let _ = std::fs::remove_dir_all(&root);
     }
 
