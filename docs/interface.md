@@ -10,8 +10,9 @@ each one for a different purpose:
 
 - **active** (default, the one that opens at startup): a live monitor of what is
   happening and what has happened in the window (`-m`). Everything is grouped by
-  project, with one row per agent: in each group, what is running first and,
-  below it, what finished within the window.
+  project (the folder where the Claude Code session was launched), with one row
+  per agent: in each group, what is running first and, below it, what finished
+  within the window.
 - **all**: the catalog, every agent on disk grouped by project, with its
   history.
 - **ranking**: the agents with work in the period, from the one that worked the
@@ -62,39 +63,43 @@ context, painted amber.)
 ```
   active   all   ranking                      window 10 min · 3 running · 4 in window · 4 sessions · 1.5M tok
 
-         agent                                                               time        ctx   tokens   tools
+         agent                                                               ctx   tokens   tools        time
  …
  api · 2 running · 1 recent ─────────────────────────────────────────────────────────────────────────────────
-    3. ✦ visual [workflow]                                                 <1 min          —        —       0
+    3. ✦ visual [workflow]                                                     —        —       0      <1 min
          task     paint the active screen
          now      —
+         cwd      ~/code/api/src/tui
 
-    4. ✦ backend [own]                                                     10 min   ▰▰▰▱ 71%     412k       7
+    4. ✦ backend [own]                                                  ▰▰▰▱ 71%     412k       7      10 min
          task     —
          now      —
+         cwd      ~/code/api
 
-    5.   frontend [own]                                                 2 min ago          —        —       —
+    5.   frontend [own]                                                        —        —       —   2 min ago
          task     —
          last     —
+         cwd      ~/code/api
 
  other · 1 running ──────────────────────────────────────────────────────────────────────────────────────────
-    6. ✦ general-purpose [claude]                                           1 min   ▰▰▰▰ 92%     1.1M      37
+    6. ✦ general-purpose [claude]                                       ▰▰▰▰ 92%     1.1M      37       1 min
          task     Independent review of the uncommitted change in /Users/x/other
          now      Bash · git diff --stat
+         cwd      ~/other
  …
  ↑↓ move · enter details · tab mode · / filter · q quit                                                v0.1.0
 ```
 
 A single list, grouped by project and numbered continuously across all groups.
-Each **agent** is a three-line block that counts as a single row, without a
-path: all its runs (and calls without a run) from that project within the
-window, plus the running ones, are merged into that row. A blank line separates
-one block from the next, and another one goes before each group rule except the
-first (never after the last block, never two in a row); the blank is not part
-of any block, so the cursor and the scroll still keep the whole three-line
-block on screen. Above them, once and in gray, the column header (`agent`,
-`time`, `ctx`, `tokens`, `tools`), with the first group rule right under it.
-There are no sections or a separate timeline.
+Each **agent** is a four-line block that counts as a single row: all its runs
+(and calls without a run) from that project within the window, plus the running
+ones, are merged into that row. A blank line separates one block from the next,
+and another one goes before each group rule except the first (never after the
+last block, never two in a row); the blank is not part of any block, so the
+cursor and the scroll still keep the whole four-line block on screen. Above
+them, once and in gray, the column header (`agent`, `ctx`, `tokens`, `tools`,
+`time`), with the first group rule right under it. There are no sections or a
+separate timeline.
 
 - **What shows.** All **running** runs, with no cap (the list scrolls), and all
   **finished** runs within the window. A finished run is one that is not
@@ -120,11 +125,17 @@ There are no sections or a separate timeline.
   latest on top). Groups are ordered by their most recent activity: the start of
   their newest running row or the end of their newest finished one; on a tie,
   by folder.
+- **Group folder**: the folder where the Claude Code session was launched (its
+  first real `cwd`, see [Launch folder](how-it-works.md#launch-folder)), not the
+  subagent's `cwd`, which is wherever the main agent was when it launched it and
+  follows every `cd`. So all the subagents of a session fall in the same group,
+  even if they work in a subfolder or outside the project. If the launch folder
+  is not known, the run's `cwd` is used.
 - **Group rule**: ` folder · N running · N recent ───`, each part only if
   greater than 0. It counts rows (agents), not runs. The folder goes in
   `claude-soft` and the rest in gray; if two groups have the same folder they
   are prefixed with the parent folder, as in «all»; `global` if there is no
-  `cwd`.
+  folder at all.
 - **Line 1** of a block: cursor `❯` and number; a 2-column slot for the star
   (`✦` in `claude` if running, alternating with `✧` every half second; blank if
   finished); the name; a gray (`ink-muted`) label saying where the agent comes
@@ -135,20 +146,24 @@ There are no sections or a separate timeline.
   ` ×N` in gray at the end of the label (`docs [own] ×5`, `docs [own] via
   workflow ×3`, `visual [workflow] ×3`; with a single run it does not show);
   and on the right, flush
-  to the edge, `time`, `ctx`, `tokens` and `tools` (the number only). `time` is
+  to the edge, `ctx`, `tokens`, `tools` (the number only) and, last, `time`. `time` is
   `N min` (what has worked) for running ones and `N min ago` (since the last
   step) for finished ones. `ctx` is how full the context of the row's
   representative run is, only while it runs: a 4-step gauge where each started
   quarter fills a step, and the percentage (`▰▰▰▱ 71%`), amber from 85%; `—` if
   the row is finished or there is no data yet. `tokens` is the sum of the
   tokens of **all** the runs merged into the row, in short form, or `—` if 0
-  (see [Tokens, context and cost](how-it-works.md#tokens-context-and-cost)). The star slot is always reserved, so names stay aligned between
+  (see [Tokens and context](how-it-works.md#tokens-and-context)). The star slot is always reserved, so names stay aligned between
   running and finished ones, and it is never removed for narrowness (the label
   yields first, then the name, cut with `…`).
 - **Line 2**, indented under the name: `task` and what it was asked to do.
 - **Line 3**: `now` and the last tool if running (`Bash · git diff --stat`,
   `Edit · README.md`); `last` and the last tool if finished. `—` in gray if the
   datum is missing, also in `task`.
+- **Line 4**: `cwd` and, in gray, the subagent's real working directory, with
+  `~` for the home (that of the row's representative run). It can differ from
+  the group folder if the main agent did a `cd` before launching it. It always
+  shows, with `—` if unknown, so all blocks have the same height.
 
 Each value goes on a single line, cut with `…` if it does not fit.
 
@@ -156,7 +171,7 @@ Colors. The name depends only on the state, whatever the kind: running,
 `claude-soft` in bold (a `[claude]` one too); finished, plain `ink` without bold
 (an `[own]` one too), and its number also in `ink`, without tint even when
 selected. What is running is told apart by the blinking star, by the name color
-and by `N min` versus `N min ago`. The `agent` column header and lines 2 and 3
+and by `N min` versus `N min ago`. The `agent` column header and lines 2 to 4
 are indented under the name, which starts right after the star (9 columns with
 fewer than 100 runs in the list; it grows with the digits of the number).
 
@@ -168,8 +183,13 @@ Who each run is:
   otherwise it is not one of the user's agents: the `description` as the name
   (or `workflow` if it has none), with the `[workflow]` label. In a workflow the
   `description` is the name, not the task;
-- any other kind (`general-purpose`, `Explore`…, or a project agent launched
-  from outside its project): its `agentType`, with the `[claude]` label.
+- any other kind (`general-purpose`, `Explore`…, or a project agent from a
+  session launched outside its project): its `agentType`, with the `[claude]`
+  label.
+
+Whether a project agent is `[own]` is decided with the launch folder too,
+because Claude Code loads `.claude/agents/` from there: a project agent launched
+after a `cd /tmp` is still `[own]`.
 
 The task is the first content line of the run's first message (see [What is
 read from each run](how-it-works.md#what-is-read-from-each-run)); if it could not be
@@ -177,7 +197,8 @@ extracted, it falls back to the meta's `description`, except in a workflow,
 where it stays `—`. For a call without a run, the call's own (above).
 
 Blocks narrow down: below 70 columns `ctx`, `tokens` and `tools` and their
-headers are removed; below 50, the labels too (with their ` ×N`). If the whole label does not fit it is
+headers are removed together and only `time` stays, at the right edge; below
+50, the labels too (with their ` ×N`). If the whole label does not fit it is
 lost in parts, in this priority order: name > origin (`[own]`, `[workflow]`,
 `[claude]`) > ` ×N` > `via workflow` (`via workflow` drops first, then ` ×N`,
 then the origin and, if that does not fit either, nothing). The name is cut with `…` before the
@@ -202,9 +223,9 @@ From active, `Enter` no longer opens the agent details: only `a` inside the run
 details does, and only if it has a defined agent. The footer paints `enter
 details` dimmed only if the cursor is not on a row. The digits, the cursor and
 `↑` `↓` follow the grouped order (continuous across groups). `/` filters by
-name, project or task over all rows (running and finished); a group left
-without rows does not show and its rule counters are recomputed. `o` does
-nothing here: the order is the one above.
+name, group folder, `cwd` or task over all rows (running and finished); a
+group left without rows does not show and its rule counters are recomputed.
+`o` does nothing here: the order is the one above.
 
 ## All: the catalog
 
@@ -404,16 +425,17 @@ total.
   the last 14 days`.
 - **Runs**, from most recent to oldest: local date and time (`Nov 4 18:12`),
   duration (`running N min` in `claude` if it is), tools, the description it was
-  launched with and the `cwd`, relative to the project root (`./src/routes`)
-  and only if it is not the root. It includes workflow runs launched with the
-  agent's `agentType`. Those that do not fit, `… N more`. If the agent has old
-  calls without a run of their own, at the end and if there is room, `+ N old
-  calls with no recorded duration`. With no runs or calls, `none`.
+  launched with and the `cwd`, relative to the project root (`./src/routes`;
+  with `~` if it is outside) and only if it is not the root. It includes
+  workflow runs launched with the agent's `agentType`. Those that do not fit,
+  `… N more`. If the agent has old calls without a run of their own, at the end
+  and if there is room, `+ N old calls with no recorded duration`. With no runs or calls, `none`.
 
 Inside the details, `↑` `↓` move to the previous or next agent of the view it
 was opened from (in the ranking, in ranking order; in active, through the
 monitor rows that belong to a defined agent), skipping folded groups; `Esc` or
-`Enter` go back.
+`Enter` go back. A click only responds on the tabs: it closes the details and
+switches to that view.
 
 ## Run details
 
@@ -438,7 +460,7 @@ launched two other runs, at 100 columns:
    input         18k
    output        24k
    cache read   351k
-   cache write   19k   ≈ $0.39 at API prices
+   cache write   19k
  tools ───────────────────────────────────────────────────────────────────────────────────────────
    Read 3 · Bash 1 · Edit 1
  launched · 2 ────────────────────────────────────────────────────────────────────────────────────
@@ -466,8 +488,9 @@ details.)
   slot as the list: `✦` in `claude` alternating with `✧` every half second if
   running, blank if finished. The name follows the same state rule as the list:
   running, `claude-soft` in bold; finished, plain `ink`, even for a defined
-  agent. The project is the last component of the `cwd`, without the list's
-  disambiguation of twin folders. Below 70 columns `running N min ·` and `· N
+  agent. The project is the last component of the launch folder (the group's
+  folder; the `cwd` if it is not known), without the list's disambiguation of
+  twin folders. Below 70 columns `running N min ·` and `· N
   tok` are removed and so is `run i/n` (which also yields before the name and
   the project: it only shows if there is room); below 50, the labels too. If
   the run already ended, there is no `running` and the right side says `ended N
@@ -485,6 +508,10 @@ details.)
   temp folder · project taken from the session` if the `cwd` was resolved to the
   session's, or `… · project unresolved` if not. If 8 or more columns are left
   for the path, ` · <temp path with ~>` follows, cut with `…`.
+- **cwd**: only if the subagent's `cwd` differs from the launch folder (and both
+  are known). A gray line under the previous ones, `   cwd          <path>`, with
+  `~` for the home and the path in the same column as the value of `launched
+  by`, cut with `…`.
 - A blank line separates those lines from the sections only if the body is 14
   lines or more.
 - **task**: the run's whole first message, with its line breaks, wrapped to the
@@ -495,10 +522,8 @@ details.)
   prefix nor the date suffix (`sonnet-5-5`; `—` if unknown). Below, with
   13-column labels: `context`, the percentage, a bar of 8 to 40 columns (amber
   from 85%, like the figure) and `142k of 200k`; then `input`, `output`, `cache
-  read` and `cache write`, in short form. After `cache write`, or on its own row
-  if it does not fit, the cost estimate in gray: `≈ $0.39 at API prices` (`<
-  $0.01` below a cent); with an unknown model there is no cost. See [Tokens,
-  context and cost](how-it-works.md#tokens-context-and-cost). With no tokens, context or model
+  read` and `cache write`, in short form; `cache write` is the last row. See
+  [Tokens and context](how-it-works.md#tokens-and-context). With no tokens, context or model
   (a call without a run, or a run that has no reply yet) the section does not
   show.
 - **tools**: uses per tool across the **whole** run, from most to least used
@@ -530,10 +555,10 @@ details.)
 
 With little height the steps rule and up to 3 steps (or the history cache note)
 are reserved first, under the header; the rest goes in whole or not at all, in
-this order: the launched-by line, the temp folder notice, the blank line, the
-tools (rule and lines), the first 2 lines of the task, the launched runs, the
-usage section and the rest of the task (up to 8 lines); whatever is left goes
-to steps. More than the available height is never painted.
+this order: the launched-by line, the temp folder notice, the `cwd` line, the
+blank line, the tools (rule and lines), the first 2 lines of the task, the
+launched runs, the usage section and the rest of the task (up to 8 lines);
+whatever is left goes to steps. More than the available height is never painted.
 
 Keys inside the details:
 
@@ -562,7 +587,7 @@ Keys inside the details:
 - `a`: opens the agent details, only if the run has a defined agent and its row
   is still in the list; it also works from a run that is not the representative
   one.
-- `/`, `o`, `r` and the mouse wheel are ignored.
+- `/`, `o`, `r`, the mouse wheel and clicks are ignored.
 
 Opening a launched run (`Enter`) or the parent (`p`) stacks the open one, so
 `Esc` walks back through them. `←` `→` replace the open run and keep the stack;
@@ -584,10 +609,11 @@ longer follows it.
 | `↑` `↓` (or `k` `j`), `Home`/`End` (or `g`/`G`) | Moves the cursor |
 | `PageDown` or `space`, `PageUp` | Pages down or up (view and cursor) |
 | mouse wheel | Moves the view 3 lines; if the cursor ends up outside, it drags it |
+| left click | On a tab of the top row, switches to that view (and closes the agent details if open). On a list row, selects it; on the row already selected, does the same as `Enter`. See [mouse](#mouse) |
 | digits | Jumps to that numbered line (agents, folded groups and active rows); two in a row make a two-digit number. In a run's details, selects that launched run |
 | `Enter` | In all and ranking, opens the agent details, or unfolds/folds an unused group. In active, on any row (running, finished or call without a run), opens the details of the run that represents it. In any details screen, goes back (in a run's, with the cursor on its row; with a launched run selected, it opens that one) |
 | `Esc` | In any details screen, goes back (in a run's, first to the runs opened from it) |
-| `/` | Filters by name or project (in active, also by task, over all rows) as you type; `Enter` fixes the filter, `Esc` removes it |
+| `/` | Filters by name or project (in active, by name, group folder, `cwd` or task, over all rows) as you type; `Enter` fixes the filter, `Esc` removes it |
 | `Tab` | Cycles active → all → ranking. In a run's details, selects the next launched run (`Shift+Tab`, the previous one) |
 | `a` | Toggles active and all. In a run's details, opens the agent's (only if it has one) |
 | `←` `→` (or `h` `l`) | Only in a run's details: the previous (older) or next (more recent) run of the same agent |
@@ -607,12 +633,29 @@ from 1 to 29 days; from 30 days on, the local date (`10/05/2026`, as
 durations: `<1 min`, `N min` below one hour and `N h M min` from there on (`1 h
 9 min`); truncated to the minute.
 
-The screen captures the mouse so the wheel moves the list. To select text with
-the terminal you have to hold `Shift` while dragging (in iTerm2, `Option`).
-
 Colors: Claude Code's colors (`claude`, `claude-soft`, `ink`…) in truecolor if the
 terminal announces `COLORTERM=truecolor`, and their 256-color approximation if
 not. It paints no background: it uses the terminal's.
+
+### Mouse
+
+The screen captures the mouse so the wheel and the left click work:
+
+- **Wheel**: moves the list, as in the table above.
+- **Click on a tab** (`active`, `all`, `ranking` in the top row): switches to
+  that view; if the agent details are open, it closes them.
+- **Click on a row**: moves the cursor to it. A click on the row the cursor is
+  already on opens it, exactly like `Enter`: the agent details, the run details
+  in active, or unfolds/folds a group. There is no double click: it is two
+  separate clicks. In active, any of the lines of a block (the name, `task`,
+  `now`/`last` and `cwd`) counts as its row; section headers, blank lines and
+  notes do not respond.
+- With the agent details open only the tabs respond; with the run details open
+  or while typing the filter (`/`), clicks do nothing.
+- Other buttons, dragging and moving the mouse do nothing.
+
+To select text with the terminal you have to hold `Shift` while dragging (in
+iTerm2, `Option`).
 
 ## The `--plain` table
 

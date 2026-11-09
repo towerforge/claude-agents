@@ -1,5 +1,5 @@
 //! Pintado de la pantalla: cabecera con pestañas, el monitor de activos (bloques
-//! de tres líneas por proyecto, en curso y terminados en la ventana), la lista
+//! de cuatro líneas por proyecto, en curso y terminados en la ventana), la lista
 //! por grupos de todos, ranking, ficha y pie. Misma gramática que las listas de moon:
 //! `❯` en la fila del cursor, número en cada fila seleccionable, reglas
 //! ` título ─── info ` y pie con las teclas. Aquí no se decide nada: se pinta
@@ -9,7 +9,9 @@ use crate::report;
 use crate::status::{
     Context, LaunchedBy, Period, PeriodStats, RankKey, RunDetail, RunKind, RunLink, RunState,
 };
-use crate::tui::app::{App, Item, LastUse, Mode, NowLine, Order, Row, RunLine, DAYS, MAX_DAYS};
+use crate::tui::app::{
+    App, Hits, Item, LastUse, Mode, NowLine, Order, Row, RowHit, RunLine, TabHit, DAYS, MAX_DAYS,
+};
 use crate::tui::theme::Theme;
 use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
 use ratatui::layout::Rect;
@@ -417,7 +419,11 @@ pub fn render(app: &mut App, frame: &mut Frame, t: &Theme) {
     let w = area.width as usize;
     // cabecera, segunda línea, cuerpo, pie
     let body_h = area.height.saturating_sub(3) as usize;
-    let mut lines = vec![top_line(app, t, w), second_line(app, t, w)];
+    // el mapa de clics se rehace con lo que pinta este fotograma
+    app.hits = Hits::default();
+    let (top, tabs) = top_line(app, t, area);
+    app.hits.tabs = tabs;
+    let mut lines = vec![top, second_line(app, t, w)];
     let mut scrollbar = None;
     let footer = if app.run_detail.is_some() {
         lines.extend(run_detail_lines(app, t, w, body_h));
@@ -467,8 +473,31 @@ pub fn render(app: &mut App, frame: &mut Frame, t: &Theme) {
         } else {
             // los umbrales responsive miran la terminal, no la barra de scroll
             let cols = Columns::of(app, &items, w, list_w);
-            for item in items.iter().skip(app.scroll).take(body_h) {
+            // la fila seleccionable de cada línea: la suya, o en un bloque de
+            // activos la de su `Live`, aunque el scroll lo haya dejado arriba
+            let mut block = None;
+            for (i, item) in items.iter().enumerate().take(app.scroll + body_h) {
+                let cursor = match item {
+                    Item::LiveTask(_) | Item::LiveNow(_) | Item::LiveCwd(_) => block,
+                    _ => item.n().map(|n| n - 1),
+                };
+                if matches!(item, Item::Live { .. }) {
+                    block = cursor;
+                }
+                if i < app.scroll {
+                    continue;
+                }
+                let first = lines.len();
                 lines.extend(item_lines(app, item, &cols, t, list_w));
+                if let Some(cursor) = cursor {
+                    // solo las líneas que caben en el cuerpo
+                    for y in first..lines.len().min(2 + body_h) {
+                        app.hits.rows.push(RowHit {
+                            row: area.y + y as u16,
+                            cursor,
+                        });
+                    }
+                }
             }
             if kept > 0 {
                 // con sitio, separada de las filas por una línea en blanco
@@ -583,7 +612,9 @@ fn run_header_line(app: &App, d: &RunDetail, t: &Theme, w: usize) -> Line<'stati
         None => tools(d.tools),
     };
     let right_w = width(&right) + 1;
-    let mut shown_project = d.cwd.is_none();
+    // el proyecto es la carpeta donde se lanzó la sesión; si no se sabe, el cwd
+    let project_dir = d.launch_dir.as_ref().or(d.cwd.as_ref());
+    let mut shown_project = project_dir.is_none();
     let mut spans = vec![Span::raw(" "), star_slot(d.ended.is_none(), app.now, t)];
     let mut room = w.saturating_sub(1 + STAR_W + right_w + 2);
     let name = truncate(&d.name, room);
@@ -596,8 +627,8 @@ fn run_header_line(app: &App, d: &RunDetail, t: &Theme, w: usize) -> Line<'stati
             spans.push(Span::styled(tag, t.muted()));
         }
     }
-    if let Some(cwd) = &d.cwd {
-        let project = short_project(&cwd.to_string_lossy());
+    if let Some(dir) = project_dir {
+        let project = short_project(&dir.to_string_lossy());
         if 3 + width(&project) <= room {
             spans.push(Span::styled(format!(" · {project}"), t.muted()));
             room -= 3 + width(&project);
@@ -643,6 +674,25 @@ fn temp_notice(app: &App, d: &RunDetail, t: &Theme, w: usize) -> Option<Line<'st
         text = format!("{text} · {}", truncate(&path, left));
     }
     Some(Line::from(Span::styled(format!("   {text}"), t.muted())))
+}
+
+/// `   cwd          ~/Offing/argi/station`
+///
+/// En gris, con el valor en la misma columna que `launched by`, solo si el
+/// subagente trabaja en otra carpeta que la de lanzamiento (la del proyecto
+/// de la cabecera). La ruta se recorta con `…`.
+fn cwd_notice(app: &App, d: &RunDetail, t: &Theme, w: usize) -> Option<Line<'static>> {
+    let (launch, cwd) = (d.launch_dir.as_ref()?, d.cwd.as_ref()?);
+    if launch == cwd {
+        return None;
+    }
+    let label = "   cwd          ";
+    let room = w.saturating_sub(width(label) + 1);
+    let path = truncate(&report::shorten(cwd, &app.home), room);
+    Some(Line::from(Span::styled(
+        format!("{label}{path}"),
+        t.muted(),
+    )))
 }
 
 /// El encargo entero, con sus saltos de línea, ajustado a `room` columnas.
@@ -733,8 +783,8 @@ fn context_gauge(c: Context, width: usize, t: &Theme) -> Vec<Span<'static>> {
 ///
 /// `   context       71%  ████████▍░░░░  142k of 200k`, y entrada, salida,
 /// lectura y escritura de caché con la cifra en corto, alineada a la derecha
-/// en `ink`; tras la última, `≈ $0.62 at API prices` en gris si se conoce el
-/// modelo (en su propia fila si no cabe). Vacío si no hay nada que contar.
+/// en `ink`. Sin coste en dólares: se va por suscripción y la cifra a precio
+/// de API no es lo que se paga. Vacío si no hay nada que contar.
 fn usage_lines(d: &RunDetail, t: &Theme, w: usize) -> Vec<Line<'static>> {
     if d.tokens == 0 && d.context.is_none() && d.usage.model.is_none() {
         return Vec::new();
@@ -790,27 +840,10 @@ fn usage_lines(d: &RunDetail, t: &Theme, w: usize) -> Vec<Line<'static>> {
         }
     }
     lines.push(Line::from(first));
-    let cost = d
-        .cost()
-        .map(|usd| format!("{} at API prices", report::cost(usd)));
-    let last = rows.len() - 1;
-    for (i, (label, value)) in rows.iter().enumerate() {
-        let mut spans = row(label, value);
-        if i == last {
-            if let Some(c) = &cost {
-                if spans_width(&spans) + 3 + width(c) < w {
-                    spans.push(Span::styled(format!("   {c}"), t.muted()));
-                } else {
-                    lines.push(Line::from(spans));
-                    spans = vec![Span::styled(
-                        format!("   {}", truncate(c, w.saturating_sub(4))),
-                        t.muted(),
-                    )];
-                }
-            }
-        }
-        lines.push(Line::from(spans));
-    }
+    lines.extend(
+        rows.iter()
+            .map(|(label, value)| Line::from(row(label, value))),
+    );
     lines
 }
 
@@ -945,9 +978,13 @@ fn run_detail_lines(app: &mut App, t: &Theme, w: usize, h: usize) -> Vec<Line<'s
     };
     let mut avail = h.saturating_sub(2 + steps_min);
     // bajo la cabecera, antes que lo demás: quién la lanzó y el aviso
-    for extra in [launched_by_line(d, t, w), temp_notice(app, d, t, w)]
-        .into_iter()
-        .flatten()
+    for extra in [
+        launched_by_line(d, t, w),
+        temp_notice(app, d, t, w),
+        cwd_notice(app, d, t, w),
+    ]
+    .into_iter()
+    .flatten()
     {
         if avail >= 1 {
             lines.push(extra);
@@ -1142,9 +1179,14 @@ fn render_scrollbar(
 /// hay que contar: en las listas, ventana y recuentos; en el ranking, el
 /// periodo y su total. Si no cabe, se acorta por el final; las pestañas no se
 /// pierden nunca.
-fn top_line(app: &App, t: &Theme, w: usize) -> Line<'static> {
+///
+/// Devuelve también dónde ha caído cada pestaña en `area` (su fila de arriba),
+/// para los clics, recortada al ancho si la terminal no llega.
+fn top_line(app: &App, t: &Theme, area: Rect) -> (Line<'static>, Vec<TabHit>) {
+    let w = area.width as usize;
     let mut used = 0;
     let mut spans = vec![];
+    let mut tabs = vec![];
     for (label, mode) in [
         ("active", Mode::Active),
         ("all", Mode::All),
@@ -1152,7 +1194,16 @@ fn top_line(app: &App, t: &Theme, w: usize) -> Line<'static> {
     ] {
         let chip = format!(" {label} ");
         // el margen de la izquierda y, entre pestañas, un hueco
+        let start = (used + 1).min(w);
         used += 1 + width(&chip);
+        let end = used.min(w);
+        if start < end {
+            tabs.push(TabHit {
+                mode,
+                row: area.y,
+                cols: area.x + start as u16..area.x + end as u16,
+            });
+        }
         spans.push(Span::styled(" ", t.text()));
         spans.push(Span::styled(
             chip,
@@ -1228,7 +1279,7 @@ fn top_line(app: &App, t: &Theme, w: usize) -> Line<'static> {
         spans.push(Span::styled(" ".repeat(fill), t.text()));
         spans.push(Span::styled(format!("{info} "), t.muted()));
     }
-    Line::from(spans)
+    (Line::from(spans), tabs)
 }
 
 /// Segunda línea: el filtro mientras se escribe o está puesto, o el error del
@@ -1551,7 +1602,7 @@ impl Columns {
     }
 
     /// Ancho de lo que va pegado al borde derecho en un bloque:
-    /// «tiempo», «ctx», «tokens» y «herr.» si salen, y el margen.
+    /// «ctx», «tokens» y «tools» si salen, «time» y el margen.
     fn live_right(&self) -> usize {
         let tools = if self.live_tools > 0 {
             3 * COL_GAP + self.live_ctx + self.live_tokens + self.live_tools
@@ -1593,7 +1644,8 @@ impl Columns {
     }
 }
 
-/// Las líneas de un `Item`: una, salvo el monitor vacío, que lleva dos.
+/// Las líneas de un `Item`: una, salvo el monitor vacío, que lleva dos. Un
+/// bloque de activos son cuatro `Item`: nombre, `task`, `now`/`last` y `cwd`.
 fn item_lines(app: &App, item: &Item, cols: &Columns, t: &Theme, w: usize) -> Vec<Line<'static>> {
     let line = match item {
         Item::Blank => Line::default(),
@@ -1605,6 +1657,7 @@ fn item_lines(app: &App, item: &Item, cols: &Columns, t: &Theme, w: usize) -> Ve
         Item::Live { n, line, .. } => live_line(app, *n, line, cols, t, w),
         Item::LiveTask(line) => live_task_line(line, cols, t, w),
         Item::LiveNow(line) => live_now_line(line, cols, t, w),
+        Item::LiveCwd(line) => live_cwd_line(app, line, cols, t, w),
         Item::Quiet { last } => return quiet_lines(app, last.as_ref(), t, w),
         Item::Columns if app.mode == Mode::Active => live_columns_line(cols, t, w),
         Item::Columns => columns_line(cols, t),
@@ -1875,36 +1928,36 @@ fn live_name_room(cols: &Columns, w: usize) -> usize {
     w.saturating_sub(cols.prefix + STAR_W + NAME_GAP + cols.live_right())
 }
 
-/// `             agente                  tiempo   herr.`
+/// `             agent             ctx   tokens   tools     time`
 ///
-/// Cabecera de columnas de los bloques, una vez, en gris: «agente» sobre el
-/// nombre y «tiempo»/«herr.» alineadas a la derecha como sus cifras.
+/// Cabecera de columnas de los bloques, una vez, en gris: «agent» sobre el
+/// nombre y «ctx»/«tokens»/«tools»/«time» alineadas a la derecha como sus
+/// cifras; «time» la última, pegada al borde, y la única que queda en estrecho.
 fn live_columns_line(cols: &Columns, t: &Theme, w: usize) -> Line<'static> {
     let name_room = live_name_room(cols, w);
     let mut s = " ".repeat(cols.prefix + STAR_W);
     s += &pad("agent", name_room + NAME_GAP, false);
-    s += &pad("time", cols.live_worked, true);
     if cols.live_tools > 0 {
         for (label, w) in [
             ("ctx", cols.live_ctx),
             ("tokens", cols.live_tokens),
             ("tools", cols.live_tools),
         ] {
-            s += &" ".repeat(COL_GAP);
             s += &pad(label, w, true);
+            s += &" ".repeat(COL_GAP);
         }
     }
+    s += &pad("time", cols.live_worked, true);
     Line::from(Span::styled(truncate(&s, w), t.muted()))
 }
 
-/// ` ❯  1. ✦   visual vía workflow                  <1 min      0`
-///
-/// ` ❯  1. ✦ visual [propio] vía workflow                  <1 min      0`
+/// ` ❯  1. ✦ visual [workflow]          —        —       0   <1 min`
 ///
 /// Primera línea de un bloque: número, el hueco de la estrella (`✦`/`✧` que
 /// parpadea en `claude` si está en curso; en blanco si terminó, siempre
 /// reservado), el nombre, su etiqueta de origen
-/// (`[propio]`/`[claude]`, y `vía workflow`, en gris) y, a la derecha, pegadas al borde, «tiempo» y «herr.». El nombre va en
+/// (`[propio]`/`[claude]`, y `vía workflow`, en gris) y, a la derecha, pegadas
+/// al borde, «ctx», «tokens», «tools» y, la última, «time». El nombre va en
 /// `claude-soft` negrita si está en curso y en `ink` normal si terminó (y el
 /// número en `ink`), sea cual sea el tipo; terminada, `hace N min` en vez de lo
 /// trabajado. La etiqueta sale si la terminal tiene 50 columnas o más y cabe.
@@ -1932,15 +1985,9 @@ fn live_line(
         }
     }
     spans.push(Span::raw(" ".repeat(room + NAME_GAP - used)));
-    spans.push(Span::styled(
-        pad(&live_time(app, r), cols.live_worked, true),
-        t.text(),
-    ));
     if cols.live_tools > 0 {
         let ctx = ctx_spans(r.context, t);
-        spans.push(Span::raw(
-            " ".repeat(COL_GAP + cols.live_ctx - spans_width(&ctx)),
-        ));
+        spans.push(Span::raw(" ".repeat(cols.live_ctx - spans_width(&ctx))));
         spans.extend(ctx);
         let tok = live_tokens_cell(r);
         spans.push(Span::raw(" ".repeat(COL_GAP)));
@@ -1953,7 +2000,13 @@ fn live_line(
             pad(&live_tools_cell(r), cols.live_tools, true),
             if no_run(r) { t.muted() } else { t.text() },
         ));
+        spans.push(Span::raw(" ".repeat(COL_GAP)));
     }
+    // «time», la última, pegada al borde
+    spans.push(Span::styled(
+        pad(&live_time(app, r), cols.live_worked, true),
+        t.text(),
+    ));
     Line::from(spans)
 }
 
@@ -1994,6 +2047,13 @@ fn live_now_line(r: &NowLine, cols: &Columns, t: &Theme, w: usize) -> Line<'stat
         RunState::Done { .. } => "last",
     };
     live_detail_line(label, r.last_tool.as_deref(), t.muted(), cols, t, w)
+}
+
+/// `           cwd      ~/Offing/argi/station`: dónde trabaja de verdad el
+/// subagente, aunque el grupo vaya por la carpeta de lanzamiento.
+fn live_cwd_line(app: &App, r: &NowLine, cols: &Columns, t: &Theme, w: usize) -> Line<'static> {
+    let cwd = r.cwd.as_deref().map(|c| report::shorten(c, &app.home));
+    live_detail_line("cwd", cwd.as_deref(), t.muted(), cols, t, w)
 }
 
 /// El monitor sin nada en curso ni en la ventana: lo dice y, debajo, cuándo
@@ -3533,27 +3593,30 @@ mod tests {
     #[test]
     fn active_blocks_breathe_with_a_blank_line_between_runs() {
         let mut app = blocks();
-        let lines = draw(&mut app, 110, 40);
+        let lines = draw(&mut app, 110, 60);
         let g = pos(&lines, " station · 2 running · 1 recent ──");
-        // bloque 3 (g+1..g+3), blanco, bloque 4 (g+5..g+7)
+        // bloque 3 (g+1..g+4, la cuarta la línea cwd), blanco, bloque 4 (g+6..g+9)
         assert_eq!(lines[g + 3], "         now      —");
-        assert_eq!(lines[g + 4], "", "{lines:#?}");
-        assert!(lines[g + 5].contains("4. "), "{lines:#?}");
+        assert_eq!(lines[g + 4], "         cwd      ~/Offing/argi/station");
+        assert_eq!(lines[g + 5], "", "{lines:#?}");
+        assert!(lines[g + 6].contains("4. "), "{lines:#?}");
         let o = pos(&lines, " otro · 1 running ──");
         assert_eq!(lines[o - 1], "", "aire antes de la regla: {lines:#?}");
-        assert_ne!(lines[o - 2], "", "un solo blanco: {lines:#?}");
+        // o - 2 es la línea cwd del bloque anterior
+        assert!(lines[o - 2].starts_with("         cwd      "), "{lines:#?}");
+        assert_ne!(lines[o - 3], "", "un solo blanco: {lines:#?}");
         // la primera regla, justo bajo la cabecera de columnas
         assert!(lines[3].contains("──"), "{lines:#?}");
     }
 
     #[test]
-    fn a_run_in_progress_is_a_three_line_block_under_a_group_rule() {
+    fn a_run_in_progress_is_a_four_line_block_under_a_group_rule() {
         let mut app = blocks();
-        let lines = draw(&mut app, 110, 40);
+        let lines = draw(&mut app, 110, 60);
         // cabecera de columnas una vez, sobre el nombre y las cifras
         assert!(lines[2].starts_with("         agent  "), "{:?}", lines[2]);
         assert!(
-            lines[2].ends_with("time   ctx   tokens   tools"),
+            lines[2].ends_with("ctx   tokens   tools        time"),
             "{:?}",
             lines[2]
         );
@@ -3563,9 +3626,11 @@ mod tests {
         assert_eq!(end_of(&lines[g]), 109);
         let o = pos(&lines, " otro · 1 running ──");
         assert!(!lines[o].contains("recent"), "{:?}", lines[o]);
+        // la ruta solo sale en la línea cwd de cada bloque
         assert!(!lines
             .iter()
-            .any(|l| l.contains("Running") || l.contains("~/")));
+            .any(|l| l.contains("Running")
+                || (l.contains("~/") && !l.starts_with("         cwd      "))));
         // el bloque: nombre justo tras el número, etiqueta de origen y «vía workflow»
         assert!(
             lines[g + 1].starts_with("    3. ✦ visual [workflow]  "),
@@ -3573,7 +3638,7 @@ mod tests {
             lines[g + 1]
         );
         assert!(
-            lines[g + 1].ends_with("<1 min     —        —       0"),
+            lines[g + 1].ends_with("—        —       0      <1 min"),
             "{:?}",
             lines[g + 1]
         );
@@ -3582,28 +3647,32 @@ mod tests {
             "         task     pintar la pantalla de activos"
         );
         assert_eq!(lines[g + 3], "         now      —");
+        assert_eq!(lines[g + 4], "         cwd      ~/Offing/argi/station");
         // sin encargo, un guion; las cifras alineadas a la derecha bajo su cabecera
-        assert_eq!(lines[g + 6], "         task     —");
+        assert_eq!(lines[g + 7], "         task     —");
         assert!(
-            lines[g + 5].ends_with("10 min     —        —       7"),
+            lines[g + 6].ends_with("—        —       7      10 min"),
             "{:?}",
-            lines[g + 5]
+            lines[g + 6]
         );
         let gp = pos(&lines, "general-purpose [claude]");
         assert!(
-            lines[gp].ends_with("1 min     —        —      37"),
+            lines[gp].ends_with("—        —      37       1 min"),
             "{:?}",
             lines[gp]
         );
         assert_eq!(lines[gp + 2], "         now      Bash · git diff --stat");
+        assert_eq!(lines[gp + 3], "         cwd      ~/otro");
         let head = &lines[2];
         for (l, time) in [
             (&lines[g + 1], "<1 min"),
-            (&lines[g + 5], "10 min"),
+            (&lines[g + 6], "10 min"),
             (&lines[gp], "1 min"),
         ] {
-            assert_eq!(end_of(l), end_col(head, "tools"), "{l:?}");
-            assert_eq!(end_col(l, time), end_col(head, "time"), "{l:?}");
+            // «time» es la última columna, pegada al borde; «tools» justo antes
+            assert_eq!(end_of(l), end_col(head, "time"), "{l:?}");
+            let before_time = width(l[..l.rfind(time).unwrap()].trim_end());
+            assert_eq!(before_time, end_col(head, "tools"), "{l:?}");
         }
     }
 
@@ -3666,8 +3735,8 @@ mod tests {
     fn group_and_detail_lines_are_painted_in_soft_muted_and_ink() {
         let t = Theme::claude_256();
         let mut app = blocks();
-        let lines = draw(&mut app, 110, 40);
-        let buf = draw_buf(&mut app, 110, 40);
+        let lines = draw(&mut app, 110, 60);
+        let buf = draw_buf(&mut app, 110, 60);
         let g = pos(&lines, " station · 2 running") as u16;
         let at = |y: usize, pat: &str| buf[(col(&lines[y], pat), y as u16)].style().fg;
         let gy = g as usize;
@@ -3682,7 +3751,7 @@ mod tests {
         assert_eq!(at(gy + 2, "task"), Some(t.ink_muted));
         assert_eq!(at(gy + 2, "pintar"), Some(t.ink));
         // sin encargo ni herramienta, el guion en gris
-        assert_eq!(at(gy + 6, "—"), Some(t.ink_muted));
+        assert_eq!(at(gy + 7, "—"), Some(t.ink_muted));
         assert_eq!(at(gy + 3, "—"), Some(t.ink_muted));
         let gp = pos(&lines, "general-purpose [claude]");
         assert_eq!(at(gp + 2, "Bash"), Some(t.ink_muted));
@@ -3691,7 +3760,7 @@ mod tests {
     #[test]
     fn a_long_task_and_last_tool_are_cut_with_an_ellipsis_on_one_line() {
         let mut app = blocks();
-        let lines = draw(&mut app, 60, 40);
+        let lines = draw(&mut app, 60, 60);
         assert!(lines.iter().all(|l| width(l) <= 59), "{lines:#?}");
         // la fila de encargo de general-purpose se corta a 59 columnas
         let task = lines.iter().find(|l| l.contains("Revisión")).unwrap();
@@ -3709,7 +3778,7 @@ mod tests {
         r.last_tool = Some("Edit\n README.md".into());
         let mut app = with_runs(fixture(), vec![r]);
         press(&mut app, KeyCode::Char('a'));
-        let lines = draw(&mut app, 110, 40);
+        let lines = draw(&mut app, 110, 60);
         let i = pos(&lines, "# ENCARGO");
         assert_eq!(lines[i], "         task     # ENCARGO copia esto");
         assert_eq!(lines[i + 1], "         now      Edit README.md");
@@ -3718,7 +3787,7 @@ mod tests {
     #[test]
     fn under_70_columns_tools_goes_and_under_50_the_tag_too() {
         let mut app = blocks();
-        let lines = draw(&mut app, 69, 40);
+        let lines = draw(&mut app, 69, 60);
         let (wf, gp) = (
             pos(&lines, "visual [workflow]"),
             pos(&lines, "general-purpose"),
@@ -3728,7 +3797,7 @@ mod tests {
         assert!(lines[wf].ends_with("<1 min"), "{:?}", lines[wf]);
         assert!(lines[gp].contains("[claude]"), "{:?}", lines[gp]);
         assert!(lines[gp].ends_with("1 min"), "{:?}", lines[gp]);
-        let lines = draw(&mut app, 49, 40);
+        let lines = draw(&mut app, 49, 60);
         assert!(!lines
             .iter()
             .any(|l| l.contains("[workflow]") || l.contains("[claude]") || l.contains("[own]")));
@@ -3742,9 +3811,9 @@ mod tests {
     fn the_tagged_rows_never_overflow_from_30_to_160_columns() {
         for mut app in [blocks(), busy(), done_only()] {
             for w in 30u16..=160 {
-                let lines = draw(&mut app, w, 40);
+                let lines = draw(&mut app, w, 60);
                 assert!(
-                    lines[2..39].iter().all(|l| width(l) < w as usize),
+                    lines[2..59].iter().all(|l| width(l) < w as usize),
                     "{w}: {lines:#?}"
                 );
             }
@@ -3755,9 +3824,9 @@ mod tests {
     fn the_blocks_never_overflow_at_any_width() {
         for mut app in [blocks(), busy(), done_only()] {
             for w in [30u16, 36, 40, 49, 50, 60, 69, 70, 71, 85, 110, 160] {
-                let lines = draw(&mut app, w, 40);
+                let lines = draw(&mut app, w, 60);
                 assert!(
-                    lines[2..39].iter().all(|l| width(l) < w as usize),
+                    lines[2..59].iter().all(|l| width(l) < w as usize),
                     "{w}: {lines:#?}"
                 );
             }
@@ -3848,7 +3917,7 @@ mod tests {
     #[test]
     fn group_rules_count_running_and_recent_and_omit_the_zero_ones() {
         // solo terminadas
-        let lines = draw(&mut done_only(), 110, 30);
+        let lines = draw(&mut done_only(), 110, 60);
         assert!(
             lines[3].starts_with(" taskflow · 2 recent ──"),
             "{:?}",
@@ -3861,7 +3930,7 @@ mod tests {
         assert!(lines.iter().any(|l| l.starts_with(" front · 1 recent ──")));
         assert!(lines.iter().all(|l| !l.contains("running ──")));
         // solo en curso
-        let lines = draw(&mut busy(), 110, 40);
+        let lines = draw(&mut busy(), 110, 60);
         let o = pos(&lines, " otro · 1 running ──");
         assert!(!lines[o].contains("recent"), "{:?}", lines[o]);
         // las dos
@@ -3873,8 +3942,8 @@ mod tests {
     fn a_finished_block_is_sober_without_star_in_ink_with_ago_and_last() {
         let t = Theme::claude_256();
         let mut app = done_only();
-        let lines = draw(&mut app, 110, 30);
-        let buf = draw_buf(&mut app, 110, 30);
+        let lines = draw(&mut app, 110, 60);
+        let buf = draw_buf(&mut app, 110, 60);
         let b = blk(&lines, "backend");
         let y = b as u16;
         // el punto de siempre (sin estrella): el nombre alinea con los demás
@@ -3884,7 +3953,7 @@ mod tests {
             lines[b]
         );
         assert!(
-            lines[b].ends_with("5 min ago     —        —       7"),
+            lines[b].ends_with("—        —       7   5 min ago"),
             "{:?}",
             lines[b]
         );
@@ -3920,8 +3989,8 @@ mod tests {
         r.last_tool = Some("Edit · src/a.rs".into());
         let mut app = with_runs(fixture(), vec![r]);
         press(&mut app, KeyCode::Char('a'));
-        let lines = draw(&mut app, 110, 30);
-        let buf = draw_buf(&mut app, 110, 30);
+        let lines = draw(&mut app, 110, 60);
+        let buf = draw_buf(&mut app, 110, 60);
         let b = blk(&lines, "backend");
         assert_eq!(lines[b + 2], "         last     Edit · src/a.rs");
         assert_eq!(
@@ -3934,24 +4003,26 @@ mod tests {
     fn a_call_without_a_run_says_dash_in_the_tools_column() {
         let t = Theme::claude_256();
         let mut app = done_only();
-        let lines = draw(&mut app, 110, 30);
-        let buf = draw_buf(&mut app, 110, 30);
+        let lines = draw(&mut app, 110, 60);
+        let buf = draw_buf(&mut app, 110, 60);
         let v = blk(&lines, "visual");
         assert!(
-            lines[v].ends_with("5 s ago     —        —       —"),
+            lines[v].ends_with("—        —       —     5 s ago"),
             "{:?}",
             lines[v]
         );
         assert_eq!(lines[v + 2], "         last     —");
         // el de herramientas, en gris; los de ctx y tokens, apagados
-        let tools_x = end_of(&lines[v]) as u16 - 1;
+        let tools_end = width(lines[v][..lines[v].rfind("5 s ago").unwrap()].trim_end());
+        let tools_x = tools_end as u16 - 1;
         assert_eq!(buf[(tools_x, v as u16)].style().fg, Some(t.ink_muted));
         assert_eq!(
             buf[(col(&lines[v], "—"), v as u16)].style().fg,
             Some(t.subtle)
         );
         // el guion cae bajo la «r.» de «herr.», como las cifras
-        assert_eq!(end_of(&lines[v]), end_col(&lines[2], "tools"));
+        assert_eq!(tools_end, end_col(&lines[2], "tools"));
+        assert_eq!(end_of(&lines[v]), end_col(&lines[2], "time"));
     }
 
     #[test]
@@ -4018,7 +4089,7 @@ mod tests {
         let st = buf[(name, ex as u16)].style();
         assert_eq!(st.fg, Some(t.ink));
         assert!(!st.add_modifier.contains(Modifier::BOLD));
-        assert!(lines[ex].contains("ago "), "{:?}", lines[ex]);
+        assert!(lines[ex].ends_with(" ago"), "{:?}", lines[ex]);
     }
 
     /// Un uso de `total` tokens con `context` del último mensaje sobre 200k.
@@ -4053,31 +4124,31 @@ mod tests {
     }
 
     #[test]
-    fn active_rows_carry_ctx_and_tokens_between_time_and_tools() {
+    fn active_rows_carry_ctx_tokens_and_tools_before_time() {
         let t = Theme::claude_256();
         let mut app = metered();
-        let lines = draw(&mut app, 110, 40);
-        let buf = draw_buf(&mut app, 110, 40);
+        let lines = draw(&mut app, 110, 60);
+        let buf = draw_buf(&mut app, 110, 60);
         let head = &lines[2];
         assert!(
-            head.ends_with("time        ctx   tokens   tools"),
+            head.ends_with("ctx   tokens   tools        time"),
             "{head:?}"
         );
         let gp = pos(&lines, "general-purpose [claude]");
         assert!(
-            lines[gp].ends_with("1 min   ▰▰▰▰ 92%     1.1M      37"),
+            lines[gp].ends_with("▰▰▰▰ 92%     1.1M      37       1 min"),
             "{:?}",
             lines[gp]
         );
         let be = blk(&lines, "backend");
         assert!(
-            lines[be].ends_with("10 min   ▰▰▰▱ 71%     412k       7"),
+            lines[be].ends_with("▰▰▰▱ 71%     412k       7      10 min"),
             "{:?}",
             lines[be]
         );
         let wf = pos(&lines, "visual [workflow]");
         assert!(
-            lines[wf].ends_with("<1 min          —        —       0"),
+            lines[wf].ends_with("—        —       0      <1 min"),
             "{:?}",
             lines[wf]
         );
@@ -4106,7 +4177,7 @@ mod tests {
             lines[0]
         );
         // por debajo de 70 columnas, ctx y tokens se van con tools
-        let lines = draw(&mut app, 69, 40);
+        let lines = draw(&mut app, 69, 60);
         assert!(lines[2].ends_with("time"), "{:?}", lines[2]);
         assert!(!lines.iter().any(|l| l.contains('▰') || l.contains("1.1M")));
     }
@@ -4150,16 +4221,16 @@ mod tests {
     fn active_footer_has_no_order_and_paints_keys_claude_and_actions_ink() {
         let t = Theme::claude_256();
         let mut app = busy();
-        let lines = draw(&mut app, 100, 40);
+        let lines = draw(&mut app, 100, 60);
         assert_eq!(
-            bare(&lines[39]),
+            bare(&lines[59]),
             " ↑↓ move · enter details · tab mode · / filter · q quit"
         );
         // enter abre la ficha de cualquier ejecución: nunca va apagada
-        let buf = draw_buf(&mut app, 100, 40);
-        let x = col(&lines[39], "enter");
-        assert_eq!(buf[(x, 39)].style().fg, Some(t.claude));
-        assert_eq!(buf[(x + 6, 39)].style().fg, Some(t.ink));
+        let buf = draw_buf(&mut app, 100, 60);
+        let x = col(&lines[59], "enter");
+        assert_eq!(buf[(x, 59)].style().fg, Some(t.claude));
+        assert_eq!(buf[(x + 6, 59)].style().fg, Some(t.ink));
     }
 
     /// La ficha de una ejecución con 38 herramientas y 5 pasos, abierta sobre
@@ -4297,7 +4368,14 @@ mod tests {
         assert_eq!(lines[10], "   input         18k");
         assert_eq!(lines[11], "   output        24k");
         assert_eq!(lines[12], "   cache read   351k");
-        assert_eq!(lines[13], "   cache write   19k   ≈ $0.39 at API prices");
+        assert_eq!(lines[13], "   cache write   19k");
+        // ningún coste en dólares: va por suscripción y la cifra no es lo que paga
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains('$') || l.contains("API prices")),
+            "{lines:?}"
+        );
         assert!(lines[14].starts_with(" tools ─"), "{:?}", lines[14]);
         assert!(lines[16].starts_with(" launched · 2 ─"), "{:?}", lines[16]);
         assert_eq!(
@@ -4327,7 +4405,7 @@ mod tests {
         assert_eq!(at(9, "░").fg, Some(t.subtle));
         assert_eq!(at(9, "142k").fg, Some(t.ink_muted));
         assert_eq!(at(12, "351k").fg, Some(t.ink));
-        assert_eq!(at(13, "≈").fg, Some(t.ink_muted));
+        assert_eq!(at(13, "19k").fg, Some(t.ink));
         // hijas: en curso, estrella y nombre claude-soft negrita; terminada, ink
         assert_eq!(at(17, "✦").fg, Some(t.claude));
         assert_eq!(at(17, "Explore").fg, Some(t.claude_soft));
@@ -4414,8 +4492,16 @@ mod tests {
     }
 
     #[test]
-    fn the_cost_says_under_a_cent_or_goes_without_a_known_model() {
+    fn usage_has_no_cost_and_goes_without_a_known_model() {
         let mut app = rich_run();
+        // en una terminal estrecha tampoco aparece el coste en su propia fila
+        let lines = draw(&mut app, 40, 40);
+        assert_eq!(lines[13], "   cache write   19k");
+        assert!(lines[14].starts_with(" tools ─"), "{:?}", lines[14]);
+        assert!(!lines
+            .iter()
+            .any(|l| l.contains('$') || l.contains("API prices")));
+        // cifras pequeñas y sin modelo conocido
         let d = app.run_detail.as_mut().unwrap();
         d.usage.tokens = crate::runs::usage::Tokens {
             input: 10,
@@ -4423,15 +4509,11 @@ mod tests {
             cache_read: 0,
             cache_creation: 0,
         };
+        d.usage.model = None;
         let lines = draw(&mut app, 100, 40);
-        assert!(
-            lines[13].ends_with("< $0.01 at API prices"),
-            "{:?}",
-            lines[13]
-        );
-        app.run_detail.as_mut().unwrap().usage.model = None;
-        let lines = draw(&mut app, 100, 40);
-        assert!(!lines.iter().any(|l| l.contains("API prices")));
+        assert!(!lines
+            .iter()
+            .any(|l| l.contains('$') || l.contains("API prices")));
         assert!(lines[8].ends_with("─ —"), "{:?}", lines[8]);
         // sin contexto, un guion
         app.run_detail.as_mut().unwrap().context = None;
@@ -5906,12 +5988,12 @@ mod tests {
     #[test]
     fn the_count_goes_with_the_tags_under_50_columns_and_never_overflows() {
         let mut app = fused_app(5);
-        let lines = draw(&mut app, 49, 30);
+        let lines = draw(&mut app, 49, 60);
         assert!(!lines.iter().any(|l| l.contains('×')), "{lines:#?}");
         for w in 30u16..=160 {
-            let lines = draw(&mut app, w, 30);
+            let lines = draw(&mut app, w, 60);
             assert!(
-                lines[2..29].iter().all(|l| width(l) < w as usize),
+                lines[2..59].iter().all(|l| width(l) < w as usize),
                 "{w}: {lines:#?}"
             );
             // las cifras de la derecha siguen pegadas al borde
@@ -6058,6 +6140,86 @@ mod tests {
     }
 
     #[test]
+    fn the_cwd_line_is_muted_with_a_dash_when_unknown_and_trimmed_when_narrow() {
+        let t = Theme::claude_256();
+        let mut runs = blocks_runs();
+        runs[2].cwd = None;
+        runs[2].launch_dir = Some(PathBuf::from(STATION));
+        runs[1].cwd = Some(PathBuf::from("/opt/fuera/del/home"));
+        let mut app = with_runs(fixture(), runs);
+        press(&mut app, KeyCode::Char('a'));
+        let lines = draw(&mut app, 110, 60);
+        let be = blk(&lines, "backend");
+        assert_eq!(lines[be + 3], "         cwd      —");
+        let gp = blk(&lines, "general-purpose");
+        assert_eq!(lines[gp + 3], "         cwd      /opt/fuera/del/home");
+        // etiqueta y valor en gris, como «now»
+        let buf = draw_buf(&mut app, 110, 60);
+        let y = (gp + 3) as u16;
+        assert_eq!(buf[(9, y)].style().fg, Some(t.ink_muted));
+        assert_eq!(buf[(18, y)].style().fg, Some(t.ink_muted));
+        // estrecho: la ruta se recorta con … y nada desborda
+        let lines = draw(&mut app, 30, 60);
+        let gp = blk(&lines, "general-");
+        assert_eq!(lines[gp + 3], "         cwd      /opt/fuera…");
+        for w in 10u16..=110 {
+            let lines = draw(&mut app, w, 60);
+            assert!(lines.iter().all(|l| width(l) <= w as usize), "{w}");
+        }
+    }
+
+    #[test]
+    fn the_run_header_takes_the_project_from_the_launch_dir_and_tells_the_cwd() {
+        let t = Theme::claude_256();
+        let mut app = run_app();
+        // mismo sitio: sin línea de cwd
+        app.run_detail.as_mut().unwrap().launch_dir = Some(PathBuf::from(STATION));
+        let lines = draw(&mut app, 100, 24);
+        assert!(
+            !lines.iter().any(|l| l.starts_with("   cwd ")),
+            "{lines:#?}"
+        );
+        // el subagente hizo cd: el proyecto es el de lanzamiento, el cwd debajo
+        {
+            let d = app.run_detail.as_mut().unwrap();
+            d.launch_dir = Some(PathBuf::from("/Users/x/lanzadera"));
+            d.cwd = Some(PathBuf::from(STATION));
+        }
+        let lines = draw(&mut app, 100, 24);
+        assert!(
+            lines[2].starts_with(" ✦ visual [own] via workflow · lanzadera"),
+            "{:?}",
+            lines[2]
+        );
+        // el valor en la columna de «launched by»
+        assert_eq!(lines[3], "   cwd          ~/Offing/argi/station");
+        let buf = draw_buf(&mut app, 100, 24);
+        assert_eq!(buf[(3, 3)].style().fg, Some(t.ink_muted));
+        assert_eq!(buf[(16, 3)].style().fg, Some(t.ink_muted));
+        // estrecho: la ruta se recorta con … y nada desborda
+        let lines = draw(&mut app, 30, 24);
+        assert_eq!(lines[3], "   cwd          ~/Offing/arg…");
+        for w in 10u16..=100 {
+            let lines = draw(&mut app, w, 24);
+            assert!(lines.iter().all(|l| width(l) <= w as usize), "{w}");
+        }
+        // sin launch_dir el proyecto sale del cwd, sin línea extra
+        app.run_detail.as_mut().unwrap().launch_dir = None;
+        let lines = draw(&mut app, 100, 24);
+        assert!(lines[2].contains("· station"), "{:?}", lines[2]);
+        assert!(!lines.iter().any(|l| l.starts_with("   cwd ")));
+        // sin cwd, con launch_dir: proyecto de lanzamiento, sin línea extra
+        {
+            let d = app.run_detail.as_mut().unwrap();
+            d.launch_dir = Some(PathBuf::from("/Users/x/lanzadera"));
+            d.cwd = None;
+        }
+        let lines = draw(&mut app, 100, 24);
+        assert!(lines[2].contains("· lanzadera"), "{:?}", lines[2]);
+        assert!(!lines.iter().any(|l| l.starts_with("   cwd ")));
+    }
+
+    #[test]
     fn the_run_footer_tells_up_down_from_left_right() {
         let mut app = nav_app();
         let lines = draw(&mut app, 120, 24);
@@ -6091,5 +6253,151 @@ mod tests {
         assert_eq!(tools(0), "0 tools");
         assert_eq!(tools(1), "1 tool");
         assert_eq!(tools(38), "38 tools");
+    }
+
+    // --- zonas clicables: `App::hits` sale de lo que de verdad se pinta ---
+
+    /// Cada pestaña del mapa cae sobre su texto en la fila de arriba.
+    fn assert_tabs_on_text(app: &mut App, w: u16) {
+        let buf = draw_buf(app, w, 20);
+        let tabs = app.hits.tabs.clone();
+        let modes: Vec<Mode> = tabs.iter().map(|h| h.mode).collect();
+        assert_eq!(modes, [Mode::Active, Mode::All, Mode::Ranking]);
+        for (hit, label) in tabs.iter().zip([" active ", " all ", " ranking "]) {
+            assert_eq!(hit.row, 0);
+            let n = hit.cols.end - hit.cols.start;
+            let text = cells(&buf, hit.cols.start, 0, n);
+            assert!(
+                label.starts_with(&text),
+                "{w}: {:?} sobre {text:?}",
+                hit.cols
+            );
+            assert_eq!(
+                n as usize,
+                width(label).min(w as usize - hit.cols.start as usize)
+            );
+            // antes de la pestaña, el hueco que la separa
+            assert_eq!(cells(&buf, hit.cols.start - 1, 0, 1), " ");
+        }
+    }
+
+    #[test]
+    fn tab_hits_sit_exactly_on_the_painted_tabs() {
+        for mode in [Mode::Active, Mode::All, Mode::Ranking] {
+            let mut app = fixture();
+            app.mode = mode;
+            // ancha, con los contadores enteros, y estrecha, recortados
+            assert_tabs_on_text(&mut app, 110);
+            assert_tabs_on_text(&mut app, 30);
+            let tabs = app.hits.tabs.clone();
+            assert_eq!(tabs[0].cols, 1..9);
+            assert_eq!(tabs[1].cols, 10..15);
+            assert_eq!(tabs[2].cols, 16..25);
+        }
+    }
+
+    #[test]
+    fn tab_hits_are_clipped_to_a_terminal_narrower_than_the_tabs() {
+        let mut app = fixture();
+        assert_tabs_on_text(&mut app, 20);
+        assert_eq!(app.hits.tabs[2].cols, 16..20);
+    }
+
+    /// Las filas de pantalla que llevan número `N. ` y el `cursor` que les toca.
+    fn numbered(lines: &[String]) -> Vec<(u16, usize)> {
+        lines
+            .iter()
+            .enumerate()
+            .filter_map(|(y, l)| {
+                let head = l.trim_start().trim_start_matches('❯').trim_start();
+                let digits: String = head.chars().take_while(|c| c.is_ascii_digit()).collect();
+                let n: usize = digits.parse().ok()?;
+                head[digits.len()..]
+                    .starts_with(". ")
+                    .then_some((y as u16, n - 1))
+            })
+            .collect()
+    }
+
+    fn row_hits(app: &App) -> Vec<(u16, usize)> {
+        app.hits.rows.iter().map(|h| (h.row, h.cursor)).collect()
+    }
+
+    #[test]
+    fn row_hits_point_at_the_numbered_rows_of_the_list() {
+        let mut app = fixture();
+        let lines = draw(&mut app, 110, 20);
+        let want = numbered(&lines[..19]);
+        assert!(want.len() >= 3, "{lines:#?}");
+        assert_eq!(row_hits(&app), want, "{lines:#?}");
+        // ni las reglas, ni los blancos, ni la cabecera llevan zona
+        assert!(app.hits.rows.iter().all(|h| h.row >= 2 && h.row < 19));
+    }
+
+    #[test]
+    fn row_hits_follow_the_scroll() {
+        let mut app = fixture();
+        app.cursor = app.count() - 1;
+        let lines = draw(&mut app, 110, 8);
+        assert!(app.scroll > 0, "sin scroll: {lines:#?}");
+        let want = numbered(&lines[..7]);
+        assert!(want.iter().any(|&(_, c)| c == app.cursor), "{lines:#?}");
+        assert_eq!(row_hits(&app), want, "{lines:#?}");
+    }
+
+    #[test]
+    fn the_four_lines_of_an_active_block_click_its_run() {
+        let mut app = blocks();
+        let lines = draw(&mut app, 110, 60);
+        let g = pos(&lines, " station · 2 running · 1 recent ──");
+        let hits = row_hits(&app);
+        let at = |y: usize| hits.iter().find(|h| h.0 as usize == y).map(|h| h.1);
+        assert_eq!(at(g), None, "la regla del grupo no se pulsa");
+        for y in g + 1..=g + 4 {
+            assert_eq!(at(y), Some(2), "línea {y}: {lines:#?}");
+        }
+        assert_eq!(at(g + 5), None, "el blanco entre bloques no se pulsa");
+        assert_eq!(at(g + 6), Some(3));
+        assert_eq!(at(2), None, "la cabecera de columnas no se pulsa");
+    }
+
+    #[test]
+    fn a_block_cut_by_the_scroll_keeps_its_run_on_the_visible_lines() {
+        let mut app = blocks();
+        let items = app.items();
+        let live = |n: usize| {
+            items
+                .iter()
+                .position(|i| matches!(i, Item::Live { n: m, .. } if *m == n))
+                .unwrap()
+        };
+        // el `Live` del bloque 3 queda justo encima de la vista
+        app.scroll = live(3) + 1;
+        app.cursor = 3;
+        let lines = draw(&mut app, 110, 14);
+        assert_eq!(app.scroll, live(3) + 1, "{lines:#?}");
+        assert!(lines[2].starts_with("         "), "{lines:#?}");
+        let hits = row_hits(&app);
+        assert_eq!(&hits[..3], &[(2, 2), (3, 2), (4, 2)], "{lines:#?}");
+        assert!(hits.contains(&(6, 3)), "{lines:#?}");
+    }
+
+    #[test]
+    fn an_open_card_keeps_the_tabs_but_no_rows() {
+        let mut app = fixture();
+        draw(&mut app, 110, 20);
+        assert!(!app.hits.rows.is_empty());
+        press(&mut app, KeyCode::Enter);
+        assert!(app.detail);
+        draw(&mut app, 110, 20);
+        assert!(app.hits.rows.is_empty());
+        assert_eq!(app.hits.tabs.len(), 3);
+
+        let mut app = blocks();
+        press(&mut app, KeyCode::Enter);
+        assert!(app.run_detail.is_some());
+        draw(&mut app, 110, 30);
+        assert!(app.hits.rows.is_empty());
+        assert_eq!(app.hits.tabs.len(), 3);
     }
 }

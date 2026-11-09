@@ -52,7 +52,14 @@ pub(super) struct Kept {
     seen: HashMap<String, Fingerprint>,
 }
 
-type Fingerprint = (DateTime<Utc>, usize, Option<bool>, usize, Option<PathBuf>);
+type Fingerprint = (
+    DateTime<Utc>,
+    usize,
+    Option<bool>,
+    usize,
+    Option<PathBuf>,
+    Option<PathBuf>,
+);
 
 fn fingerprint(r: &Run) -> Fingerprint {
     (
@@ -61,6 +68,7 @@ fn fingerprint(r: &Run) -> Fingerprint {
         r.finished,
         r.children.len(),
         r.cwd.clone(),
+        r.launch_dir.clone(),
     )
 }
 
@@ -202,6 +210,7 @@ fn to_line(r: &Run) -> String {
         "parent_run": r.parent_run,
         "children": r.children,
         "cwd": r.cwd,
+        "launch_dir": r.launch_dir,
         "start": r.start.as_ref().map(stamp),
         "last": r.last.as_ref().map(stamp),
         "modified": stamp(&r.modified),
@@ -262,6 +271,8 @@ fn from_line(line: &str) -> Option<Run> {
             .filter_map(|c| c.as_str().map(str::to_string))
             .collect(),
         cwd: text("cwd").map(PathBuf::from),
+        // Las entradas anteriores a este campo no lo traen: `None`.
+        launch_dir: text("launch_dir").map(PathBuf::from),
         start: Some(at("start")?),
         last: at("last"),
         modified: at("modified").unwrap_or_default(),
@@ -334,7 +345,8 @@ mod tests {
             session_prompt: Some("mejora el README".into()),
             parent_run: Some("p0".into()),
             children: vec!["k1".into()],
-            cwd: Some(PathBuf::from("/Users/x/app")),
+            cwd: Some(PathBuf::from("/Users/x/app/src")),
+            launch_dir: Some(PathBuf::from("/Users/x/app")),
             start: Some(start),
             last: Some(at("2026-11-05T10:03:00Z")),
             modified: at("2026-11-05T10:03:00Z"),
@@ -393,6 +405,35 @@ mod tests {
         let back = from_line(&to_line(&r)).unwrap();
         assert_eq!(back, stored(&r));
         assert!(back.from_cache && back.steps.is_empty() && back.last_tool.is_none());
+    }
+
+    #[test]
+    fn an_old_line_without_launch_dir_reads_as_none() {
+        let old = r#"{"v":1,"id":"a1","agent_type":"docs","cwd":"/Users/x/app/src","start":"2026-11-05T10:00:00Z"}"#;
+        let r = from_line(old).unwrap();
+        assert_eq!(r.cwd, Some(PathBuf::from("/Users/x/app/src")));
+        assert_eq!(r.launch_dir, None);
+        let back = from_line(&to_line(&done("a1"))).unwrap();
+        assert_eq!(back.launch_dir, Some(PathBuf::from("/Users/x/app")));
+    }
+
+    #[test]
+    fn a_run_is_kept_again_when_its_launch_dir_appears() {
+        let tmp = TempDir::new("launch");
+        let path = tmp.0.join("runs.jsonl");
+        let now = at("2026-11-06T00:00:00Z");
+        let mut kept = Kept::new(path.clone());
+        let unresolved = Run {
+            launch_dir: None,
+            ..done("a1")
+        };
+        kept.keep(&[unresolved], now);
+        assert_eq!(read(&path).unwrap()["a1"].launch_dir, None);
+        kept.keep(&[done("a1")], now);
+        assert_eq!(
+            read(&path).unwrap()["a1"].launch_dir,
+            Some(PathBuf::from("/Users/x/app"))
+        );
     }
 
     #[test]

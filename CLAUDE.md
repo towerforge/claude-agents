@@ -15,7 +15,7 @@ Cada instrucción va al agente de su apartado (`.claude/agents/`):
 | Agente | Apartado |
 |---|---|
 | `data` | Lo que se lee del disco y de `ps`, y su forma: `src/agents.rs`, `src/transcripts.rs`, `src/runs.rs` y `src/runs/` (tokens, enlaces, la caché `runs.jsonl`), `src/sessions.rs`. No hay base de datos |
-| `backend` | El cruce y la orquestación: `src/status.rs` y `src/status/pricing.rs`, `main()` de `src/main.rs`, el bucle y el hilo de lectura de `src/tui/mod.rs` y `src/tui/scan.rs`, `Cargo.toml`, `Makefile`, `.github/workflows/`, `install.sh` |
+| `backend` | El cruce y la orquestación: `src/status.rs`, `main()` de `src/main.rs`, el bucle y el hilo de lectura de `src/tui/mod.rs` y `src/tui/scan.rs`, `Cargo.toml`, `Makefile`, `.github/workflows/`, `install.sh` |
 | `frontend` | Lo que sale y cómo se maneja: flags y ayuda (`struct Cli` en `src/main.rs`), columnas y orden, teclas, filtro y ficha (`src/tui/app.rs`) |
 | `visual` | Cómo se pinta: `src/report.rs`, `src/tui/view.rs`, `src/tui/theme.rs` y las cadenas de formato. Sin lógica |
 | `docs` | `README.md` (en inglés de EE. UU.), `CLAUDE.md` (en castellano), `docs/` (en inglés, sin código), `assets/readme/` (imágenes del README, SVG a mano y con datos inventados) |

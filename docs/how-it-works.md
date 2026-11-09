@@ -17,10 +17,12 @@ tool. That is why «active» is a heuristic:
    session's `cwd` and the `timestamp`, and also the block's `id`, the
    `input.description` (`description` in `Invocation`) and the first clean line
    of the `input.prompt` (`prompt_line`; see [What is read from each
-   run](#what-is-read-from-each-run)).
+   run](#what-is-read-from-each-run)). Each call also gets the [launch
+   folder](#launch-folder) of its session.
 3. A **global** agent matches any session. A **project** agent only matches
-   sessions whose `cwd` is inside that project: two projects with a `frontend`
-   agent do not contaminate each other.
+   sessions launched inside that project (the launch folder; the call's `cwd`
+   if it is not known): two projects with a `frontend` agent do not contaminate
+   each other.
 4. The last call that matches is the agent's «last time». If it falls within the
    window, the agent shows as `ACTIVE`.
 5. If it has a **running** run (see below), it shows as `RUNNING` and counts as
@@ -60,9 +62,10 @@ from each line of the `.jsonl`, `timestamp`, `cwd`, `sessionId`, the
    (the ones launched by a workflow), it is running as long as the `.jsonl` was
    written less than **2 minutes** ago.
 4. **Which agent it goes to**: the same rule as calls, with `agentType` as the
-   name: a global agent matches any `cwd`, a project one only runs whose `cwd`
-   is inside the project. If the run's `cwd` is Claude's temp folder, the real
-   project's is used (see [Temporary `cwd` from
+   name: a global agent matches any run, a project one only runs whose session
+   was launched inside the project (see [Launch folder](#launch-folder); the
+   run's `cwd` if it is not known). If that `cwd` is Claude's temp folder, the
+   real project's is used (see [Temporary `cwd` from
    Claude](#temporary-cwd-from-claude)).
 5. **Total** of an agent: the sum of all its runs (running ones, up to now),
    including those that only remain in the [history cache](#kept-history).
@@ -125,7 +128,7 @@ calls that do not link to any run:
   …):`, with whitespace collapsed) and uncut. The task of that monitor line is
   `prompt_line` or, if there is none, `description`.
 
-## Tokens, context and cost
+## Tokens and context
 
 From the assistant lines of each run's transcript (`Run.usage`):
 
@@ -144,13 +147,9 @@ From the assistant lines of each run's transcript (`Run.usage`):
   message. The window is 1M if the model id contains `[1m]` or if the run ever
   went over 200k of context; otherwise 200k. The percentage is context over
   window, rounded.
-- **Cost** (`status::pricing`): an estimate at the API list prices of a table
-  of known models, with cache writes at the 5-minute rate. A model that is not
-  in the table (or no model) has no cost: it is never guessed.
 
 Token figures go in short form: `999`, `1.5k` (one decimal below 10k), `86k`,
-`1M`, `1.1M`, `31.4M`, `142M`, without a trailing `.0`. The cost reads `≈
-$0.62`, or `< $0.01` below a cent.
+`1M`, `1.1M`, `31.4M`, `142M`, without a trailing `.0`.
 
 ## Who launched whom
 
@@ -194,7 +193,39 @@ directory:
 
 If there is no real `cwd`, the temporary one is kept: none is made up. With the
 `cwd` resolved, the run is grouped under its project and matches its project
-agents like any other.
+agents like any other (when the [launch folder](#launch-folder) is not known;
+if it is, that one decides, and it is never a temp folder).
+
+## Launch folder
+
+A subagent's `cwd` is wherever the main agent was when it launched it, and it
+follows every `cd`: the subagents of one session can carry `~/app`,
+`~/app/src/css` or `/tmp`. Claude Code, though, loads `.claude/agents/` from
+the folder where the session was launched. That folder is the launch folder:
+
+- **Run** (`Run.launch_dir`): the first non-temporary `cwd` in the session's
+  main transcript (`~/.claude/projects/<project>/<session>.jsonl`), read with
+  the same first lines and the same per-session store as the [temporary
+  `cwd`](#temporary-cwd-from-claude). Nested runs and workflow steps share the
+  one of their session. If it cannot be read yet, there is none and it is
+  retried on the next refresh.
+- **Call** (`Invocation.launch_dir`): the same, from the main transcript of the
+  session the call's file belongs to (a call made from inside a subagent takes
+  the main session's). Until it is found, it is looked for again only when that
+  transcript grows.
+
+It decides three things, falling back to the `cwd` when it is not known:
+
+- the active group (see [Active: the monitor](interface.md#active-the-monitor)),
+  so all the subagents of a session fall in one group;
+- which project agents match, and therefore `[own]` or `[claude]`, the time,
+  runs and last use of each agent, in every view and in `--plain`: a project
+  agent launched after a `cd /tmp` is still the project's;
+- the project in the [run details](interface.md#run-details) header, which adds
+  a `cwd` line when the subagent's differs.
+
+The subagent's own `cwd` is kept apart: it is the fourth line of each active
+block and what the agent details' runs list shows.
 
 ## Kept history
 
@@ -212,7 +243,8 @@ It is the only file the tool writes; the screen and `--plain` both update it.
 - One JSON object per line and per run, with `"v":1` (a line of another
   version, or a broken one, is skipped). Only runs that are not in progress go
   in; a running one goes in once it ends. It stores what the views need: agent,
-  description, session and its first prompt, links, `cwd`, times, worked time
+  description, session and its first prompt, links, `cwd`, launch folder
+  (`launch_dir`), times, worked time
   and its 15-minute slots, tool counts, task, tokens, model and context. Not the
   steps, the last tool or the temporary `cwd`. Around 1 MB for some 400 runs.
 - It is rewritten whole and atomically (a temporary file next to it, then
@@ -225,6 +257,9 @@ It is the only file the tool writes; the screen and `--plain` both update it.
   runs, the per-day chart, last use and the ranking), but they have no steps:
   their details say `from the history cache · steps are not kept`. The ranking
   says how many there are (`history kept: N runs older than Claude's cleanup`).
+- Lines written before `launch_dir` existed are read without a launch folder
+  (they are grouped and matched by their `cwd`); there is no migration and the
+  version stays `"v":1`.
 - Tests never write there: they use their own temporary folders, or no cache.
 
 To start over, delete the file.
@@ -251,12 +286,12 @@ To start over, delete the file.
   on disk and do not show in all or in the ranking, even if they have runs. They
   do show in active, running and as finished within the window, but they add no
   time or runs to any agent; there `Enter` opens the run details, but there are
-  no agent details (`a` does nothing). The same goes for a project agent
-  launched from outside its project, unless the `cwd` was Claude's temp folder:
-  that one is resolved to the session's project (see [Temporary `cwd` from
-  Claude](#temporary-cwd-from-claude)).
+  no agent details (`a` does nothing). The same goes for a project agent from a
+  session launched outside its project; what counts is the [launch
+  folder](#launch-folder), not the subagent's `cwd`.
 - If the parent session's transcript cannot be read (or has no real `cwd` in its
-  first lines), a run with a temporary `cwd` keeps the temporary one: it matches
+  first lines), there is no launch folder and a run with a temporary `cwd`
+  keeps the temporary one: it matches
   no project agent and shows as `[claude]` under a group named after that
   temporary folder.
 - Workflow runs with `agentType` `workflow-subagent` are not assigned to any
@@ -302,11 +337,9 @@ To start over, delete the file.
   show as `never` once those transcripts are deleted. Runs whose transcripts
   were deleted before the tool ever ran are not in the cache either.
 - Runs from the history cache have no steps or last tool, and nothing in them
-  changes any more.
-- The cost is an estimate at API list prices, from a fixed table in the code:
-  on a subscription you do not pay per token, cache writes are counted at the
-  5-minute rate (Claude Code's 1-hour cache writes cost twice the input, so it
-  can fall short), and a model missing from the table has no cost at all.
+  changes any more. Those kept before the launch folder existed, if their
+  transcript is gone, go by their `cwd`: one launched after a `cd` can show in
+  another group, or as `[claude]` if it left its project.
 - The context window is not written anywhere: it is 1M if the model id carries
   `[1m]` or the run went over 200k, and 200k otherwise. A 1M run whose model id
   lacks `[1m]` and that never went over 200k shows its percentage over 200k.

@@ -223,6 +223,7 @@ mod tests {
             id: None,
             description: None,
             prompt_line: None,
+            launch_dir: None,
         }
     }
 

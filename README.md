@@ -50,11 +50,11 @@ No configuration: it looks for agents under your home directory (`~/.claude/agen
 
 ## Features
 
-- **Global and project agents**, grouped by project; a project agent only matches sessions inside its project.
-- **Live monitor** of what is running and what finished within the window: task, current tool, time, context and tokens. Refreshes every 2 s.
+- **Global and project agents**, grouped by project; a project agent only matches sessions launched inside its project, even if the main agent later did a `cd` elsewhere.
+- **Live monitor** of what is running and what finished within the window: task, current tool, context, tokens and time. Refreshes every 2 s.
 - **Claude Code's own agents and workflow steps** too, labeled `[claude]` and `[workflow]` next to your `[own]` ones.
 - **Time worked per day**, without pauses over 5 minutes.
-- **Tokens, context and a cost estimate** at API list prices (only for known models).
+- **Tokens and context** per run, with the model.
 - **Who launched each run**: the session and its first prompt, or another run.
 - **Ranking** by time, tokens or runs over 7 days, 30 days or all time.
 - **Kept history**: finished runs survive Claude Code's transcript cleanup.
@@ -64,11 +64,11 @@ No configuration: it looks for agents under your home directory (`~/.claude/agen
 
 Three views, as tabs in the header:
 
-- **active** (default): one block per agent and project with `task` and `now`/`last`; running ones first, marked `✦`.
+- **active** (default): one block per agent and project with `task`, `now`/`last` and the subagent's `cwd`; running ones first, marked `✦`. Groups go by the folder where the Claude Code session was launched.
 - **all**: every agent on disk by project, with a 14-day bar, time worked, runs and last use.
 - **ranking**: agents with work in the period, from most to least.
 
-`Enter` opens the agent's details (in all and ranking) or the run's (in active). Every view in detail: [docs/interface.md](docs/interface.md); all the keys: [keys and formats](docs/interface.md#keys-and-formats).
+`Enter` opens the agent's details (in all and ranking) or the run's (in active). The mouse works too: the wheel scrolls, a click on a tab switches view, a click on a row selects it and a second click on it opens it like `Enter`. Every view in detail: [docs/interface.md](docs/interface.md); all the keys: [keys and formats](docs/interface.md#keys-and-formats).
 
 ### Flags
 
@@ -106,8 +106,9 @@ It only reads Claude Code's files, plus `ps` for open sessions:
 
 - [Active](docs/how-it-works.md#how-it-decides-an-agent-is-active): an `Agent` call within the window, or a run in progress.
 - [Time worked](docs/how-it-works.md#how-worked-time-is-calculated): gaps between transcript lines, minus pauses over 5 minutes.
-- [Tokens, context and cost](docs/how-it-works.md#tokens-context-and-cost): from `message.usage`.
+- [Tokens and context](docs/how-it-works.md#tokens-and-context): from `message.usage`.
 - [Who launched whom](docs/how-it-works.md#who-launched-whom): the meta's `toolUseId`.
+- [Launch folder](docs/how-it-works.md#launch-folder): the first real `cwd` of the session's main transcript; it decides the group and which project agents match.
 - [Kept history](docs/how-it-works.md#kept-history): `~/.cache/claude-agents/runs.jsonl`, the only file it writes.
 
 Limitations: [docs/how-it-works.md](docs/how-it-works.md#limitations).
@@ -118,11 +119,9 @@ Limitations: [docs/how-it-works.md](docs/how-it-works.md#limitations).
 
 **Why don't `general-purpose` or `Explore` show in all or in the ranking?** They have no definition on disk. They show in active, but add no time to any agent.
 
-**Is the cost what I pay?** No. It is an estimate at API list prices; on a subscription you do not pay per token, and models missing from the table get no cost.
-
 **An agent I used shows as `never`.** Old `Agent` calls are not kept once Claude Code deletes their transcripts; only runs are.
 
-**I cannot select text with the mouse.** Hold `Shift` while dragging (`Option` in iTerm2).
+**I cannot select text with the mouse.** The screen captures the mouse for the wheel and clicks. Hold `Shift` while dragging (`Option` in iTerm2).
 
 ## Contributing
 
