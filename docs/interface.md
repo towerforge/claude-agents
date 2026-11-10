@@ -64,9 +64,10 @@ star is left. With a one-row body, only the first line shows.
 ## Active: the monitor
 
 (Excerpt of a render with made-up data, at 110 columns: two of the groups.
-`docs` has three runs in progress, so they hang from its name; `frontend` in
-`station` finished with no task or tokens recorded; `Explore` finished 6 min
-ago.)
+`docs` has three runs in progress, so they hang from its name; the `frontend`
+one in progress in `web` is alone and hangs from its name the same way;
+`frontend` in `station` finished with no task or tokens recorded; `Explore`
+finished 6 min ago.)
 
 ```
   active   all   ranking                      window 10 min · 4 running · 5 in window · 4 sessions · 887k tok
@@ -86,7 +87,8 @@ ago.)
     6.   frontend [own]  —                                                             —   2 min ago        —
 
  web · 1 running · 1 recent ─────────────────────────────────────────────────────────────────────────────────
-    7. ✦ frontend [claude]  Add a LanguageSwitcher to header.tsx            ▰▰▰▰▰▰▱▱ 71%       9 min     412k
+         frontend [claude]
+    7. ✦ └ Add a LanguageSwitcher to header.tsx                             ▰▰▰▰▰▰▱▱ 71%       9 min     412k
            now    Edit · src/components/header.tsx
     8.   Explore [claude]  Find where the locale is read                               —   6 min ago      51k
  ↑↓ move · enter details · tab mode · / filter · q quit                                                v0.1.0
@@ -95,8 +97,9 @@ ago.)
 A single list, grouped by project and numbered continuously across all groups.
 In each group, what is running goes first, **one row per run**, and below it
 what finished within the window, **one row per agent**. A running row takes two
-lines, three if its run has loaded a skill (the row, `skill` and `now`); a
-finished row is a single line. There are no blank lines between rows: one blank
+lines, three if its run has loaded a skill (the row, `skill` and `now`), plus
+the agent's name line above it if it is the first of its chain; a finished row
+is a single line. There are no blank lines between rows: one blank
 goes before each group rule except the first, and it is not part of any row, so
 the cursor and the scroll still keep a whole row on screen. Above them, once and
 in gray, the column header (`agent`, `ctx`, `time`, `tokens`), with the first
@@ -122,8 +125,9 @@ group rule right under it. There are no sections or a separate timeline.
   a chain: the agent's name goes on a line of its own above them (`docs [own]
   ×3`, with the number of runs in the chain), and each run hangs from it with
   `├` (`└` the last one) followed by its task, so all the tasks of the chain
-  start in the same column. A lone running run carries its name on its own row
-  (`frontend [claude]  Implementa…`). An agent with runs both running and
+  start in the same column. A lone running run is a chain of one: its name on a
+  line of its own, without ` ×N` (`frontend [claude]`), and the run below it
+  with `└` and its task. An agent with runs both running and
   finished shows in both parts of the group.
 - **Finished: one row per agent.** All the finished runs (and calls without a
   run) of the same agent in the group merge into one row, represented by the
@@ -147,16 +151,17 @@ group rule right under it. There are no sections or a separate timeline.
   parent folder, as in «all»; `global` if there is no folder at all.
 - **The row**: cursor `❯` and number (the number in gray unless the row is
   selected); a 2-column slot for the star (`✦` in `claude` if running,
-  alternating with `✧` every half second; blank if finished); then, on a lone
-  or finished row, the name; a gray (`ink-muted`) label saying where the agent
+  alternating with `✧` every half second; blank if finished); then, on a
+  finished row, the name; a gray (`ink-muted`) label saying where the agent
   comes from (`[own]` for one of the user's own agents; `[own] via workflow`
   for a workflow step whose `description` is one of them: `docs [own] via
   workflow`; `[workflow]` for a workflow step that is not one of the user's
   agents; `[claude]` for a Claude Code one) and, if the finished row merges more
   than one run, ` ×N` in `subtle` at the end of the label (`docs [own] ×5`,
   `docs [own] via workflow ×3`; with a single run it does not show); two spaces
-  and the task, or `—` if there is none. In a chain, `├ ` or `└ ` in `subtle`,
-  in the name's column, and the task. On the right, flush to the edge, `ctx`,
+  and the task, or `—` if there is none. On a running row (always in a chain,
+  even a chain of one), `├ ` or `└ ` in `subtle`, in the name's column, and the
+  task. On the right, flush to the edge, `ctx`,
   `time` and, last, `tokens`:
   - `ctx` is how full the run's context is, only while it runs: an 8-step gauge
     where each started eighth fills a step (`▰` in `claude`, `▱` in `subtle`),
@@ -189,8 +194,9 @@ Colors. The name depends only on the state, whatever the kind: running,
 gray (`ink-muted`), with its task in gray too. What is running is told apart by
 the blinking star, by the name color and by `N min` versus `N min ago`. The
 figures (`time`, `tokens`, the `ctx` percentage) go in gray on every row; a `—`
-in `ctx` or `tokens` goes in `subtle`. The chain's line of its own carries the name like a running
-row, without number, star or figures. The lines under a row start in the name's
+in `ctx` or `tokens` goes in `subtle`. The chain's line of its own carries the name in `claude-soft` bold and the label in
+gray, with ` ×N` only if the chain has more than one run, without number, star
+or figures. The lines under a row start in the name's
 column, which comes right after the star (9 columns with fewer than 100 runs in
 the list; it grows with the digits of the number), as does the `agent` column
 header: first a 2-column guide, `│ ` in `subtle` while the chain goes on below
@@ -224,7 +230,8 @@ right edge; below 50, the labels too (with their ` ×N`). If the whole label
 does not fit it is lost in parts, in this priority order: name > origin
 (`[own]`, `[workflow]`, `[claude]`) > ` ×N` > `via workflow` (`via workflow`
 drops first, then ` ×N`, then the origin and, if that does not fit either,
-nothing). The name is cut with `…` before the figures.
+nothing). On a finished row the name is cut with `…` before the figures; on a
+chain's name line, which has no figures, only if it does not fit the width.
 
 If there is nothing running or in the window, the monitor says so and points to
 the last use of any defined agent:
@@ -246,11 +253,13 @@ the finished row. From active, `Enter` no longer opens the agent details: only
 `a` inside the run details does, and only if it has a defined agent. The footer
 paints `enter details` dimmed only if the cursor is not on a row. The digits,
 the cursor and `↑` `↓` follow the grouped order (continuous across groups); the
-chain's name line is not a row of its own: it belongs to the chain's first row.
+chain's name line is not a row of its own: it belongs to the chain's first row
+(a click on it counts as a click on that row, and the cursor and the scroll
+keep it in view with it).
 `/` filters by name, group folder, `cwd` or task over all rows (running and
 finished); a group left without rows does not show, its rule counters are
-recomputed and so are the chains (one left alone shows its name on its row
-again). `o` does nothing here: the order is the one above.
+recomputed and so are the chains (a run left alone becomes a chain of one,
+with its name on its own line and no ` ×N`). `o` does nothing here: the order is the one above.
 
 ## All: the catalog
 

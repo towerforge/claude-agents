@@ -66,7 +66,7 @@ No configuration: it looks for agents under your home directory (`~/.claude/agen
 
 Three views, as tabs in the header:
 
-- **active** (default): one row per running run, marked `✦`, with its task, context, time and tokens, and `skill` and `now` under it; two or more running runs of the same agent hang together under its name. Below them, one line per agent for what finished within the window. Groups go by the folder where the Claude Code session was launched.
+- **active** (default): one row per running run, marked `✦`, with its task, context, time and tokens, and `skill` and `now` under it; each one hangs from its agent's name, on a line of its own, and two or more running runs of the same agent share it. Below them, one line per agent for what finished within the window. Groups go by the folder where the Claude Code session was launched.
 - **all**: every agent on disk by project, with a 14-day bar, time worked, runs and last use.
 - **ranking**: agents with work in the period, from most to least.
 
