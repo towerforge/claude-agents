@@ -483,7 +483,7 @@ pub fn render(app: &mut App, frame: &mut Frame, t: &Theme) {
             let mut block = None;
             for (i, item) in items.iter().enumerate().take(app.scroll + body_h) {
                 let cursor = match item {
-                    // la línea del agente de un racimo es de la fila de debajo
+                    // la línea del agente (racimo o en curso sola) es de la fila de debajo
                     Item::LiveAgent(_) => items.get(i + 1).and_then(Item::n).map(|n| n - 1),
                     Item::LiveSkill(_) | Item::LiveNow(_) => block,
                     _ => item.n().map(|n| n - 1),
@@ -1653,8 +1653,8 @@ impl Columns {
 
 /// Las líneas de un `Item`: una, salvo el monitor vacío, que lleva dos. Una
 /// fila de activos en curso son dos `Item` (fila y `now`) o tres, con `skill`
-/// entre ambos; la cabeza de un racimo suma encima la línea del agente. Una
-/// terminada, uno.
+/// entre ambos; la cabeza de un racimo, o la en curso sola, suma encima la
+/// línea del agente. Una terminada, uno.
 fn item_lines(app: &App, item: &Item, cols: &Columns, t: &Theme, w: usize) -> Vec<Line<'static>> {
     let line = match item {
         Item::Blank => Line::default(),
@@ -1991,11 +1991,12 @@ fn live_line(
 
 /// Lo de la izquierda de una fila de activos, en `room` columnas como mucho.
 ///
-/// - Sola (o terminada): el nombre con su etiqueta (`live_name`), dos
-///   espacios y la tarea (`ink` en curso, gris terminada; `—` si no hay).
-/// - En un racimo: `├` (`└` la última) en `subtle`, en la columna del
-///   nombre, un espacio y la tarea; el nombre va en su propia línea encima
-///   de la cabeza (`live_agent_line`).
+/// - Terminada: el nombre con su etiqueta (`live_name`), dos espacios y la
+///   tarea en gris (`—` si no hay).
+/// - En curso, en un racimo o sola (un racimo de uno): `├` (`└` la última o
+///   la sola) en `subtle`, en la columna del nombre, un espacio y la tarea en
+///   `ink`; el nombre va en su propia línea encima de la cabeza
+///   (`live_agent_line`).
 ///
 /// Lo primero que se recorta es la tarea; luego la etiqueta y por último el
 /// nombre.
@@ -2012,6 +2013,7 @@ fn live_left(r: &NowLine, room: usize, tag: bool, done: bool, t: &Theme) -> Vec<
             let glyph = if r.chain == Chain::Last { "└" } else { "├" };
             (vec![Span::styled(truncate(glyph, room), t.line())], 1)
         }
+        Chain::Single if !done => (vec![Span::styled(truncate("└", room), t.line())], 1),
         Chain::Single => (live_name(r, room, tag, done, t), TASK_GAP),
     };
     // la tarea, con lo que quede; sin sitio ni para dos columnas, fuera
@@ -2025,8 +2027,9 @@ fn live_left(r: &NowLine, room: usize, tag: bool, done: bool, t: &Theme) -> Vec<
 
 /// `docs [own] ×3`: el nombre (`claude-soft` negrita en curso, gris
 /// terminada), su etiqueta de origen en gris si `tag` (desde 50 columnas) y
-/// ` ×N` en `subtle` (N el del racimo en la cabeza; en una terminada, las
-/// ejecuciones fundidas si son más de una), en `room` columnas como mucho:
+/// ` ×N` en `subtle` (N el del racimo en la cabeza; ninguno en una en curso
+/// sola; en una terminada, las ejecuciones fundidas si son más de una), en
+/// `room` columnas como mucho:
 /// la etiqueta cede antes que el nombre (`live_tag`).
 fn live_name(r: &NowLine, room: usize, tag: bool, done: bool, t: &Theme) -> Vec<Span<'static>> {
     let name = truncate(&r.name, room);
@@ -2036,6 +2039,8 @@ fn live_name(r: &NowLine, room: usize, tag: bool, done: bool, t: &Theme) -> Vec<
     if tag {
         let count = match r.chain {
             Chain::Head(n) => n,
+            // una en curso sola es un racimo de uno: sin «×1»
+            Chain::Single if !done => 1,
             _ => r.runs,
         };
         let tag = live_tag(r.kind, count, room - used);
@@ -2053,9 +2058,9 @@ fn live_name(r: &NowLine, room: usize, tag: bool, done: bool, t: &Theme) -> Vec<
 
 /// `         docs [own] ×3`
 ///
-/// La línea del agente de un racimo, encima de su cabeza y en la columna del
-/// nombre: nombre, etiqueta y `×N` (`live_name`), sin número, estrella ni
-/// cifras.
+/// La línea del agente de un racimo en curso, encima de su cabeza y en la
+/// columna del nombre: nombre, etiqueta y `×N` (`live_name`; sin `×N` si va
+/// sola, un racimo de uno), sin número, estrella ni cifras.
 fn live_agent_line(r: &NowLine, cols: &Columns, t: &Theme, w: usize) -> Line<'static> {
     let indent = cols.prefix + STAR_W;
     let room = w.saturating_sub(indent + 1);
@@ -3686,6 +3691,21 @@ mod tests {
             .unwrap_or_else(|| panic!("sin bloque {name:?}: {lines:#?}"))
     }
 
+    /// La fila de una ejecución en curso de `name`, que va sola o encabeza
+    /// su racimo: la línea justo bajo la de su agente.
+    fn run_of(lines: &[String], name: &str) -> usize {
+        lines
+            .iter()
+            .position(|l| {
+                l.starts_with("         ")
+                    && l.trim_start()
+                        .strip_prefix(name)
+                        .is_some_and(|r| r.is_empty() || r.starts_with(' '))
+            })
+            .map(|a| a + 1)
+            .unwrap_or_else(|| panic!("sin agente {name:?}: {lines:#?}"))
+    }
+
     /// Posición de la primera línea que contiene `pat`.
     fn pos(lines: &[String], pat: &str) -> usize {
         lines
@@ -3814,6 +3834,63 @@ mod tests {
         assert_eq!(col(&lines[l], "└"), col(&lines[a], "docs"));
     }
 
+    /// Una en curso sola es un racimo de uno: el agente en su propia línea
+    /// encima (sin ×N), la tarea colgada de `└` y las sublíneas tras la guía
+    /// de dos espacios; la línea del agente se pulsa como su fila. La
+    /// terminada sigue en una sola línea.
+    #[test]
+    fn a_single_run_in_progress_puts_the_agent_on_its_own_line_like_a_chain_of_one() {
+        let t = Theme::claude_256();
+        let mut app = blocks();
+        let lines = draw(&mut app, 110, 60);
+        let buf = draw_buf(&mut app, 110, 60);
+        let g = pos(&lines, " station · 2 running · 1 recent ──");
+        assert_eq!(lines[g + 1], "         visual [workflow]", "{lines:#?}");
+        assert!(
+            lines[g + 2].starts_with("    3. ✦ └ pintar la pantalla de activos  "),
+            "{:?}",
+            lines[g + 2]
+        );
+        assert!(
+            lines[g + 2].ends_with("—      <1 min        —"),
+            "{:?}",
+            lines[g + 2]
+        );
+        assert_eq!(lines[g + 3], "           skill  superpowers:brainstorming");
+        assert_eq!(lines[g + 4], "           now    —");
+        assert_eq!(lines[g + 5], "         backend [own]", "sin ×1");
+        assert!(
+            lines[g + 6].starts_with("    4. ✦ └ —  "),
+            "{:?}",
+            lines[g + 6]
+        );
+        // estilos: nombre claude-soft negrita, etiqueta gris, └ en subtle
+        let y = (g + 1) as u16;
+        let name = buf[(col(&lines[g + 1], "visual"), y)].style();
+        assert_eq!(name.fg, Some(t.claude_soft));
+        assert!(name.add_modifier.contains(Modifier::BOLD));
+        let tag = buf[(col(&lines[g + 1], "[workflow]"), y)].style();
+        assert_eq!(tag.fg, Some(t.ink_muted));
+        let y = (g + 2) as u16;
+        assert_eq!(buf[(col(&lines[g + 2], "└"), y)].style().fg, Some(t.subtle));
+        assert_eq!(
+            buf[(col(&lines[g + 2], "pintar"), y)].style().fg,
+            Some(t.ink)
+        );
+        // la línea del agente es de su fila
+        let hits = row_hits(&app);
+        let at = |y: usize| hits.iter().find(|h| h.0 as usize == y).map(|h| h.1);
+        assert_eq!(at(g + 1), Some(2), "{lines:#?}");
+        assert_eq!(at(g + 5), Some(3), "{lines:#?}");
+        // la terminada no cambia: una línea con nombre, etiqueta y tarea
+        let d = blk(&lines, "  frontend [own]  ");
+        assert!(lines[d].contains(". "), "{:?}", lines[d]);
+        assert!(
+            !lines[d - 1].trim_start().starts_with("frontend"),
+            "{lines:#?}"
+        );
+    }
+
     /// La línea del agente es de la cabeza: pulsarla abre esa fila.
     #[test]
     fn the_agent_line_of_a_chain_clicks_its_head() {
@@ -3861,17 +3938,20 @@ mod tests {
         let mut app = blocks();
         let lines = draw(&mut app, 110, 60);
         let g = pos(&lines, " station · 2 running · 1 recent ──");
-        // fila 3 con skill y now, fila 4 con now, fila 5 terminada: seguidas
-        assert!(lines[g + 1].starts_with("    3. ✦ visual"), "{lines:#?}");
-        assert_eq!(lines[g + 2], "           skill  superpowers:brainstorming");
-        assert_eq!(lines[g + 3], "           now    —");
-        assert!(lines[g + 4].starts_with("    4. ✦ backend"), "{lines:#?}");
-        assert_eq!(lines[g + 5], "           now    —");
-        assert!(lines[g + 6].starts_with("    5.   frontend"), "{lines:#?}");
+        // fila 3 (agente encima) con skill y now, fila 4 (agente encima) con
+        // now, fila 5 terminada: seguidas
+        assert_eq!(lines[g + 1], "         visual [workflow]", "{lines:#?}");
+        assert!(lines[g + 2].starts_with("    3. ✦ └ pintar"), "{lines:#?}");
+        assert_eq!(lines[g + 3], "           skill  superpowers:brainstorming");
+        assert_eq!(lines[g + 4], "           now    —");
+        assert_eq!(lines[g + 5], "         backend [own]", "{lines:#?}");
+        assert!(lines[g + 6].starts_with("    4. ✦ └ —"), "{lines:#?}");
+        assert_eq!(lines[g + 7], "           now    —");
+        assert!(lines[g + 8].starts_with("    5.   frontend"), "{lines:#?}");
         // un solo blanco, justo antes de la regla siguiente
-        assert_eq!(lines[g + 7], "", "{lines:#?}");
+        assert_eq!(lines[g + 9], "", "{lines:#?}");
         let o = pos(&lines, " otro · 1 running ──");
-        assert_eq!(o, g + 8, "{lines:#?}");
+        assert_eq!(o, g + 10, "{lines:#?}");
         // dentro de un grupo, ni un blanco
         assert!(lines[g..o - 1].iter().all(|l| !l.is_empty()), "{lines:#?}");
         // la primera regla, justo bajo la cabecera de columnas
@@ -3902,37 +3982,42 @@ mod tests {
             !lines.iter().any(|l| l.contains("~/") || l.contains("cwd")),
             "{lines:#?}"
         );
-        // la fila: nombre tras el número, etiqueta, dos espacios y la tarea
+        // en curso y sola, un racimo de uno: el agente en su línea y la
+        // fila, tras el número, con la tarea colgada de └
+        assert_eq!(lines[g + 1], "         visual [workflow]");
         assert!(
-            lines[g + 1].starts_with("    3. ✦ visual [workflow]  pintar la pantalla de activos  "),
+            lines[g + 2].starts_with("    3. ✦ └ pintar la pantalla de activos  "),
             "{:?}",
-            lines[g + 1]
+            lines[g + 2]
         );
         assert!(
-            lines[g + 1].ends_with("—      <1 min        —"),
+            lines[g + 2].ends_with("—      <1 min        —"),
             "{:?}",
-            lines[g + 1]
+            lines[g + 2]
         );
         // con skill, tres líneas: skill y now en la columna del nombre, tras
         // la guía (dos espacios en una sola)
-        assert_eq!(lines[g + 2], "           skill  superpowers:brainstorming");
-        assert_eq!(lines[g + 3], "           now    —");
+        assert_eq!(lines[g + 3], "           skill  superpowers:brainstorming");
+        assert_eq!(lines[g + 4], "           now    —");
         // sin tarea, «—»; sin skill, dos líneas
+        assert_eq!(lines[g + 5], "         backend [own]");
         assert!(
-            lines[g + 4].starts_with("    4. ✦ backend [own]  —  "),
+            lines[g + 6].starts_with("    4. ✦ └ —  "),
             "{:?}",
-            lines[g + 4]
+            lines[g + 6]
         );
         assert!(
-            lines[g + 4].ends_with("—      10 min        —"),
+            lines[g + 6].ends_with("—      10 min        —"),
             "{:?}",
-            lines[g + 4]
+            lines[g + 6]
         );
-        assert_eq!(lines[g + 5], "           now    —");
-        // la tarea larga se corta con … antes que las cifras
-        let gp = pos(&lines, "general-purpose [claude]");
+        assert_eq!(lines[g + 7], "           now    —");
+        // sin el nombre delante, la tarea larga cabe entera antes de las
+        // cifras (el corte con … lo cubre el racimo estrecho)
+        let gp = pos(&lines, "general-purpose [claude]") + 1;
         assert!(
-            lines[gp].contains("[claude]  Revisión independiente del cambio sin commitear…"),
+            lines[gp]
+                .contains("✦ └ Revisión independiente del cambio sin commitear en /Users/x/otro  "),
             "{:?}",
             lines[gp]
         );
@@ -3943,8 +4028,8 @@ mod tests {
         );
         assert_eq!(lines[gp + 1], "           now    Bash · git diff --stat");
         for (l, time) in [
-            (&lines[g + 1], "<1 min"),
-            (&lines[g + 4], "10 min"),
+            (&lines[g + 2], "<1 min"),
+            (&lines[g + 6], "10 min"),
             (&lines[gp], "1 min"),
         ] {
             // «tokens» es la última columna, pegada al borde; «time» justo antes
@@ -3959,9 +4044,10 @@ mod tests {
         let mut app = blocks();
         let lines = draw(&mut app, 110, 40);
         let buf = draw_buf(&mut app, 110, 40);
+        // en curso, el nombre y la etiqueta en la línea del agente
         let (wf, be, gp) = (
             pos(&lines, "visual [workflow]"),
-            pos(&lines, ". ✦ backend"),
+            run_of(&lines, "backend") - 1,
             pos(&lines, "general-purpose [claude]"),
         );
         // en curso, sea cual sea el tipo (paso de workflow, definido y built-in):
@@ -3975,7 +4061,7 @@ mod tests {
         assert_eq!(tag.fg, Some(t.ink_muted));
         let tag = buf[(col(&lines[gp], "[claude]"), gp as u16)].style();
         assert_eq!(tag.fg, Some(t.ink_muted));
-        let task = buf[(col(&lines[wf], "pintar"), wf as u16)].style();
+        let task = buf[(col(&lines[wf + 1], "pintar"), (wf + 1) as u16)].style();
         assert_eq!(task.fg, Some(t.ink));
         // un definido no lleva etiqueta
         assert!(!lines[be].contains("built-in") && !lines[be].contains("via"));
@@ -3993,9 +4079,9 @@ mod tests {
         let st = dbuf[(col(&dlines[d], "backend: tarea"), d as u16)].style();
         assert_eq!(st.fg, Some(t.ink_muted));
         // el tiempo, en gris también en curso
-        let y = wf as u16;
+        let y = (wf + 1) as u16;
         assert_eq!(
-            buf[(col(&lines[wf], "<1 min"), y)].style().fg,
+            buf[(col(&lines[wf + 1], "<1 min"), y)].style().fg,
             Some(t.ink_muted)
         );
         // sin fondo en ninguna celda de la lista, tampoco en la seleccionada
@@ -4030,14 +4116,14 @@ mod tests {
         assert_eq!(at(2, "agent"), Some(t.ink_muted));
         assert_eq!(at(2, "time"), Some(t.ink_muted));
         // la etiqueta de la sublínea, apagada; skill y now, en gris
-        assert_eq!(at(gy + 2, "skill"), Some(t.subtle));
-        assert_eq!(at(gy + 2, "superpowers"), Some(t.ink_muted));
-        assert_eq!(at(gy + 3, "now"), Some(t.subtle));
+        assert_eq!(at(gy + 3, "skill"), Some(t.subtle));
+        assert_eq!(at(gy + 3, "superpowers"), Some(t.ink_muted));
+        assert_eq!(at(gy + 4, "now"), Some(t.subtle));
         // sin herramienta, el guion en gris
-        assert_eq!(at(gy + 3, "—"), Some(t.ink_muted));
-        assert_eq!(at(gy + 5, "—"), Some(t.ink_muted));
+        assert_eq!(at(gy + 4, "—"), Some(t.ink_muted));
+        assert_eq!(at(gy + 7, "—"), Some(t.ink_muted));
         let gp = pos(&lines, "general-purpose [claude]");
-        assert_eq!(at(gp + 1, "Bash"), Some(t.ink_muted));
+        assert_eq!(at(gp + 2, "Bash"), Some(t.ink_muted));
     }
 
     #[test]
@@ -4074,17 +4160,18 @@ mod tests {
         );
         assert!(!lines[2].contains("tools"), "{:?}", lines[2]);
         assert!(lines[2].ends_with("time"), "{:?}", lines[2]);
-        assert!(lines[wf].ends_with("<1 min"), "{:?}", lines[wf]);
+        assert!(lines[wf + 1].ends_with("<1 min"), "{:?}", lines[wf + 1]);
         assert!(lines[gp].contains("[claude]"), "{:?}", lines[gp]);
-        assert!(lines[gp].ends_with("1 min"), "{:?}", lines[gp]);
+        assert!(lines[gp + 1].ends_with("1 min"), "{:?}", lines[gp + 1]);
         let lines = draw(&mut app, 49, 60);
         assert!(!lines
             .iter()
             .any(|l| l.contains("[workflow]") || l.contains("[claude]") || l.contains("[own]")));
-        let wf = pos(&lines, "3. ✦ visual");
-        assert!(lines[wf].starts_with("    3. ✦ visual "), "{:?}", lines[wf]);
+        let wf = run_of(&lines, "visual");
+        assert_eq!(lines[wf - 1], "         visual", "{lines:#?}");
+        assert!(lines[wf].starts_with("    3. ✦ └ "), "{:?}", lines[wf]);
         assert!(lines[wf].ends_with("<1 min"), "{:?}", lines[wf]);
-        assert!(lines.iter().any(|l| l.contains("6. ✦ general-purpose ")));
+        assert!(lines.iter().any(|l| l == "         general-purpose"));
     }
 
     #[test]
@@ -4114,7 +4201,7 @@ mod tests {
     }
 
     #[test]
-    fn a_long_name_is_cut_before_the_figures() {
+    fn a_long_name_is_cut_on_its_own_line_and_the_figures_stay() {
         let mut r = run(
             "workflow-subagent",
             STATION,
@@ -4126,13 +4213,25 @@ mod tests {
         r.description = Some("un-agente-con-un-nombre-larguisimo-de-verdad".into());
         let mut app = with_runs(fixture(), vec![r]);
         press(&mut app, KeyCode::Char('a'));
+        // en curso y sola, el nombre va en su línea, encima de la fila
         let lines = draw(&mut app, 60, 40);
-        let l = pos(&lines, "un-agente-con");
-        let l = &lines[l];
-        assert!(l.contains('…'), "{l:?}");
+        let a = pos(&lines, "un-agente-con");
+        assert_eq!(
+            lines[a], "         un-agente-con-un-nombre-larguisimo-de-verdad",
+            "sin sitio para la etiqueta, el nombre entero"
+        );
+        assert!(
+            lines[a + 1].ends_with("└ —                                          5 min"),
+            "{lines:#?}"
+        );
+        // estrecho, el nombre se corta con … y nada desborda
+        let lines = draw(&mut app, 40, 40);
+        let a = pos(&lines, "un-agente-con");
+        let l = &lines[a];
+        assert!(l.ends_with('…'), "{l:?}");
         assert!(!l.contains("via"), "{l:?}");
-        assert_eq!(width(l), 59, "{l:?}");
-        assert!(l.ends_with("…      5 min"), "{l:?}");
+        assert!(width(l) < 40, "{l:?}");
+        assert!(lines[a + 1].ends_with("5 min"), "{lines:#?}");
     }
 
     #[test]
@@ -4316,17 +4415,18 @@ mod tests {
         let mut app = busy();
         let lines = draw(&mut app, 110, 40);
         let buf = draw_buf(&mut app, 110, 40);
-        let ex = pos(&lines, "Explore [claude]");
-        let be = pos(&lines, ". ✦ backend [own]");
+        // en curso, el nombre va en la línea de su agente, sobre la fila
+        let (ex_a, be_a) = (
+            pos(&lines, "Explore [claude]"),
+            pos(&lines, " backend [own]"),
+        );
+        let (ex, be) = (ex_a + 1, be_a + 1);
         let fe = blk(&lines, "frontend");
         let wf = blk(&lines, "visual");
-        assert!(
-            lines[ex].starts_with("    3. ✦ Explore [claude]"),
-            "{:?}",
-            lines[ex]
-        );
+        assert_eq!(lines[ex_a], "         Explore [claude]", "{lines:#?}");
+        assert!(lines[ex].starts_with("    3. ✦ └ "), "{:?}", lines[ex]);
         // texto por tipo: [propio] en definidos y pasos de workflow, [claude] en built-in
-        assert!(lines[be].contains("backend [own]"), "{:?}", lines[be]);
+        assert_eq!(lines[be_a], "         backend [own]", "{lines:#?}");
         assert!(lines[fe].contains("frontend [own]"), "{:?}", lines[fe]);
         assert!(lines[wf].contains("visual [own]"));
         // ni `✻`, ni punto, ni la etiqueta vieja
@@ -4348,18 +4448,20 @@ mod tests {
         // parpadea cada medio segundo en la lista
         app.now += TimeDelta::milliseconds(500);
         let lines2 = draw(&mut app, 110, 40);
-        assert!(lines2[be].contains("✧ backend"), "{:?}", lines2[be]);
-        assert!(lines2[ex].contains("✧ Explore"), "{:?}", lines2[ex]);
+        assert!(lines2[be].contains("✧ └"), "{:?}", lines2[be]);
+        assert!(lines2[ex].contains("✧ └"), "{:?}", lines2[ex]);
         assert_eq!(lines2.iter().filter(|l| l.contains('✧')).count(), 3);
         // la etiqueta, en gris, tanto en curso como terminada
-        for (l, pat) in [(ex, "[claude]"), (be, "[own]"), (fe, "[own]")] {
+        for (l, pat) in [(ex_a, "[claude]"), (be_a, "[own]"), (fe, "[own]")] {
             let st = buf[(col(&lines[l], pat), l as u16)].style();
             assert_eq!(st.fg, Some(t.ink_muted), "{pat}");
         }
         // el nombre empieza justo tras el número; cabecera y detalles, en esa columna
-        let name = col(&lines[ex], "Explore");
+        let name = col(&lines[ex_a], "Explore");
         assert_eq!(name, 9);
-        assert_eq!(col(&lines[be], "backend"), name);
+        assert_eq!(col(&lines[be_a], "backend"), name);
+        // y el └ de una en curso, en esa misma columna
+        assert_eq!(col(&lines[ex], "└"), name);
         assert_eq!(col(&lines[fe], "frontend"), name);
         assert_eq!(col(&lines[2], "agent"), name);
         // las sublíneas, tras la guía del racimo (dos columnas)
@@ -4419,19 +4521,19 @@ mod tests {
         let head = &lines[2];
         assert!(head.ends_with("ctx        time   tokens"), "{head:?}");
         // ctx en ocho pasos (cada octavo empezado llena uno) y el porcentaje
-        let gp = pos(&lines, "general-purpose [claude]");
+        let gp = pos(&lines, "general-purpose [claude]") + 1;
         assert!(
             lines[gp].ends_with("▰▰▰▰▰▰▰▰ 92%       1 min     1.1M"),
             "{:?}",
             lines[gp]
         );
-        let be = blk(&lines, "backend");
+        let be = run_of(&lines, "backend");
         assert!(
             lines[be].ends_with("▰▰▰▰▰▰▱▱ 71%      10 min     412k"),
             "{:?}",
             lines[be]
         );
-        let wf = pos(&lines, "visual [workflow]");
+        let wf = pos(&lines, "visual [workflow]") + 1;
         assert!(
             lines[wf].ends_with("—      <1 min        —"),
             "{:?}",
@@ -6232,8 +6334,11 @@ mod tests {
         let y = y_of(&lines, be);
         assert_eq!(buf[(col(be, "×4"), y)].style().fg, Some(t.subtle));
         assert_eq!(buf[(col(be, "[own]"), y)].style().fg, Some(t.ink_muted));
-        let running = find(&lines, "✦ backend");
-        assert!(!running.contains('×'), "{running:?}");
+        // en curso y sola: su agente encima, sin ×1
+        assert!(
+            lines.iter().any(|l| l == "         backend [own]"),
+            "{lines:#?}"
+        );
         // una sola ejecución: sin contador
         let mut one = fused_app(1);
         let lines = draw(&mut one, 100, 30);
@@ -6655,16 +6760,16 @@ mod tests {
         let hits = row_hits(&app);
         let at = |y: usize| hits.iter().find(|h| h.0 as usize == y).map(|h| h.1);
         assert_eq!(at(g), None, "la regla del grupo no se pulsa");
-        // la fila con skill: fila, skill y now
-        for y in g + 1..=g + 3 {
+        // la fila con skill: agente, fila, skill y now
+        for y in g + 1..=g + 4 {
             assert_eq!(at(y), Some(2), "línea {y}: {lines:#?}");
         }
-        // la fila sin skill, dos líneas; la terminada, una
-        for y in g + 4..=g + 5 {
+        // la fila sin skill, tres líneas (agente, fila y now); la terminada, una
+        for y in g + 5..=g + 7 {
             assert_eq!(at(y), Some(3), "línea {y}: {lines:#?}");
         }
-        assert_eq!(at(g + 6), Some(4), "{lines:#?}");
-        assert_eq!(at(g + 7), None, "el blanco antes de la regla no se pulsa");
+        assert_eq!(at(g + 8), Some(4), "{lines:#?}");
+        assert_eq!(at(g + 9), None, "el blanco antes de la regla no se pulsa");
         assert_eq!(at(2), None, "la cabecera de columnas no se pulsa");
     }
 
@@ -6685,9 +6790,10 @@ mod tests {
         assert_eq!(app.scroll, live(3) + 1, "{lines:#?}");
         assert!(lines[2].starts_with("           skill"), "{lines:#?}");
         let hits = row_hits(&app);
+        // skill y now de la 3; agente, fila y now de la 4; la terminada
         assert_eq!(
-            &hits[..5],
-            &[(2, 2), (3, 2), (4, 3), (5, 3), (6, 4)],
+            &hits[..6],
+            &[(2, 2), (3, 2), (4, 3), (5, 3), (6, 3), (7, 4)],
             "{lines:#?}"
         );
     }

@@ -302,15 +302,18 @@ pub enum Item {
     /// agente real lo es) y `None` si es built-in o un workflow sin agente
     /// definido. Enter abre en cualquier caso la ficha de la ejecución
     /// (`line.id`). En curso le siguen siempre `LiveSkill` (solo si tiene
-    /// skill) y `LiveNow`: dos o tres líneas. Terminada, una sola.
+    /// skill) y `LiveNow`, y si es la primera de su racimo (o va sola) la
+    /// precede `LiveAgent`. Terminada, una sola línea.
     Live {
         n: usize,
         line: NowLine,
         row: Option<Row>,
     },
-    /// Activos: la línea del agente de un racimo (`Chain::Head`), justo
-    /// encima de su cabeza: nombre, etiqueta y `×N`, sin número ni cifras.
-    /// No se selecciona; es parte de la fila de la cabeza (scroll y clic).
+    /// Activos: la línea del agente de un racimo en curso, justo encima de
+    /// su cabeza (`Chain::Head`, o `Chain::Single` si va sola: un racimo de
+    /// uno): nombre, etiqueta y `×N` (sin él si va sola), sin número ni
+    /// cifras. No se selecciona; es parte de la fila de debajo (scroll y
+    /// clic). Las terminadas no la llevan.
     LiveAgent(NowLine),
     /// Activos: «skill …» (`line.skill`), justo bajo una fila en curso que
     /// tiene skill. No se selecciona; va siempre detrás de su `Live`.
@@ -701,7 +704,8 @@ impl App {
     /// los racimos también (`rechain`). Arriba del todo, la cabecera de
     /// columnas. Una fila en curso mide dos líneas (fila y `now`), tres si
     /// tiene skill (justo bajo la fila); una terminada, una. La cabeza de un
-    /// racimo lleva además, encima, la línea de su agente (`Item::LiveAgent`). Sin blancos
+    /// racimo en curso, y la en curso que va sola (un racimo de uno), lleva
+    /// además, encima, la línea de su agente (`Item::LiveAgent`). Sin blancos
     /// entre filas: solo un `Item::Blank` antes de la regla de cada grupo
     /// menos el primero (que no es parte de ninguna fila para el scroll). Si
     /// su agente es uno definido (`NowRun::owner`), lleva su fila para la
@@ -760,9 +764,9 @@ impl App {
                     chain: r.chain,
                 };
                 let running = line.state == RunState::Running;
-                // un racimo lleva el nombre del agente en su propia línea,
-                // encima de la cabeza
-                if matches!(line.chain, Chain::Head(_)) {
+                // en curso, el nombre del agente va en su propia línea encima
+                // de la cabeza de su racimo, aunque el racimo sea de una
+                if running && matches!(line.chain, Chain::Head(_) | Chain::Single) {
                     items.push(Item::LiveAgent(line.clone()));
                 }
                 items.push(Item::Live {
@@ -1056,7 +1060,8 @@ impl App {
     /// se vea: todo lo de encima si es la primera (columnas, regla del
     /// ranking, o la regla de grupo en activos) o su cabecera si es la primera de su sección.
     fn row_top(items: &[Item], line: usize) -> usize {
-        // la cabeza de un racimo empieza en la línea de su agente
+        // la cabeza de un racimo (o la en curso sola) empieza en la línea
+        // de su agente
         let line = match line.checked_sub(1).map(|l| &items[l]) {
             Some(Item::LiveAgent(_)) => line - 1,
             _ => line,
@@ -1076,8 +1081,9 @@ impl App {
     }
 
     /// Última línea de la fila de la línea `line`: la `now` de una fila en
-    /// curso de activos (la segunda o la tercera, según tenga skill), o ella
-    /// misma (una terminada, o cualquier fila fuera de activos).
+    /// curso de activos (una o dos líneas por debajo, según tenga skill), o
+    /// ella misma (una terminada, o cualquier fila fuera de activos). La
+    /// línea del agente, si la lleva, va por encima (`row_top`).
     fn row_end(items: &[Item], line: usize) -> usize {
         let mut end = line;
         while matches!(
@@ -2796,15 +2802,16 @@ pub(crate) mod tests {
     #[test]
     fn a_running_row_keeps_its_now_line_in_view() {
         let mut app = active(busy());
-        // Explore (3): regla de station en 5, la fila en 6 y su now en 7; con
-        // 3 de alto la vista empieza en la regla
+        // Explore (3): regla de station en 5, su agente en 6, la fila en 7 y
+        // su now en 8; con 4 de alto la vista empieza en la regla
         app.cursor = 2;
-        assert_eq!(frame(&mut app, 3), 6);
+        assert_eq!(frame(&mut app, 4), 7);
         assert_eq!(app.scroll, 5);
-        // general-purpose (7): fila en 15 y now en 16; la vista acaba en el 16
+        // general-purpose (7): agente en 18, fila en 19 y now en 20; la vista
+        // acaba en el 20
         app.cursor = 6;
-        assert_eq!(frame(&mut app, 4), 15);
-        assert_eq!(app.scroll, 13);
+        assert_eq!(frame(&mut app, 4), 19);
+        assert_eq!(app.scroll, 17);
         // y de vuelta al primero, con las columnas y su regla
         app.cursor = 0;
         assert_eq!(frame(&mut app, 4), 2);
@@ -2827,7 +2834,8 @@ pub(crate) mod tests {
         );
         // Columnas arriba y sin blancos entre filas: solo uno antes de cada
         // regla de grupo salvo la primera, nunca al final. Una terminada mide
-        // una línea; una en curso, dos (la fila y su `now`), sin skill.
+        // una línea; una en curso sola, tres (su agente encima, la fila y su
+        // `now`), sin skill.
         let shape: Vec<&str> = items
             .iter()
             .map(|i| match i {
@@ -2836,6 +2844,7 @@ pub(crate) mod tests {
                 Item::Live { .. } => "row",
                 Item::LiveSkill(_) => "skill",
                 Item::LiveNow(_) => "now",
+                Item::LiveAgent(_) => "agent",
                 Item::Blank => "blank",
                 _ => "other",
             })
@@ -2845,11 +2854,11 @@ pub(crate) mod tests {
             vec![
                 "columns", "group", "row", "row", // taskflow: 1, 2 terminadas
                 "blank", "group", // station
-                "row", "now", // 3 Explore
-                "row", "now", // 4 workflow
-                "row", "now", // 5 backend
+                "agent", "row", "now", // 3 Explore
+                "agent", "row", "now", // 4 workflow
+                "agent", "row", "now", // 5 backend
                 "row", // 6 frontend, terminada
-                "blank", "group", "row", "now", // otro: 7 general-purpose
+                "blank", "group", "agent", "row", "now", // otro: 7 general-purpose
                 "blank", "group", "row", // station/front: 8 docs, terminada
             ]
         );
@@ -2879,7 +2888,7 @@ pub(crate) mod tests {
         assert_eq!(ended(&app, 3), RunState::Running);
         assert_eq!(ended(&app, 6), ended_at("2026-11-05T11:58:00Z"));
         assert_eq!(ended(&app, 7), RunState::Running);
-        let Item::LiveNow(wf) = &items[9] else {
+        let Item::LiveNow(wf) = &items[11] else {
             panic!("segunda línea de workflow")
         };
         assert_eq!(wf.name, "workflow-subagent: tarea");
@@ -2889,7 +2898,7 @@ pub(crate) mod tests {
         assert_eq!(wf.last_tool, None);
         assert_eq!(wf.since, Some("2026-11-05T11:56:00Z".parse().unwrap()));
         assert_eq!(wf.chain, Chain::Single, "único en curso de su agente");
-        let Item::Live { line, .. } = &items[6] else {
+        let Item::Live { line, .. } = &items[7] else {
             panic!("Explore")
         };
         assert_eq!(line.kind, RunKind::BuiltIn);
@@ -3167,8 +3176,10 @@ pub(crate) mod tests {
         wf.task = Some("revisar el cruce".into());
         let mut app = active(with_runs(fixture(), vec![wf]));
         let items = app.items();
-        // taskflow (2 terminadas) va antes; el workflow abre station: la 3
-        let Item::Live { n, line, row } = &items[6] else {
+        // taskflow (2 terminadas) va antes; el workflow abre station: la 3,
+        // bajo la línea de su agente
+        assert!(matches!(items[6], Item::LiveAgent(_)));
+        let Item::Live { n, line, row } = &items[7] else {
             panic!("el workflow abre el grupo de station")
         };
         assert_eq!(*n, 3);
@@ -3395,9 +3406,11 @@ pub(crate) mod tests {
             .iter()
             .position(|i| matches!(i, Item::LiveGroup { section, .. } if section == "~/lanzadera"))
             .unwrap();
-        assert!(matches!(items[rule + 1], Item::Live { .. }));
-        assert!(matches!(items[rule + 2], Item::LiveNow(_)));
-        assert_eq!(App::row_end(&items, rule + 1), rule + 2);
+        assert!(matches!(items[rule + 1], Item::LiveAgent(_)));
+        assert!(matches!(items[rule + 2], Item::Live { .. }));
+        assert!(matches!(items[rule + 3], Item::LiveNow(_)));
+        assert_eq!(App::row_top(&items, rule + 2), rule);
+        assert_eq!(App::row_end(&items, rule + 2), rule + 3);
     }
 
     #[test]
@@ -3479,23 +3492,24 @@ pub(crate) mod tests {
     fn a_block_scrolls_into_view_with_all_its_lines_running_or_finished() {
         let mut app = active(busy());
         key(&mut app, KeyCode::Char('7'));
-        // general-purpose en la 15 y su now en la 16; su regla en la 14
-        assert_eq!(frame(&mut app, 3), 15);
+        // general-purpose en la 19, su agente en la 18 y su now en la 20; su
+        // regla en la 17
+        assert_eq!(frame(&mut app, 4), 19);
         assert_eq!(
-            app.scroll, 14,
-            "se ven la regla y las dos líneas de la fila"
+            app.scroll, 17,
+            "se ven la regla y las tres líneas de la fila"
         );
         key(&mut app, KeyCode::Char('1'));
         frame(&mut app, 3);
         assert_eq!(app.scroll, 0, "el primero arrastra la regla y las columnas");
-        // una terminada (la 6, en la 12) mide una línea
+        // una terminada (la 6, en la 15) mide una línea
         key(&mut app, KeyCode::Char('6'));
         frame(&mut app, 3);
-        assert_eq!(app.scroll, 10, "la 6 en la última línea de la vista");
-        // la última (la 8, en la 19): con la regla de su grupo (18) a la vista
+        assert_eq!(app.scroll, 13, "la 6 en la última línea de la vista");
+        // la última (la 8, en la 23): con la regla de su grupo (22) a la vista
         key(&mut app, KeyCode::Char('8'));
-        assert_eq!(frame(&mut app, 3), 19);
-        assert_eq!(app.scroll, 17);
+        assert_eq!(frame(&mut app, 3), 23);
+        assert_eq!(app.scroll, 21);
         key(&mut app, KeyCode::Home);
         frame(&mut app, 5);
         assert_eq!(app.scroll, 0);
@@ -4011,6 +4025,50 @@ pub(crate) mod tests {
         let v = vec![finished, agent, row];
         assert_eq!(App::row_top(&v, 2), 1);
         assert_eq!(App::row_end(&v, 2), 2, "sin sublíneas en este corte");
+    }
+
+    /// Una en curso sola (también la que deja sola el filtro) lleva encima
+    /// la línea de su agente, como un racimo de uno; la terminada, no.
+    #[test]
+    fn a_single_run_in_progress_has_its_agent_line_above_it_inside_its_row() {
+        let agents = |app: &App| -> Vec<(String, Chain, Option<usize>)> {
+            let items = app.items();
+            items
+                .iter()
+                .enumerate()
+                .filter_map(|(i, it)| match it {
+                    Item::LiveAgent(l) => Some((l.name.clone(), l.chain, items[i + 1].n())),
+                    _ => None,
+                })
+                .collect()
+        };
+        let app = fused();
+        assert_eq!(
+            agents(&app),
+            vec![("backend".into(), Chain::Head(2), Some(1))],
+            "ni la última del racimo ni las terminadas (frontend, sola)"
+        );
+        // el filtro deja sola la última del racimo: lleva su línea
+        let mut app = fused();
+        type_filter(&mut app, "tests");
+        assert_eq!(
+            agents(&app),
+            vec![("backend".into(), Chain::Single, Some(1))]
+        );
+        // tras otra fila, empieza en la línea de su agente y acaba en su now
+        let mut items = app.items();
+        let row = items
+            .iter()
+            .position(|i| matches!(i, Item::Live { n: 1, .. }))
+            .unwrap();
+        let finished = fused().items().pop().unwrap();
+        assert!(finished.n().is_some());
+        let block: Vec<Item> = items.drain(row - 1..=row + 1).collect();
+        assert!(matches!(block[0], Item::LiveAgent(_)));
+        assert!(matches!(block[2], Item::LiveNow(_)));
+        let v: Vec<Item> = std::iter::once(finished).chain(block).collect();
+        assert_eq!(App::row_top(&v, 2), 1);
+        assert_eq!(App::row_end(&v, 2), 3);
     }
 
     #[test]
