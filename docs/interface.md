@@ -11,9 +11,9 @@ each one for a different purpose:
 
 - **active** (default, the one that opens at startup): a live monitor of what is
   happening and what has happened in the window (`-m`). Everything is grouped by
-  project (the folder where the Claude Code session was launched), with one row
-  per agent: in each group, what is running first and, below it, what finished
-  within the window.
+  project (the folder where the Claude Code session was launched): in each
+  group, what is running first, one row per run, and, below it, what finished
+  within the window, one row per agent.
 - **all**: the catalog, every agent on disk grouped by project, with its
   history.
 - **ranking**: the agents with work in the period, from the one that worked the
@@ -23,10 +23,10 @@ each one for a different purpose:
 the ranking, it goes to active).
 
 On the right of the header: in active, `window N min · N running · N in window ·
-N sessions · N tok` (`N running` are the rows, that is, the agents, with at
-least one run in progress, and `N in window` those that finished within it,
-both without filter and counting rows, not runs; `N tok` are the tokens of the
-rows that show, with the filter applied, and is left out when 0); in all,
+N sessions · N tok` (`N running` are the runs in progress, one row each, and
+`N in window` the finished rows, one per agent, both without filter; `N tok`
+are the tokens of the rows that show, with the filter applied, and is left out
+when 0); in all,
 `window N min · N agents · N running · N sessions` (without `· N running` if
 nothing is running); in the ranking, `<period> · <total> in N runs · N tok`
 (the tokens of the period, also left out when 0). On narrow screens it drops
@@ -63,75 +63,77 @@ star is left. With a one-row body, only the first line shows.
 
 ## Active: the monitor
 
-(Excerpt of a render with made-up data, at 110 columns: two of the four groups.
-`visual` is a workflow step that is not one of your agents and has just started,
-with no token data yet, and has loaded a skill; `frontend` is a finished
-call with no run, so every figure is `—`; `general-purpose` is over 85% of its
-context, painted amber.)
+(Excerpt of a render with made-up data, at 110 columns: two of the groups.
+`docs` has three runs in progress, so they hang from its name; `frontend` in
+`station` finished with no task or tokens recorded; `Explore` finished 6 min
+ago.)
 
 ```
-  active   all   ranking                      window 10 min · 3 running · 4 in window · 4 sessions · 1.5M tok
+  active   all   ranking                      window 10 min · 4 running · 5 in window · 4 sessions · 887k tok
 
-         agent                                                               ctx   tokens   tools        time
+         agent                                                                       ctx        time   tokens
  …
- api · 2 running · 1 recent ─────────────────────────────────────────────────────────────────────────────────
-    3. ✦ visual [workflow]                                                     —        —       0      <1 min
-         skill    superpowers:brainstorming
-         now      —
-         cwd      ~/code/api/src/tui
+ station · 3 running · 1 recent ─────────────────────────────────────────────────────────────────────────────
+         docs [own] ×3
+    3. ✦ ├ Review the docs/README conventions                               ▰▰▰▰▱▱▱▱ 41%       1 min     140k
+         │ skill  superpowers:brainstorming
+         │ now    Read · docs/interface.md
+    4. ✦ ├ Check the Makefile targets                                       ▰▰▱▱▱▱▱▱ 22%       1 min     141k
+         │ now    Bash · grep -n release Makefile
+    5. ✦ └ Read contact-form.astro and cookie-table                         ▰▰▰▰▱▱▱▱ 48%       2 min     142k
+           skill  frontend-design:frontend-design
+           now    Read · src/components/contact-form.astro
+    6.   frontend [own]  —                                                             —   2 min ago        —
 
-    4. ✦ backend [own]                                                  ▰▰▰▱ 71%     412k       7      10 min
-         now      —
-         cwd      ~/code/api
-
-    5.   frontend [own]                                                        —        —       —   2 min ago
-         last     —
-         cwd      ~/code/api
-
- other · 1 running ──────────────────────────────────────────────────────────────────────────────────────────
-    6. ✦ general-purpose [claude]                                       ▰▰▰▰ 92%     1.1M      37       1 min
-         now      Bash · git diff --stat
-         cwd      ~/other
- …
+ web · 1 running · 1 recent ─────────────────────────────────────────────────────────────────────────────────
+    7. ✦ frontend [claude]  Add a LanguageSwitcher to header.tsx            ▰▰▰▰▰▰▱▱ 71%       9 min     412k
+           now    Edit · src/components/header.tsx
+    8.   Explore [claude]  Find where the locale is read                               —   6 min ago      51k
  ↑↓ move · enter details · tab mode · / filter · q quit                                                v0.1.0
 ```
 
 A single list, grouped by project and numbered continuously across all groups.
-Each **agent** is a block of three lines, or four if its run has loaded a
-skill, that counts as a single row: all its runs
-(and calls without a run) from that project within the window, plus the running
-ones, are merged into that row. A blank line separates one block from the next,
-and another one goes before each group rule except the first (never after the
-last block, never two in a row); the blank is not part of any block, so the
-cursor and the scroll still keep the whole block on screen. Above
-them, once and in gray, the column header (`agent`, `ctx`, `tokens`, `tools`,
-`time`), with the first group rule right under it. There are no sections or a
-separate timeline.
+In each group, what is running goes first, **one row per run**, and below it
+what finished within the window, **one row per agent**. A running row takes two
+lines, three if its run has loaded a skill (the row, `skill` and `now`); a
+finished row is a single line. There are no blank lines between rows: one blank
+goes before each group rule except the first, and it is not part of any row, so
+the cursor and the scroll still keep a whole row on screen. Above them, once and
+in gray, the column header (`agent`, `ctx`, `time`, `tokens`), with the first
+group rule right under it. There are no sections or a separate timeline.
 
 - **What shows.** All **running** runs, with no cap (the list scrolls), and all
   **finished** runs within the window. A finished run is one that is not
   running (an interrupted one too) and whose last step falls in the window, of
   any kind: defined agents, Claude Code agents (`general-purpose`, `Explore`…)
   and workflow steps. `Agent` calls in the window that do not link to any run
-  also show: they appear as a finished run with no steps or tools (`tools` =
-  `—`, `last` = `—`) and their task is the first clean line of the call's
-  prompt or, if there is none, its `description`. A call and its run are one
-  and the same. All are grouped by agent (see «One row per agent»).
-- **One row per agent.** The key is (project, agent). If the run resolves to a
-  defined agent, the agent is that one: a direct launch and a workflow step with
-  the same agent share a row (the `via workflow` label does not count). With no
-  defined agent, the key is (kind, name): a `visual [claude]` and a
-  `visual [workflow]` are different rows, just like an own agent and a
-  homonymous `[claude]` one. The row is represented by one run: the most
-  recent running one (by start) or, if there is none, the most recent finished
-  one; the state, time, `tools`, task, skill and `now`/`last` come from it.
-  The row is running if any of its runs is. If it groups more than one, the
-  label carries ` ×N` (see below).
-- **Order.** Within a group, running rows first (the one that started latest on
-  top, by its representative run) and then finished ones (the one that ended
-  latest on top). Groups are ordered by their most recent activity: the start of
-  their newest running row or the end of their newest finished one; on a tie,
-  by folder.
+  also show: they appear as a finished run with `—` in `ctx` and `tokens`, and
+  their task is
+  the first clean line of the call's prompt or, if there is none, its
+  `description`. A call and its run are one and the same.
+- **Who is the same agent.** The key is (project, agent). If the run resolves
+  to a defined agent, the agent is that one: a direct launch and a workflow step
+  with the same agent count as the same (the `via workflow` label does not
+  count). With no defined agent, the key is (kind, name): a `visual [claude]`
+  and a `visual [workflow]` are different agents, just like an own agent and a
+  homonymous `[claude]` one.
+- **Running: one row per run, in a chain.** Running runs are never merged. When
+  an agent has two or more running in the same group, they go together and form
+  a chain: the agent's name goes on a line of its own above them (`docs [own]
+  ×3`, with the number of runs in the chain), and each run hangs from it with
+  `├` (`└` the last one) followed by its task, so all the tasks of the chain
+  start in the same column. A lone running run carries its name on its own row
+  (`frontend [claude]  Implementa…`). An agent with runs both running and
+  finished shows in both parts of the group.
+- **Finished: one row per agent.** All the finished runs (and calls without a
+  run) of the same agent in the group merge into one row, represented by the
+  most recent one: its task and its `N min ago` come from it. If it merges more
+  than one, the label carries ` ×N` (see below).
+- **Order.** Within a group, the running chains first, the one whose newest run
+  started latest on top, and inside each chain the run that started latest on
+  top; then the finished rows, the one that ended latest on top. Groups are
+  ordered by their most recent activity: the start of their newest running run
+  or the end of their newest finished one; on a tie, by folder.
 - **Group folder**: the folder where the Claude Code session was launched (its
   first real `cwd`, see [Launch folder](how-it-works.md#launch-folder)), not the
   subagent's `cwd`, which is wherever the main agent was when it launched it and
@@ -139,58 +141,61 @@ separate timeline.
   even if they work in a subfolder or outside the project. If the launch folder
   is not known, the run's `cwd` is used.
 - **Group rule**: ` folder · N running · N recent ───`, each part only if
-  greater than 0. It counts rows (agents), not runs. The folder goes in
-  `claude-soft` and the rest in gray; if two groups have the same folder they
-  are prefixed with the parent folder, as in «all»; `global` if there is no
-  folder at all.
-- **Line 1** of a block: cursor `❯` and number; a 2-column slot for the star
-  (`✦` in `claude` if running, alternating with `✧` every half second; blank if
-  finished); the name; a gray (`ink-muted`) label saying where the agent comes
-  from (`[own]` for one of the user's own agents; `[own] via workflow` for a
-  workflow step whose `description` is one of them: `docs [own] via workflow`;
-  `[workflow]` for a workflow step that is not one of the user's agents;
-  `[claude]` for a Claude Code one) and, if the row merges more than one run,
-  ` ×N` in gray at the end of the label (`docs [own] ×5`, `docs [own] via
-  workflow ×3`, `visual [workflow] ×3`; with a single run it does not show);
-  and on the right, flush
-  to the edge, `ctx`, `tokens`, `tools` (the number only) and, last, `time`. `time` is
-  `N min` (what has worked) for running ones and `N min ago` (since the last
-  step) for finished ones. `ctx` is how full the context of the row's
-  representative run is, only while it runs: a 4-step gauge where each started
-  quarter fills a step, and the percentage (`▰▰▰▱ 71%`), amber from 85%; `—` if
-  the row is finished or there is no data yet. `tokens` is the sum of the
-  tokens of **all** the runs merged into the row, in short form, or `—` if 0
-  (see [Tokens and context](how-it-works.md#tokens-and-context)). The star slot is always reserved, so names stay aligned between
-  running and finished ones, and it is never removed for narrowness (the label
-  yields first, then the name, cut with `…`).
-- **`skill`**, right under the name and only if the run has invoked a skill:
-  the last one it loaded (`superpowers:brainstorming`), which stays until it
-  loads another (see [What is read from each
-  run](how-it-works.md#what-is-read-from-each-run)). That of the row's
-  representative run. Runs that only remain in the [history
-  cache](how-it-works.md#kept-history) have none, so they never show it.
-- **`now`** and the last tool if running (`Bash · git diff --stat`,
-  `Edit · README.md`, `Skill · superpowers:brainstorming`); **`last`** and the
-  last tool if finished. `—` in gray if the datum is missing.
-- **`cwd`**, the last line: in gray, the subagent's real working directory, with
-  `~` for the home (that of the row's representative run). It can differ from
-  the group folder if the main agent did a `cd` before launching it. It always
-  shows, with `—` if unknown.
+  greater than 0. They count the rows that follow it: `running` the running
+  runs, `recent` the finished agents. The folder goes in `claude-soft` and the
+  rest in gray; if two groups have the same folder they are prefixed with the
+  parent folder, as in «all»; `global` if there is no folder at all.
+- **The row**: cursor `❯` and number (the number in gray unless the row is
+  selected); a 2-column slot for the star (`✦` in `claude` if running,
+  alternating with `✧` every half second; blank if finished); then, on a lone
+  or finished row, the name; a gray (`ink-muted`) label saying where the agent
+  comes from (`[own]` for one of the user's own agents; `[own] via workflow`
+  for a workflow step whose `description` is one of them: `docs [own] via
+  workflow`; `[workflow]` for a workflow step that is not one of the user's
+  agents; `[claude]` for a Claude Code one) and, if the finished row merges more
+  than one run, ` ×N` in `subtle` at the end of the label (`docs [own] ×5`,
+  `docs [own] via workflow ×3`; with a single run it does not show); two spaces
+  and the task, or `—` if there is none. In a chain, `├ ` or `└ ` in `subtle`,
+  in the name's column, and the task. On the right, flush to the edge, `ctx`,
+  `time` and, last, `tokens`:
+  - `ctx` is how full the run's context is, only while it runs: an 8-step gauge
+    where each started eighth fills a step (`▰` in `claude`, `▱` in `subtle`),
+    and the percentage in gray (`▰▰▰▰▱▱▱▱ 41%`); gauge and percentage turn
+    amber from 85%. `—` if the row is finished or there is no data yet.
+  - `time` is `N min` (what the run has worked) for running rows and `N min
+    ago` (since the last step) for finished ones.
+  - `tokens` is the run's tokens, in short form; on a finished row, the sum of
+    **all** the runs merged into it; `—` if 0 (see [Tokens and
+    context](how-it-works.md#tokens-and-context)).
 
-The task does not show in the block: it is in the [run
-details](#run-details), and the `/` filter still searches it.
+  The star slot is always reserved, so names stay aligned between running and
+  finished rows, and it is never removed for narrowness.
+- **`skill`**, right under a running row and only if its run has invoked a
+  skill: the last one it loaded (`superpowers:brainstorming`), which stays until
+  it loads another (see [What is read from each
+  run](how-it-works.md#what-is-read-from-each-run)).
+- **`now`**, under every running row: the run's last tool (`Bash · git diff
+  --stat`, `Edit · README.md`, `Skill · superpowers:brainstorming`), or `—` if
+  there is none yet.
+
+Finished rows carry neither line, and the list never shows the subagent's
+`cwd`: it is in the [run details](#run-details), and the `/` filter still
+searches it.
 
 Each value goes on a single line, cut with `…` if it does not fit.
 
 Colors. The name depends only on the state, whatever the kind: running,
-`claude-soft` in bold (a `[claude]` one too); finished, plain `ink` without bold
-(an `[own]` one too), and its number also in `ink`, without tint even when
-selected. What is running is told apart by the blinking star, by the name color
-and by `N min` versus `N min ago`. The labels (`skill`, `now`/`last`, `cwd`) go
-in gray; the skill's value in `ink`, like the names, and those of `now`/`last`
-and `cwd` in gray. The `agent` column header and the lines under the name
-are indented under the name, which starts right after the star (9 columns with
-fewer than 100 runs in the list; it grows with the digits of the number).
+`claude-soft` in bold (a `[claude]` one too), with its task in `ink`; finished,
+gray (`ink-muted`), with its task in gray too. What is running is told apart by
+the blinking star, by the name color and by `N min` versus `N min ago`. The
+figures (`time`, `tokens`, the `ctx` percentage) go in gray on every row; a `—`
+in `ctx` or `tokens` goes in `subtle`. The chain's line of its own carries the name like a running
+row, without number, star or figures. The lines under a row start in the name's
+column, which comes right after the star (9 columns with fewer than 100 runs in
+the list; it grows with the digits of the number), as does the `agent` column
+header: first a 2-column guide, `│ ` in `subtle` while the chain goes on below
+(under `├`), two spaces otherwise; then the label (`skill`, `now`) in `subtle`,
+7 columns wide, and the value in gray.
 
 Who each run is:
 
@@ -213,13 +218,13 @@ read from each run](how-it-works.md#what-is-read-from-each-run)); if it could no
 extracted, it falls back to the meta's `description`, except in a workflow,
 where it stays `—`. For a call without a run, the call's own (above).
 
-Blocks narrow down: below 70 columns `ctx`, `tokens` and `tools` and their
-headers are removed together and only `time` stays, at the right edge; below
-50, the labels too (with their ` ×N`). If the whole label does not fit it is
-lost in parts, in this priority order: name > origin (`[own]`, `[workflow]`,
-`[claude]`) > ` ×N` > `via workflow` (`via workflow` drops first, then ` ×N`,
-then the origin and, if that does not fit either, nothing). The name is cut with `…` before the
-figures.
+Rows narrow down: the task is cut first, with `…`; below 70 columns `ctx` and
+`tokens` and their headers are removed together and only `time` stays, at the
+right edge; below 50, the labels too (with their ` ×N`). If the whole label
+does not fit it is lost in parts, in this priority order: name > origin
+(`[own]`, `[workflow]`, `[claude]`) > ` ×N` > `via workflow` (`via workflow`
+drops first, then ` ×N`, then the origin and, if that does not fit either,
+nothing). The name is cut with `…` before the figures.
 
 If there is nothing running or in the window, the monitor says so and points to
 the last use of any defined agent:
@@ -234,15 +239,18 @@ empty, it says `adjust the filter or press tab`.
 
 `Enter` opens the [run details](#run-details) on **any** row: running or
 finished, of any kind, and also a call without a run (a minimal screen, without
-steps and with `ended … ago`); it opens the run that represents the row. The
-other runs merged into it are browsed from the details screen with `←` `→`.
-From active, `Enter` no longer opens the agent details: only `a` inside the run
-details does, and only if it has a defined agent. The footer paints `enter
-details` dimmed only if the cursor is not on a row. The digits, the cursor and
-`↑` `↓` follow the grouped order (continuous across groups). `/` filters by
-name, group folder, `cwd` or task over all rows (running and finished); a
-group left without rows does not show and its rule counters are recomputed.
-`o` does nothing here: the order is the one above.
+steps and with `ended … ago`). A running row opens its own run; a finished one,
+the most recent of the runs it merges. From the details, `←` `→` walk the other
+runs of the chain (moving the list cursor along) or the other runs merged into
+the finished row. From active, `Enter` no longer opens the agent details: only
+`a` inside the run details does, and only if it has a defined agent. The footer
+paints `enter details` dimmed only if the cursor is not on a row. The digits,
+the cursor and `↑` `↓` follow the grouped order (continuous across groups); the
+chain's name line is not a row of its own: it belongs to the chain's first row.
+`/` filters by name, group folder, `cwd` or task over all rows (running and
+finished); a group left without rows does not show, its rule counters are
+recomputed and so are the chains (one left alone shows its name on its row
+again). `o` does nothing here: the order is the one above.
 
 ## All: the catalog
 
@@ -457,9 +465,9 @@ switches to that view.
 ## Run details
 
 `Enter` on **any** row of active (running or finished, of any kind: defined
-agent, Claude Code agent or workflow step) opens the details of the run that
-**represents** the row (the most recent running one or, if there is none, the
-most recent finished one), not those of the agent. Also on an `Agent` call with
+agent, Claude Code agent or workflow step) opens the details of the row's run
+(on a finished row, the most recent of the runs it merges), not those of the
+agent. Also on an `Agent` call with
 no linked run, which opens a minimal screen: no task (`—`), no tools, no steps
 (`—`) and with `ended … ago` in the header. The agent details open from here
 with `a`, and only if the run has a defined agent. Example of a running one that
@@ -499,8 +507,10 @@ details.)
 - **Header**: the star, the name, the origin label (the same as in the list:
   `[own]`, `[own] via workflow`, `[workflow]` or `[claude]`) and the project in
   gray; on the right,
-  `running N min · N tools · N tok`, preceded by `run i/n` in gray if the agent
-  has more than one run (`1/n` is the most recent); `· N tok` is left out when
+  `running N min · N tools · N tok`, preceded by `run i/n` in gray if the run
+  has siblings: the runs of its chain if it is running (`1/n` is the top one,
+  the one that started latest), or the runs merged into its row if it finished
+  (`1/n` is the most recent); `· N tok` is left out when
   the run has no tokens. In front of the name, the same star
   slot as the list: `✦` in `claude` alternating with `✧` every half second if
   running, blank if finished. The name follows the same state rule as the list:
@@ -562,7 +572,7 @@ details.)
   history cache · steps are not kept`.
 - **Footer**: ` esc back · ↑↓ other agent · ←→ other run · tab launched · enter
   open · pgup/pgdn steps · p parent · a agent · q quit`, each one only when it
-  applies: `←→ other run` if the row has more than one run; `tab launched` if
+  applies: `←→ other run` if the run has siblings (as in `run i/n`); `tab launched` if
   the run launched any; `enter open` with a child selected; `pgup/pgdn steps`
   unless it comes from the history cache; `p parent` if it was launched by a
   run still in the data; `a agent` if the run has a defined agent and its row
@@ -581,8 +591,9 @@ Keys inside the details:
 
 - `Esc`: go back to the run it came from (see `Enter` and `p` below), as it was
   (scroll and selection); if there is none, go back to the list, with the
-  cursor on the **row** that contains that run (whether or not it is the
-  representative one) if it is still in the list.
+  cursor on the **row** that contains that run (its own if it is running; the
+  finished row that merges it, whether or not it is the most recent one) if it
+  is still in the list.
 - `Tab` / `Shift+Tab`: select the next or previous run in «launched» (from none,
   the first or the last); past the end, none is selected. The digits select
   that number directly (two in a row make a two-digit number).
@@ -591,19 +602,21 @@ Keys inside the details:
 - `p`: opens the details of the run that launched this one, only if it was
   launched by a run still in the data.
 - `q` (and `Ctrl+C`) quits the program.
-- `←` `→` (or `h` `l`): move to the previous (older) or next (more recent) run
-  of the same agent. At the ends, or if the row has a single run, they do
-  nothing. The list cursor does not move and the steps go back to the first
-  line. Sibling runs are computed over the unfiltered groups: what is typed in
-  `/` does not trim them.
-- `↑` `↓` (or `k` `j`): move to the previous or next row of the list (another
-  agent; running and finished), in grouped order, and open its representative
-  run; at the ends it does not move.
+- `←` `→` (or `h` `l`): move to the previous (older) or next (more recent)
+  sibling run: in a running one, through its chain, in the order of the list
+  (`←` goes down, `→` up), and the list cursor follows to that run's row; in a
+  finished one, through the runs merged into its row, and the cursor does not
+  move. At the ends, or without siblings, they do nothing. The steps go back to
+  the first line. Siblings are computed over the unfiltered groups: what is
+  typed in `/` does not trim them.
+- `↑` `↓` (or `k` `j`): move to the previous or next row of the list (running
+  and finished), in grouped order, and open its run; at the ends it does not
+  move.
 - `PageUp`, `PageDown` or `space` (one page), `Home`/`g`, `End`/`G`: scroll the
   steps; `End` leaves the last page full.
 - `a`: opens the agent details, only if the run has a defined agent and its row
-  is still in the list; it also works from a run that is not the representative
-  one.
+  is still in the list; it also works from a merged run that is not the most
+  recent one.
 - `/`, `o`, `r`, the mouse wheel and clicks are ignored.
 
 Opening a launched run (`Enter`) or the parent (`p`) stacks the open one, so
@@ -612,7 +625,7 @@ Opening a launched run (`Enter`) or the parent (`p`) stacks the open one, so
 launched run disappears, the selection moves to the last one left.
 
 The details refresh with the usual 2 s cycle and stay on the **same** run even
-if, when the data changes, the row's representative becomes another. If the run
+if, when the data changes, a finished row comes to be represented by another. If the run
 ends with the details open, they **do not close**: they keep the last snapshot
 and `ended N min ago`; if it disappears from disk, they keep the last snapshot.
 Even so, it becomes a finished run: on going back, the cursor follows it as long
@@ -628,12 +641,12 @@ longer follows it.
 | mouse wheel | Moves the view 3 lines; if the cursor ends up outside, it drags it |
 | left click | On a tab of the top row, switches to that view (and closes the agent details if open). On a list row, selects it; on the row already selected, does the same as `Enter`. See [mouse](#mouse) |
 | digits | Jumps to that numbered line (agents, folded groups and active rows); two in a row make a two-digit number. In a run's details, selects that launched run |
-| `Enter` | In all and ranking, opens the agent details, or unfolds/folds an unused group. In active, on any row (running, finished or call without a run), opens the details of the run that represents it. In any details screen, goes back (in a run's, with the cursor on its row; with a launched run selected, it opens that one) |
+| `Enter` | In all and ranking, opens the agent details, or unfolds/folds an unused group. In active, on any row (running, finished or call without a run), opens the details of its run (on a finished row, the most recent one it merges). In any details screen, goes back (in a run's, with the cursor on its row; with a launched run selected, it opens that one) |
 | `Esc` | In any details screen, goes back (in a run's, first to the runs opened from it) |
 | `/` | Filters by name or project (in active, by name, group folder, `cwd` or task, over all rows) as you type; `Enter` fixes the filter, `Esc` removes it |
 | `Tab` | Cycles active → all → ranking. In a run's details, selects the next launched run (`Shift+Tab`, the previous one) |
 | `a` | Toggles active and all. In a run's details, opens the agent's (only if it has one) |
-| `←` `→` (or `h` `l`) | Only in a run's details: the previous (older) or next (more recent) run of the same agent |
+| `←` `→` (or `h` `l`) | Only in a run's details: the previous (older) or next (more recent) run of its chain, or of those merged into its finished row |
 | `o` | In all, order within groups: recent or worked |
 | `p` | In the ranking, period: 7 days → 30 days → all time. In a run's details, opens the run that launched it (if it is still in the data) |
 | `s` | In the ranking, sort key: time worked → tokens → runs |
@@ -664,8 +677,9 @@ The screen captures the mouse so the wheel and the left click work:
 - **Click on a row**: moves the cursor to it. A click on the row the cursor is
   already on opens it, exactly like `Enter`: the agent details, the run details
   in active, or unfolds/folds a group. There is no double click: it is two
-  separate clicks. In active, any of the lines of a block (the name, `skill`,
-  `now`/`last` and `cwd`) counts as its row; section headers, blank lines and
+  separate clicks. In active, any of the lines of a row (the row itself,
+  `skill` and `now`, and a chain's name line, which counts as the chain's first
+  row) counts as that row; group rules, the column header, blank lines and
   notes do not respond.
 - With the agent details open only the tabs respond; with the run details open
   or while typing the filter (`/`), clicks do nothing.

@@ -230,8 +230,8 @@ It decides three things, falling back to the `cwd` when it is not known:
 - the project in the [run details](interface.md#run-details) header, which adds
   a `cwd` line when the subagent's differs.
 
-The subagent's own `cwd` is kept apart: it is the fourth line of each active
-block and what the agent details' runs list shows.
+The subagent's own `cwd` is kept apart: the active list does not show it, but
+`/` searches it there, and it is what the agent details' runs list shows.
 
 ## Kept history
 
@@ -354,16 +354,16 @@ it off the network, set `CLAUDE_AGENTS_NO_UPDATE_CHECK=1` and do not run
   long tool) shows as interrupted until it writes again. A workflow run, whose
   meta carries no `finished`, stops showing as running after 2 min without
   writing, and keeps showing for up to 2 min after finishing.
-- Active merges the runs of the same agent in a project into a single row: they
-  can only be seen one by one from the details, with `←` `→`, and the counters
-  in the header and in the rules count rows, not runs. An own agent and a
-  `[claude]` one with the same name, or a `visual [workflow]`, are different
-  rows. The window (`-m`) decides which runs get in: one
-  older than it does not count in the `×N`.
+- Active merges the finished runs of the same agent in a project into a single
+  row: they can only be seen one by one from the details, with `←` `→`, and the
+  `recent` and `in window` counters count those rows, not runs (running runs
+  get a row each). An own agent and a `[claude]` one with the same name, or a
+  `visual [workflow]`, are different rows. The window (`-m`) decides which runs
+  get in: one older than it does not count in the `×N`.
 - Old calls, from before Claude Code stored one transcript per run, have no run
   of their own: they add no time or days, and in the details they only count in
   `+ N old calls with no recorded duration`. If they fall within the window, the
-  active monitor does show them, as a finished run without tools (merged with
+  active monitor does show them, as a finished run with no figures (merged with
   those of its agent).
 - Claude Code agents (`general-purpose`, `Explore`, `fork`…) have no definition
   on disk and do not show in all or in the ranking, even if they have runs. They

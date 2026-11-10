@@ -7,7 +7,6 @@ use crate::runs::{Run, ToolStep};
 use crate::transcripts::Invocation;
 use chrono::{DateTime, NaiveDate, TimeDelta, TimeZone, Utc};
 use std::cmp::Ordering;
-use std::collections::HashMap;
 use std::ops::AddAssign;
 use std::path::{Path, PathBuf};
 
@@ -356,6 +355,23 @@ pub enum RunState {
     Done { ended: DateTime<Utc> },
 }
 
+/// Posición de una fila en curso dentro del racimo de su agente: las
+/// ejecuciones en curso de un mismo agente en un proyecto van contiguas, la
+/// que empezó más tarde arriba. La vista pinta el nombre solo en la cabeza
+/// (con ` ×N`) y `├─`/`└─` en las demás.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Chain {
+    /// Sola: el agente tiene una única ejecución en curso en el grupo, o la
+    /// fila está terminada (las terminadas nunca forman racimo).
+    Single,
+    /// La primera de un racimo de N ≥ 2 ejecuciones en curso (N = el campo).
+    Head(usize),
+    /// Ni la primera ni la última de su racimo.
+    Middle,
+    /// La última de su racimo.
+    Last,
+}
+
 /// Contexto ocupado por el último mensaje de una ejecución sobre su ventana.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Context {
@@ -424,17 +440,21 @@ pub struct NowRun<'a> {
     /// En curso o terminada (y cuándo terminó).
     pub state: RunState,
     /// Cuántas ejecuciones (o llamadas sin ejecución) representa la fila (≥ 1).
-    /// Fuera de `active_groups` vale 1.
+    /// Una fila en curso es siempre UNA ejecución (1); solo las terminadas de
+    /// `active_groups` funden las de su agente. Fuera de `active_groups` vale 1.
     pub runs: usize,
-    /// Los ids de todas ellas, de la más reciente a la más antigua; la primera
-    /// es `id`, la que representa a la fila.
+    /// Los ids de las ejecuciones de la fila, de la más reciente a la más
+    /// antigua; la primera es `id`. En una fila en curso, solo `[id]`.
     pub run_ids: Vec<String>,
-    /// `Tokens::total` sumado sobre TODAS las ejecuciones de la fila (las de
-    /// `run_ids`); las llamadas sin ejecución suman 0.
+    /// `Tokens::total` sumado sobre las ejecuciones de la fila (las de
+    /// `run_ids`; en curso, la suya); las llamadas sin ejecución suman 0.
     pub tokens: u64,
-    /// Contexto de la ejecución representante mientras está en curso; `None`
-    /// si la fila está terminada o aún no hay ningún mensaje con uso.
+    /// Contexto de la ejecución mientras está en curso; `None` si la fila
+    /// está terminada o aún no hay ningún mensaje con uso.
     pub context: Option<Context>,
+    /// Posición en el racimo de su agente (`Chain`); `Single` en las
+    /// terminadas y fuera de `active_groups`.
+    pub chain: Chain,
 }
 
 /// Identificador estable de una ejecución: su `tool_use_id` si lo tiene; los
@@ -680,10 +700,11 @@ fn now_run<'a>(agents: &'a [Agent], r: &'a Run, now: DateTime<Utc>) -> NowRun<'a
         run_ids: vec![run_id(r)],
         tokens: r.usage.tokens.total(),
         context: Context::of(&r.usage),
+        chain: Chain::Single,
     }
 }
 
-/// Las ejecuciones en curso de un proyecto.
+/// Lo activo de un proyecto: en curso y terminado en la ventana.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveGroup<'a> {
     /// Clave del grupo, como `Row::section`: «global» sin carpeta, o
@@ -691,12 +712,15 @@ pub struct LiveGroup<'a> {
     /// acortado con `~`. Su nombre corto y la desambiguación entre carpetas
     /// iguales son de la vista (`short_project`/`group_title`).
     pub section: String,
-    /// Cuántas FILAS (agentes) en curso hay en el grupo.
+    /// Cuántas filas en curso hay en el grupo: una por ejecución en curso.
     pub running: usize,
-    /// Cuántas filas terminadas en la ventana: `running + recent == lines.len()`.
+    /// Cuántas filas terminadas en la ventana (una por agente):
+    /// `running + recent == lines.len()`.
     pub recent: usize,
-    /// Una fila por agente: primero las en curso (por el inicio de su ejecución
-    /// representante, la más tardía primero) y luego las terminadas (por `ended`).
+    /// Primero las en curso, una por ejecución, en racimos contiguos por
+    /// agente (`NowRun::chain`; el racimo con el inicio más tardío arriba y,
+    /// dentro, la más tardía primero); luego las terminadas, una por agente,
+    /// por `ended` (la más tardía primero).
     pub lines: Vec<NowRun<'a>>,
     /// Suma de `NowRun::tokens` de sus filas.
     pub tokens: u64,
@@ -728,16 +752,27 @@ fn agent_key<'a>(l: &NowRun<'a>) -> AgentKey<'a> {
     }
 }
 
-/// Los ids de las ejecuciones de la fila que contiene `id`, de la más reciente
-/// a la más antigua (para saltar entre ellas en la ficha). Vacío si ninguna
-/// fila lo contiene.
+/// Los ids entre los que salta la ficha (←→) desde la fila que contiene `id`:
+/// en una fila en curso, los de su racimo (las en curso del mismo agente en el
+/// grupo) en el orden de la pantalla; en una terminada, sus `run_ids`, de la
+/// más reciente a la más antigua. Vacío si ninguna fila lo contiene.
 pub fn sibling_ids(groups: &[LiveGroup], id: &str) -> Vec<String> {
-    groups
-        .iter()
-        .flat_map(|g| &g.lines)
-        .find(|l| l.run_ids.iter().any(|r| r == id))
-        .map(|l| l.run_ids.clone())
-        .unwrap_or_default()
+    for g in groups {
+        let Some(line) = g.lines.iter().find(|l| l.run_ids.iter().any(|r| r == id)) else {
+            continue;
+        };
+        if line.state != RunState::Running {
+            return line.run_ids.clone();
+        }
+        let key = agent_key(line);
+        return g
+            .lines
+            .iter()
+            .filter(|l| l.state == RunState::Running && agent_key(l) == key)
+            .map(|l| l.id.clone())
+            .collect();
+    }
+    Vec::new()
 }
 
 /// Clave de grupo de una línea (`NowRun::group_dir`): como `Row::section`.
@@ -784,6 +819,7 @@ fn lone_call_line<'a>(agents: &'a [Agent], c: &'a Invocation) -> NowRun<'a> {
         run_ids: vec![call_id(c)],
         tokens: 0,
         context: None,
+        chain: Chain::Single,
     }
 }
 
@@ -792,10 +828,17 @@ fn lone_call_line<'a>(agents: &'a [Agent], c: &'a Invocation) -> NowRun<'a> {
 /// (definidas, built-in, workflow) y las llamadas `Agent` de la ventana sin
 /// ejecución enlazada (`run_of`); una llamada y su ejecución son una sola línea.
 ///
-/// Orden garantizado: dentro de cada grupo, las en curso por inicio (la más
-/// tardía primero) y luego las terminadas por `ended` (la más tardía primero);
-/// los grupos, por su actividad más reciente (inicio de la en curso más nueva o
-/// `ended` de la terminada más nueva); a igualdad, por `section`.
+/// Cada ejecución en curso es su propia fila, nunca fundida; las terminadas
+/// (y llamadas sin ejecución) de un mismo agente en un proyecto se funden en
+/// una fila. Un agente con ejecuciones en curso y terminadas sale en ambas
+/// partes.
+///
+/// Orden garantizado dentro de cada grupo: primero las en curso, en racimos
+/// contiguos por agente (`Chain`): los racimos por el inicio más tardío de sus
+/// ejecuciones y, dentro, por inicio (la más tardía primero; a igualdad, por
+/// id). Luego las terminadas por `ended` (la más tardía primero). Los grupos,
+/// por su actividad más reciente (inicio de la en curso más nueva o `ended` de
+/// la terminada más nueva); a igualdad, por `section`.
 pub fn active_groups<'a>(
     agents: &'a [Agent],
     calls: &'a [Invocation],
@@ -804,82 +847,126 @@ pub fn active_groups<'a>(
     now: DateTime<Utc>,
     home: &Path,
 ) -> Vec<LiveGroup<'a>> {
-    let mut lines: Vec<NowRun<'a>> = runs
-        .iter()
-        .filter_map(|r| {
-            if r.in_progress(now) {
-                return Some(now_run(agents, r, now));
-            }
-            let ended = r.last.or(r.start).filter(|at| *at >= since)?;
-            Some(NowRun {
+    let mut live: Vec<NowRun<'a>> = Vec::new();
+    let mut done: Vec<NowRun<'a>> = Vec::new();
+    for r in runs {
+        if r.in_progress(now) {
+            live.push(now_run(agents, r, now));
+        } else if let Some(ended) = r.last.or(r.start).filter(|at| *at >= since) {
+            done.push(NowRun {
                 state: RunState::Done { ended },
                 context: None,
                 ..now_run(agents, r, now)
-            })
-        })
-        .collect();
-    lines.extend(
+            });
+        }
+    }
+    done.extend(
         calls
             .iter()
             .filter(|c| c.at >= since && run_of(c, runs).is_none())
             .map(|c| lone_call_line(agents, c)),
     );
-    // la clave de orden dentro del grupo: en curso antes que terminadas
-    let key = |l: &NowRun| match l.state {
-        RunState::Running => (0, l.since),
-        RunState::Done { ended } => (1, Some(ended)),
-    };
-    let activity = |l: &NowRun| match l.state {
-        RunState::Running => l.since,
+    let ended_of = |l: &NowRun| match l.state {
         RunState::Done { ended } => Some(ended),
+        RunState::Running => l.since,
     };
-    lines.sort_by(|a, b| {
-        let (ka, kb) = (key(a), key(b));
-        ka.0.cmp(&kb.0).then(kb.1.cmp(&ka.1))
-    });
-    let mut groups: Vec<(LiveGroup<'a>, Option<DateTime<Utc>>)> = Vec::new();
-    // fila de cada (proyecto, agente): índices de grupo y de línea
-    let mut rows: HashMap<(String, AgentKey<'a>), (usize, usize)> = HashMap::new();
-    for line in lines {
-        let section = section_of(line.group_dir, home);
-        // `lines` ya va ordenada, así que la primera de cada agente es la
-        // que lo representa y las demás solo suman a `runs`/`run_ids`
-        let key = (section.clone(), agent_key(&line));
-        if let Some(&(gi, li)) = rows.get(&key) {
-            let g = &mut groups[gi].0;
-            g.tokens += line.tokens;
-            let row = &mut g.lines[li];
-            row.runs += 1;
-            row.tokens += line.tokens;
-            row.run_ids.extend(line.run_ids);
-            continue;
-        }
-        let act = activity(&line);
-        let running = usize::from(line.state == RunState::Running);
-        let idx = match groups.iter().position(|(g, _)| g.section == section) {
+
+    // por proyecto: racimos en curso por agente, filas terminadas y la
+    // actividad más reciente
+    struct Acc<'a> {
+        clusters: Vec<(AgentKey<'a>, Vec<NowRun<'a>>)>,
+        done: Vec<NowRun<'a>>,
+        latest: Option<DateTime<Utc>>,
+    }
+    /// El índice del proyecto `section` en `acc`, creándolo si no está.
+    fn slot(acc: &mut Vec<(String, Acc<'_>)>, section: String) -> usize {
+        match acc.iter().position(|(s, _)| *s == section) {
             Some(i) => i,
             None => {
-                groups.push((
-                    LiveGroup {
-                        section,
-                        running: 0,
-                        recent: 0,
-                        lines: Vec::new(),
-                        tokens: 0,
+                acc.push((
+                    section,
+                    Acc {
+                        clusters: Vec::new(),
+                        done: Vec::new(),
+                        latest: None,
                     },
-                    None,
                 ));
-                groups.len() - 1
+                acc.len() - 1
             }
-        };
-        rows.insert(key, (idx, groups[idx].0.lines.len()));
-        let (g, latest) = &mut groups[idx];
-        g.running += running;
-        g.recent += 1 - running;
-        g.tokens += line.tokens;
-        *latest = (*latest).max(act);
-        g.lines.push(line);
+        }
     }
+    let mut acc: Vec<(String, Acc<'a>)> = Vec::new();
+
+    for line in live {
+        let gi = slot(&mut acc, section_of(line.group_dir, home));
+        let a = &mut acc[gi].1;
+        a.latest = a.latest.max(line.since);
+        let key = agent_key(&line);
+        match a.clusters.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, c)) => c.push(line),
+            None => a.clusters.push((key, vec![line])),
+        }
+    }
+
+    // las terminadas, de la más reciente a la más antigua: la primera de cada
+    // agente representa a la fila y las demás solo suman a `runs`/`run_ids`
+    done.sort_by_key(|l| std::cmp::Reverse(ended_of(l)));
+    for line in done {
+        let gi = slot(&mut acc, section_of(line.group_dir, home));
+        let a = &mut acc[gi].1;
+        a.latest = a.latest.max(ended_of(&line));
+        let key = agent_key(&line);
+        match a.done.iter_mut().find(|row| agent_key(row) == key) {
+            Some(row) => {
+                row.runs += 1;
+                row.tokens += line.tokens;
+                row.run_ids.extend(line.run_ids);
+            }
+            None => a.done.push(line),
+        }
+    }
+
+    let mut groups: Vec<(LiveGroup<'a>, Option<DateTime<Utc>>)> = acc
+        .into_iter()
+        .map(|(section, mut a)| {
+            for (_, c) in &mut a.clusters {
+                c.sort_by(|x, y| y.since.cmp(&x.since).then_with(|| x.id.cmp(&y.id)));
+            }
+            // tras ordenar cada racimo, su primera es la de inicio más tardío
+            a.clusters.sort_by(|(_, x), (_, y)| {
+                y[0].since
+                    .cmp(&x[0].since)
+                    .then_with(|| x[0].id.cmp(&y[0].id))
+            });
+            let mut lines: Vec<NowRun<'a>> = Vec::new();
+            for (_, c) in a.clusters {
+                let n = c.len();
+                for (i, mut l) in c.into_iter().enumerate() {
+                    l.chain = match (n, i) {
+                        (1, _) => Chain::Single,
+                        (_, 0) => Chain::Head(n),
+                        (_, i) if i + 1 == n => Chain::Last,
+                        _ => Chain::Middle,
+                    };
+                    lines.push(l);
+                }
+            }
+            let running = lines.len();
+            let recent = a.done.len();
+            lines.extend(a.done);
+            let tokens = lines.iter().map(|l| l.tokens).sum();
+            (
+                LiveGroup {
+                    section,
+                    running,
+                    recent,
+                    lines,
+                    tokens,
+                },
+                a.latest,
+            )
+        })
+        .collect();
     groups.sort_by(|(a, la), (b, lb)| lb.cmp(la).then_with(|| a.section.cmp(&b.section)));
     groups.into_iter().map(|(g, _)| g).collect()
 }
@@ -1210,6 +1297,7 @@ mod tests {
                 ],
                 tokens: 0,
                 context: None,
+                chain: Chain::Single,
             }
         );
         // 15 min hasta su última línea a las 11:55 y 4 más hasta ahora
@@ -1383,8 +1471,8 @@ mod tests {
             .iter()
             .map(|g| (g.section.as_str(), g.running, g.recent))
             .collect();
-        // por filas: los dos `docs` de ~/app (en curso y terminado) son una
-        assert_eq!(got, vec![("~/app", 2, 1), ("~/otro", 0, 1)]);
+        // el `docs` en curso y el terminado de ~/app son dos filas
+        assert_eq!(got, vec![("~/app", 2, 2), ("~/otro", 0, 1)]);
         let lines: Vec<_> = groups[0]
             .lines
             .iter()
@@ -1394,7 +1482,7 @@ mod tests {
             lines,
             vec![
                 ("general-purpose", RunState::Running, 1),
-                ("docs", RunState::Running, 2),
+                ("docs", RunState::Running, 1),
                 (
                     "Explore",
                     RunState::Done {
@@ -1402,10 +1490,16 @@ mod tests {
                     },
                     1
                 ),
+                (
+                    "docs",
+                    RunState::Done {
+                        ended: t("2026-11-05T11:15:00Z")
+                    },
+                    1
+                ),
             ]
         );
-        assert_eq!(groups[0].lines[1].run_ids.len(), 2);
-        assert_eq!(groups[0].lines[1].run_ids[1], "toolu_old");
+        assert_eq!(groups[0].lines[3].run_ids, vec!["toolu_old"]);
         assert_eq!(groups[0].lines[2].kind, RunKind::BuiltIn);
         assert_eq!(groups[1].lines[0].task, Some("revisa"));
     }
@@ -1467,9 +1561,11 @@ mod tests {
         let groups = active_groups(&agents, &calls, &runs, since, now, home());
         assert_eq!(groups.len(), 1);
         let g = &groups[0];
-        assert_eq!((g.running, g.recent, g.lines.len()), (1, 1, 2));
-        assert_eq!((g.lines[0].runs, g.lines[0].name), (2, "docs"));
-        let lone = &g.lines[1];
+        // la en curso arriba; la terminada de `docs` (11:42) y la llamada suelta debajo
+        assert_eq!((g.running, g.recent, g.lines.len()), (1, 2, 3));
+        assert_eq!((g.lines[0].runs, g.lines[0].name), (1, "docs"));
+        assert_eq!(g.lines[1].run_ids, vec!["toolu_1"]);
+        let lone = &g.lines[2];
         assert_eq!(lone.id, "toolu_perdido");
         assert_eq!(
             (lone.name, lone.kind, lone.owner),
@@ -1492,7 +1588,7 @@ mod tests {
             (TimeDelta::zero(), 0, None, None, 0)
         );
         assert_eq!(lone.cwd, Some(Path::new("/Users/x/app")));
-        assert_eq!(g.lines[0].run_ids, vec!["toolu_vivo", "toolu_1"]);
+        assert_eq!(g.lines[0].run_ids, vec!["toolu_vivo"]);
     }
 
     #[test]
@@ -1851,11 +1947,11 @@ mod tests {
     }
 
     #[test]
-    fn a_running_and_a_finished_run_of_one_agent_are_one_running_row() {
+    fn a_running_and_a_finished_run_of_one_agent_are_two_rows() {
         let now = t("2026-11-05T12:00:00Z");
         let since = t("2026-11-05T11:00:00Z");
         let agents = defined();
-        // la terminada es más reciente por `ended`, pero la fila la representa la en curso
+        // la terminada es más reciente por `ended`, pero la en curso va arriba
         let done = at_app(run("docs", None, "2026-11-05T11:20:00Z", 38), "toolu_done");
         let mut live = at_app(running("docs", "2026-11-05T11:10:00Z", 45), "toolu_live");
         live.tools = 9;
@@ -1865,15 +1961,26 @@ mod tests {
         let runs = [done, live];
         let groups = active_groups(&agents, &[], &runs, since, now, home());
         let l = &groups[0].lines[0];
-        // la skill es la de la representante (la en curso), no la de la terminada
+        // cada fila con su propia skill
         assert_eq!(l.skill, Some("superpowers:brainstorming"));
-        assert_eq!(groups[0].lines.len(), 1);
-        assert_eq!((groups[0].running, groups[0].recent), (1, 0));
+        assert_eq!(groups[0].lines.len(), 2);
+        assert_eq!((groups[0].running, groups[0].recent), (1, 1));
         assert_eq!(
-            (l.state, l.runs, l.id.as_str(), l.tools),
-            (RunState::Running, 2, "toolu_live", 9)
+            (l.state, l.runs, l.id.as_str(), l.tools, l.chain),
+            (RunState::Running, 1, "toolu_live", 9, Chain::Single)
         );
-        assert_eq!(l.run_ids, vec!["toolu_live", "toolu_done"]);
+        assert_eq!(l.run_ids, vec!["toolu_live"]);
+        let d = &groups[0].lines[1];
+        assert_eq!(
+            (d.runs, d.id.as_str(), d.skill, d.chain),
+            (
+                1,
+                "toolu_done",
+                Some("superpowers:writing-plans"),
+                Chain::Single
+            )
+        );
+        assert_eq!(d.run_ids, vec!["toolu_done"]);
     }
 
     #[test]
@@ -1941,14 +2048,129 @@ mod tests {
         ];
         let groups = active_groups(&agents, &calls, &runs, since, now, home());
         let g = &groups[0];
-        assert_eq!((g.running, g.recent, g.lines.len()), (1, 2, 3));
+        // docs en curso; terminadas: Explore (llamada), backend, docs (2 fundidas)
+        assert_eq!((g.running, g.recent, g.lines.len()), (1, 3, 4));
         assert_eq!(g.running + g.recent, g.lines.len());
-        // un id que ya no representa a la fila sigue dando los hermanos
-        assert_eq!(
-            sibling_ids(&groups, "toolu_2"),
-            vec!["toolu_1", "toolu_3", "toolu_2"]
-        );
+        // un id que ya no representa a la fila sigue dando los hermanos terminados
+        assert_eq!(sibling_ids(&groups, "toolu_2"), vec!["toolu_3", "toolu_2"]);
+        // la en curso sola no arrastra a las terminadas de su agente
+        assert_eq!(sibling_ids(&groups, "toolu_1"), vec!["toolu_1"]);
         assert!(sibling_ids(&groups, "nope").is_empty());
+    }
+
+    /// Una ejecución en curso en ~/app con su id, encargo, skill y uso propios.
+    fn live_at_app(agent_type: &str, start: &str, mins: i64, id: &str, n: u64) -> Run {
+        let mut r = at_app(running(agent_type, start, mins), id);
+        r.task = Some(format!("encargo {id}"));
+        r.skill = Some(format!("skill-{id}"));
+        r.last_tool = Some(format!("Bash · {id}"));
+        r.tools = n as usize;
+        r.usage = usage(n * 100, Some(n * 1_000));
+        r
+    }
+
+    #[test]
+    fn running_runs_are_one_row_each_in_contiguous_clusters_per_agent() {
+        let now = t("2026-11-05T12:00:00Z");
+        let since = t("2026-11-05T11:00:00Z");
+        let agents = defined();
+        let mut d3 = live_at_app("docs", "2026-11-05T11:46:00Z", 10, "d3", 3);
+        // otro `cwd` (un `cd` dentro de la sesión): sigue en el grupo de su lanzamiento
+        d3.launch_dir = Some("/Users/x/app".into());
+        d3.cwd = Some("/Users/x/app/front".into());
+        let runs = [
+            live_at_app("docs", "2026-11-05T11:40:00Z", 15, "d1", 1),
+            live_at_app("general-purpose", "2026-11-05T11:55:00Z", 1, "g1", 4),
+            live_at_app("docs", "2026-11-05T11:50:00Z", 5, "d2", 2),
+            live_at_app("Explore", "2026-11-05T11:20:00Z", 35, "e2", 5),
+            d3,
+            live_at_app("backend", "2026-11-05T11:30:00Z", 25, "b1", 6),
+            live_at_app("Explore", "2026-11-05T11:52:00Z", 3, "e1", 7),
+            // dos terminadas de `docs`: una sola fila debajo
+            at_app(run("docs", None, "2026-11-05T11:01:00Z", 4), "dd1"),
+            at_app(run("docs", None, "2026-11-05T11:06:00Z", 2), "dd2"),
+        ];
+        let groups = active_groups(&agents, &[], &runs, since, now, home());
+        assert_eq!(groups.len(), 1);
+        let g = &groups[0];
+        let rows: Vec<_> = g
+            .lines
+            .iter()
+            .map(|l| {
+                (
+                    l.id.as_str(),
+                    l.name,
+                    l.state == RunState::Running,
+                    l.chain,
+                    l.runs,
+                )
+            })
+            .collect();
+        // racimos por su inicio más tardío: g1 11:55, Explore 11:52, docs 11:50, backend 11:30
+        assert_eq!(
+            rows,
+            vec![
+                ("g1", "general-purpose", true, Chain::Single, 1),
+                ("e1", "Explore", true, Chain::Head(2), 1),
+                ("e2", "Explore", true, Chain::Last, 1),
+                ("d2", "docs", true, Chain::Head(3), 1),
+                ("d3", "docs", true, Chain::Middle, 1),
+                ("d1", "docs", true, Chain::Last, 1),
+                ("b1", "backend", true, Chain::Single, 1),
+                ("dd2", "docs", false, Chain::Single, 2),
+            ]
+        );
+        // cada en curso con lo suyo
+        let d3 = &g.lines[4];
+        assert_eq!(d3.run_ids, vec!["d3"]);
+        assert_eq!(
+            (d3.task, d3.skill, d3.last_tool, d3.tools, d3.tokens),
+            (
+                Some("encargo d3"),
+                Some("skill-d3"),
+                Some("Bash · d3"),
+                3,
+                300
+            )
+        );
+        assert_eq!(d3.context.map(|c| c.used), Some(3_000));
+        assert_eq!(d3.cwd, Some(Path::new("/Users/x/app/front")));
+        // 10 min hasta su última línea a las 11:56 y 4 más hasta ahora
+        assert_eq!(d3.worked, mins(14));
+        assert!(g
+            .lines
+            .iter()
+            .filter(|l| l.state == RunState::Running)
+            .all(|l| l.run_ids == vec![l.id.clone()]));
+        // la terminada funde las dos
+        assert_eq!(g.lines[7].run_ids, vec!["dd2", "dd1"]);
+        assert_eq!((g.running, g.recent), (7, 1));
+        assert_eq!(g.running + g.recent, g.lines.len());
+        assert_eq!(g.tokens, g.lines.iter().map(|l| l.tokens).sum::<u64>());
+        assert_eq!(g.tokens, 2_800);
+        // ←→ en la ficha: el racimo en su orden, o los fundidos de la terminada
+        assert_eq!(sibling_ids(&groups, "d1"), vec!["d2", "d3", "d1"]);
+        assert_eq!(sibling_ids(&groups, "e2"), vec!["e1", "e2"]);
+        assert_eq!(sibling_ids(&groups, "g1"), vec!["g1"]);
+        assert_eq!(sibling_ids(&groups, "dd1"), vec!["dd2", "dd1"]);
+    }
+
+    #[test]
+    fn running_rows_of_one_agent_in_two_projects_are_two_singles() {
+        let now = t("2026-11-05T12:00:00Z");
+        let since = t("2026-11-05T11:00:00Z");
+        let agents = defined();
+        let mut a = running("docs", "2026-11-05T11:50:00Z", 5);
+        a.cwd = Some("/Users/x/a".into());
+        a.tool_use_id = Some("a".into());
+        let mut b = running("docs", "2026-11-05T11:55:00Z", 1);
+        b.cwd = Some("/Users/x/b".into());
+        b.tool_use_id = Some("b".into());
+        let runs = [a, b];
+        let groups = active_groups(&agents, &[], &runs, since, now, home());
+        assert_eq!(groups.len(), 2);
+        assert!(groups.iter().all(|g| g.lines[0].chain == Chain::Single));
+        assert_eq!(sibling_ids(&groups, "a"), vec!["a"]);
     }
 
     /// Uso con `total` tokens de entrada, `context` de contexto y modelo opus 5.5.
@@ -2015,7 +2237,7 @@ mod tests {
             vec![
                 (
                     "docs",
-                    1_300,
+                    1_000,
                     Some(Context {
                         used: 60_000,
                         window: 200_000
@@ -2023,6 +2245,8 @@ mod tests {
                 ),
                 ("Explore", 0, None),
                 ("backend", 20, None),
+                // la terminada de `docs` es su propia fila, sin contexto
+                ("docs", 300, None),
             ]
         );
         assert_eq!(g.tokens, 1_320);
