@@ -98,7 +98,12 @@ For the active monitor, the following is also taken from each run's transcript:
   `Name · short argument`. `Bash`, its `command` on one line; `Read`, `Edit` and
   `Write`, their `file_path` relative to the `cwd` if it hangs from it and,
   otherwise, only the last component (`NotebookEdit`, the same with
-  `notebook_path`); `Grep` and `Glob`, their `pattern`; the rest, only the name.
+  `notebook_path`); `Grep` and `Glob`, their `pattern`; `Skill`, its `skill`
+  (`Skill · superpowers:brainstorming`); the rest, only the name.
+- **Skill** (`skill`): the last non-empty `input.skill` of a `Skill`
+  `tool_use` block in the transcript (`superpowers:brainstorming`), as is. A
+  loaded skill stays in force until another one is loaded, so it is kept even
+  when that step falls out of the last 200 steps. Empty if the run never invoked one.
 
 For the run details, also:
 
@@ -249,7 +254,8 @@ own binary.
   description, session and its first prompt, links, `cwd`, launch folder
   (`launch_dir`), times, worked time
   and its 15-minute slots, tool counts, task, tokens, model and context. Not the
-  steps, the last tool or the temporary `cwd`. Around 1 MB for some 400 runs.
+  steps, the last tool, the skill or the temporary `cwd`. Around 1 MB for some
+  400 runs.
 - It is rewritten whole and atomically (a temporary file next to it, then
   `rename`), only when some run is new or changed, and merged first with what
   is on disk, so another instance's runs are not lost.
@@ -413,8 +419,8 @@ it off the network, set `CLAUDE_AGENTS_NO_UPDATE_CHECK=1` and do not run
   so an agent whose only uses were old calls without a run of their own may
   show as `never` once those transcripts are deleted. Runs whose transcripts
   were deleted before the tool ever ran are not in the cache either.
-- Runs from the history cache have no steps or last tool, and nothing in them
-  changes any more. Those kept before the launch folder existed, if their
+- Runs from the history cache have no steps, last tool or skill, and nothing in
+  them changes any more. Those kept before the launch folder existed, if their
   transcript is gone, go by their `cwd`: one launched after a `cd` can show in
   another group, or as `[claude]` if it left its project.
 - The context window is not written anywhere: it is 1M if the model id carries

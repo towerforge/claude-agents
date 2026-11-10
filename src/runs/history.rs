@@ -147,6 +147,7 @@ fn stored(r: &Run) -> Run {
     Run {
         temp_cwd: None,
         last_tool: None,
+        skill: None,
         steps: Arc::from([]),
         from_cache: true,
         ..r.clone()
@@ -399,12 +400,14 @@ mod tests {
             }]
             .into(),
             last_tool: Some("Read".into()),
+            skill: Some("superpowers:brainstorming".into()),
             temp_cwd: Some(PathBuf::from("/tmp/claude-501/x")),
             ..done("a1")
         };
         let back = from_line(&to_line(&r)).unwrap();
         assert_eq!(back, stored(&r));
         assert!(back.from_cache && back.steps.is_empty() && back.last_tool.is_none());
+        assert_eq!(back.skill, None);
     }
 
     #[test]

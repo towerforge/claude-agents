@@ -132,6 +132,7 @@ pub(super) fn tool_parts(block: &Value, cwd: Option<&str>) -> Option<(String, Op
         "Read" | "Edit" | "Write" => field("file_path").map(|p| short_path(p, cwd)),
         "NotebookEdit" => field("notebook_path").map(|p| short_path(p, cwd)),
         "Grep" | "Glob" => field("pattern").map(str::to_string),
+        "Skill" => field("skill").map(str::to_string),
         _ => None,
     };
     Some((name.to_string(), arg.filter(|a| !a.is_empty())))

@@ -65,7 +65,7 @@ star is left. With a one-row body, only the first line shows.
 
 (Excerpt of a render with made-up data, at 110 columns: two of the four groups.
 `visual` is a workflow step that is not one of your agents and has just started,
-with no token data yet; `frontend` is a finished
+with no token data yet, and has loaded a skill; `frontend` is a finished
 call with no run, so every figure is `—`; `general-purpose` is over 85% of its
 context, painted amber.)
 
@@ -76,23 +76,20 @@ context, painted amber.)
  …
  api · 2 running · 1 recent ─────────────────────────────────────────────────────────────────────────────────
     3. ✦ visual [workflow]                                                     —        —       0      <1 min
-         task     paint the active screen
+         skill    superpowers:brainstorming
          now      —
          cwd      ~/code/api/src/tui
 
     4. ✦ backend [own]                                                  ▰▰▰▱ 71%     412k       7      10 min
-         task     —
          now      —
          cwd      ~/code/api
 
     5.   frontend [own]                                                        —        —       —   2 min ago
-         task     —
          last     —
          cwd      ~/code/api
 
  other · 1 running ──────────────────────────────────────────────────────────────────────────────────────────
     6. ✦ general-purpose [claude]                                       ▰▰▰▰ 92%     1.1M      37       1 min
-         task     Independent review of the uncommitted change in /Users/x/other
          now      Bash · git diff --stat
          cwd      ~/other
  …
@@ -100,12 +97,13 @@ context, painted amber.)
 ```
 
 A single list, grouped by project and numbered continuously across all groups.
-Each **agent** is a four-line block that counts as a single row: all its runs
+Each **agent** is a block of three lines, or four if its run has loaded a
+skill, that counts as a single row: all its runs
 (and calls without a run) from that project within the window, plus the running
 ones, are merged into that row. A blank line separates one block from the next,
 and another one goes before each group rule except the first (never after the
 last block, never two in a row); the blank is not part of any block, so the
-cursor and the scroll still keep the whole four-line block on screen. Above
+cursor and the scroll still keep the whole block on screen. Above
 them, once and in gray, the column header (`agent`, `ctx`, `tokens`, `tools`,
 `time`), with the first group rule right under it. There are no sections or a
 separate timeline.
@@ -126,9 +124,9 @@ separate timeline.
   `visual [workflow]` are different rows, just like an own agent and a
   homonymous `[claude]` one. The row is represented by one run: the most
   recent running one (by start) or, if there is none, the most recent finished
-  one; the state, time, `tools`, task and `now`/`last` come from it. The row is
-  running if any of its runs is. If it groups more than one, the label carries
-  ` ×N` (see below).
+  one; the state, time, `tools`, task, skill and `now`/`last` come from it.
+  The row is running if any of its runs is. If it groups more than one, the
+  label carries ` ×N` (see below).
 - **Order.** Within a group, running rows first (the one that started latest on
   top, by its representative run) and then finished ones (the one that ended
   latest on top). Groups are ordered by their most recent activity: the start of
@@ -165,14 +163,22 @@ separate timeline.
   (see [Tokens and context](how-it-works.md#tokens-and-context)). The star slot is always reserved, so names stay aligned between
   running and finished ones, and it is never removed for narrowness (the label
   yields first, then the name, cut with `…`).
-- **Line 2**, indented under the name: `task` and what it was asked to do.
-- **Line 3**: `now` and the last tool if running (`Bash · git diff --stat`,
-  `Edit · README.md`); `last` and the last tool if finished. `—` in gray if the
-  datum is missing, also in `task`.
-- **Line 4**: `cwd` and, in gray, the subagent's real working directory, with
+- **`skill`**, right under the name and only if the run has invoked a skill:
+  the last one it loaded (`superpowers:brainstorming`), which stays until it
+  loads another (see [What is read from each
+  run](how-it-works.md#what-is-read-from-each-run)). That of the row's
+  representative run. Runs that only remain in the [history
+  cache](how-it-works.md#kept-history) have none, so they never show it.
+- **`now`** and the last tool if running (`Bash · git diff --stat`,
+  `Edit · README.md`, `Skill · superpowers:brainstorming`); **`last`** and the
+  last tool if finished. `—` in gray if the datum is missing.
+- **`cwd`**, the last line: in gray, the subagent's real working directory, with
   `~` for the home (that of the row's representative run). It can differ from
   the group folder if the main agent did a `cd` before launching it. It always
-  shows, with `—` if unknown, so all blocks have the same height.
+  shows, with `—` if unknown.
+
+The task does not show in the block: it is in the [run
+details](#run-details), and the `/` filter still searches it.
 
 Each value goes on a single line, cut with `…` if it does not fit.
 
@@ -180,7 +186,9 @@ Colors. The name depends only on the state, whatever the kind: running,
 `claude-soft` in bold (a `[claude]` one too); finished, plain `ink` without bold
 (an `[own]` one too), and its number also in `ink`, without tint even when
 selected. What is running is told apart by the blinking star, by the name color
-and by `N min` versus `N min ago`. The `agent` column header and lines 2 to 4
+and by `N min` versus `N min ago`. The labels (`skill`, `now`/`last`, `cwd`) go
+in gray; the skill's value in `ink`, like the names, and those of `now`/`last`
+and `cwd` in gray. The `agent` column header and the lines under the name
 are indented under the name, which starts right after the star (9 columns with
 fewer than 100 runs in the list; it grows with the digits of the number).
 
@@ -656,7 +664,7 @@ The screen captures the mouse so the wheel and the left click work:
 - **Click on a row**: moves the cursor to it. A click on the row the cursor is
   already on opens it, exactly like `Enter`: the agent details, the run details
   in active, or unfolds/folds a group. There is no double click: it is two
-  separate clicks. In active, any of the lines of a block (the name, `task`,
+  separate clicks. In active, any of the lines of a block (the name, `skill`,
   `now`/`last` and `cwd`) counts as its row; section headers, blank lines and
   notes do not respond.
 - With the agent details open only the tabs respond; with the run details open

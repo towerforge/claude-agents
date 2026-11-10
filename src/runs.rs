@@ -94,6 +94,11 @@ pub struct Run {
     /// La última herramienta usada, `Nombre · argumento corto` (`Bash · git diff
     /// --stat`), o solo el nombre. Una línea, sin recortar; cambia con cada línea.
     pub last_tool: Option<String>,
+    /// La skill que está usando: la última que invocó (`Skill` con
+    /// `input.skill`, p. ej. `superpowers:brainstorming`), tal cual; sigue
+    /// mandando hasta que carga otra. `None` si no invocó ninguna o si la
+    /// ejecución viene del historial guardado.
+    pub skill: Option<String>,
     /// Los últimos 200 `tool_use` (`MAX_STEPS`), del más antiguo, con su hora.
     pub steps: Arc<[ToolStep]>,
     /// Usos por herramienta sobre TODA la ejecución, de más a menos; suman `tools`.
@@ -114,7 +119,7 @@ pub struct Run {
     /// `id` de las ejecuciones que lanzó ella, ordenados.
     pub children: Vec<String>,
     /// Solo está en el historial guardado: su transcripción ya no existe. No
-    /// tiene `steps`, `last_tool` ni `temp_cwd`.
+    /// tiene `steps`, `last_tool`, `skill` ni `temp_cwd`.
     pub from_cache: bool,
 }
 
@@ -494,6 +499,7 @@ impl Runs {
                     task: t.task.clone(),
                     task_full: t.task_full.clone(),
                     last_tool: t.steps.last_label(),
+                    skill: t.steps.skill().map(str::to_string),
                     steps: t.steps.recent_arc(),
                     tool_counts: t.steps.counts_arc(),
                     finished: meta.finished,

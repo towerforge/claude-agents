@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" shape-rendering="crispEdges" width="980" height="598" viewBox="0 0 980 598">
-<rect width="980" height="598" fill="#1f1e1d"/>
-<rect x="0.5" y="0.5" width="979" height="597" fill="none" stroke="#3a3936"/>
+<svg xmlns="http://www.w3.org/2000/svg" shape-rendering="crispEdges" width="980" height="532" viewBox="0 0 980 532">
+<rect width="980" height="532" fill="#1f1e1d"/>
+<rect x="0.5" y="0.5" width="979" height="531" fill="none" stroke="#3a3936"/>
 <g font-family="'IBM Plex Mono','JetBrains Mono',Menlo,'DejaVu Sans Mono',ui-monospace,monospace" font-size="14" xml:space="preserve">
 <rect x="36.4" y="30" width="67.2" height="20" fill="#d77757"/>
 <text x="44.8" y="45" fill="#141413" textLength="50.4" lengthAdjust="spacing">active</text>
@@ -47,16 +47,8 @@
 <text x="826.0" y="133" fill="#faf9f5" textLength="16.8" lengthAdjust="spacing">23</text>
 <text x="893.2" y="133" fill="#faf9f5" textLength="16.8" lengthAdjust="spacing">12</text>
 <text x="918.4" y="133" fill="#faf9f5" textLength="25.2" lengthAdjust="spacing">min</text>
-<text x="103.6" y="155" fill="#999999" textLength="33.6" lengthAdjust="spacing">task</text>
-<text x="179.2" y="155" fill="#faf9f5" textLength="50.4" lengthAdjust="spacing">Review</text>
-<text x="238.0" y="155" fill="#faf9f5" textLength="25.2" lengthAdjust="spacing">the</text>
-<text x="271.6" y="155" fill="#faf9f5" textLength="50.4" lengthAdjust="spacing">cursor</text>
-<text x="330.4" y="155" fill="#faf9f5" textLength="84.0" lengthAdjust="spacing">pagination</text>
-<text x="422.8" y="155" fill="#faf9f5" textLength="50.4" lengthAdjust="spacing">change</text>
-<text x="481.6" y="155" fill="#faf9f5" textLength="16.8" lengthAdjust="spacing">in</text>
-<text x="506.8" y="155" fill="#faf9f5" textLength="25.2" lengthAdjust="spacing">the</text>
-<text x="540.4" y="155" fill="#faf9f5" textLength="50.4" lengthAdjust="spacing">orders</text>
-<text x="599.2" y="155" fill="#faf9f5" textLength="67.2" lengthAdjust="spacing">endpoint</text>
+<text x="103.6" y="155" fill="#999999" textLength="42.0" lengthAdjust="spacing">skill</text>
+<text x="179.2" y="155" fill="#faf9f5" textLength="193.2" lengthAdjust="spacing">superpowers:code-review</text>
 <text x="103.6" y="177" fill="#999999" textLength="25.2" lengthAdjust="spacing">now</text>
 <text x="179.2" y="177" fill="#999999" textLength="33.6" lengthAdjust="spacing">Bash</text>
 <text x="221.2" y="177" fill="#999999">·</text>
@@ -76,88 +68,65 @@
 <text x="834.4" y="243" fill="#faf9f5">9</text>
 <text x="901.6" y="243" fill="#faf9f5">2</text>
 <text x="918.4" y="243" fill="#faf9f5" textLength="25.2" lengthAdjust="spacing">min</text>
-<text x="103.6" y="265" fill="#999999" textLength="33.6" lengthAdjust="spacing">task</text>
-<text x="179.2" y="265" fill="#faf9f5" textLength="33.6" lengthAdjust="spacing">Find</text>
-<text x="221.2" y="265" fill="#faf9f5" textLength="42.0" lengthAdjust="spacing">every</text>
-<text x="271.6" y="265" fill="#faf9f5" textLength="50.4" lengthAdjust="spacing">caller</text>
-<text x="330.4" y="265" fill="#faf9f5" textLength="16.8" lengthAdjust="spacing">of</text>
-<text x="355.6" y="265" fill="#faf9f5" textLength="126.0" lengthAdjust="spacing">OrderRepo::list</text>
-<text x="103.6" y="287" fill="#999999" textLength="25.2" lengthAdjust="spacing">now</text>
-<text x="179.2" y="287" fill="#999999" textLength="33.6" lengthAdjust="spacing">Grep</text>
-<text x="221.2" y="287" fill="#999999">·</text>
-<text x="238.0" y="287" fill="#999999" textLength="126.0" lengthAdjust="spacing">OrderRepo::list</text>
-<text x="103.6" y="309" fill="#999999" textLength="25.2" lengthAdjust="spacing">cwd</text>
-<text x="179.2" y="309" fill="#999999" textLength="243.6" lengthAdjust="spacing">~/code/shop/api/crates/orders</text>
-<text x="61.6" y="353" fill="#faf9f5" textLength="16.8" lengthAdjust="spacing">3.</text>
-<text x="103.6" y="353" fill="#faf9f5" textLength="58.8" lengthAdjust="spacing">backend</text>
-<text x="170.8" y="353" fill="#999999" textLength="42.0" lengthAdjust="spacing">[own]</text>
-<text x="221.2" y="353" fill="#999999" textLength="16.8" lengthAdjust="spacing">×3</text>
-<text x="691.6" y="353" fill="#505050">—</text>
-<text x="742.0" y="353" fill="#faf9f5" textLength="33.6" lengthAdjust="spacing">1.1M</text>
-<text x="826.0" y="353" fill="#faf9f5" textLength="16.8" lengthAdjust="spacing">41</text>
-<text x="868.0" y="353" fill="#faf9f5">6</text>
-<text x="884.8" y="353" fill="#faf9f5" textLength="25.2" lengthAdjust="spacing">min</text>
-<text x="918.4" y="353" fill="#faf9f5" textLength="25.2" lengthAdjust="spacing">ago</text>
-<text x="103.6" y="375" fill="#999999" textLength="33.6" lengthAdjust="spacing">task</text>
-<text x="179.2" y="375" fill="#faf9f5" textLength="25.2" lengthAdjust="spacing">Add</text>
-<text x="212.8" y="375" fill="#faf9f5" textLength="100.8" lengthAdjust="spacing">cursor-based</text>
-<text x="322.0" y="375" fill="#faf9f5" textLength="84.0" lengthAdjust="spacing">pagination</text>
-<text x="414.4" y="375" fill="#faf9f5" textLength="16.8" lengthAdjust="spacing">to</text>
-<text x="439.6" y="375" fill="#faf9f5" textLength="25.2" lengthAdjust="spacing">GET</text>
-<text x="473.2" y="375" fill="#faf9f5" textLength="58.8" lengthAdjust="spacing">/orders</text>
-<text x="103.6" y="397" fill="#999999" textLength="33.6" lengthAdjust="spacing">last</text>
-<text x="179.2" y="397" fill="#999999" textLength="33.6" lengthAdjust="spacing">Edit</text>
-<text x="221.2" y="397" fill="#999999">·</text>
-<text x="238.0" y="397" fill="#999999" textLength="168.0" lengthAdjust="spacing">src/routes/orders.rs</text>
-<text x="103.6" y="419" fill="#999999" textLength="25.2" lengthAdjust="spacing">cwd</text>
-<text x="179.2" y="419" fill="#999999" textLength="126.0" lengthAdjust="spacing">~/code/shop/api</text>
-<text x="36.4" y="463" fill="#eb9f7f" textLength="25.2" lengthAdjust="spacing">web</text>
-<text x="70.0" y="463" fill="#999999">·</text>
-<text x="86.8" y="463" fill="#999999">1</text>
-<text x="103.6" y="463" fill="#999999" textLength="58.8" lengthAdjust="spacing">running</text>
-<line x1="170.8" y1="458" x2="943.6" y2="458" stroke="#505050" stroke-width="1"/>
-<text x="61.6" y="485" fill="#999999" textLength="16.8" lengthAdjust="spacing">4.</text>
-<text x="86.8" y="485" fill="#d77757">✦</text>
-<text x="103.6" y="485" fill="#eb9f7f" font-weight="700" textLength="67.2" lengthAdjust="spacing">frontend</text>
-<text x="179.2" y="485" fill="#999999" textLength="42.0" lengthAdjust="spacing">[own]</text>
-<text x="229.6" y="485" fill="#999999" textLength="25.2" lengthAdjust="spacing">via</text>
-<text x="263.2" y="485" fill="#999999" textLength="67.2" lengthAdjust="spacing">workflow</text>
-<text x="632.8" y="485" fill="#e5b567" textLength="33.6" lengthAdjust="spacingAndGlyphs">▰▰▰▰</text>
-<text x="674.8" y="485" fill="#e5b567" textLength="25.2" lengthAdjust="spacing">88%</text>
-<text x="742.0" y="485" fill="#faf9f5" textLength="33.6" lengthAdjust="spacing">233k</text>
-<text x="826.0" y="485" fill="#faf9f5" textLength="16.8" lengthAdjust="spacing">15</text>
-<text x="901.6" y="485" fill="#faf9f5">4</text>
-<text x="918.4" y="485" fill="#faf9f5" textLength="25.2" lengthAdjust="spacing">min</text>
-<text x="103.6" y="507" fill="#999999" textLength="33.6" lengthAdjust="spacing">task</text>
-<text x="179.2" y="507" fill="#faf9f5" textLength="33.6" lengthAdjust="spacing">Wire</text>
-<text x="221.2" y="507" fill="#faf9f5" textLength="25.2" lengthAdjust="spacing">the</text>
-<text x="254.8" y="507" fill="#faf9f5" textLength="50.4" lengthAdjust="spacing">orders</text>
-<text x="313.6" y="507" fill="#faf9f5" textLength="42.0" lengthAdjust="spacing">table</text>
-<text x="364.0" y="507" fill="#faf9f5" textLength="16.8" lengthAdjust="spacing">to</text>
-<text x="389.2" y="507" fill="#faf9f5" textLength="25.2" lengthAdjust="spacing">the</text>
-<text x="422.8" y="507" fill="#faf9f5" textLength="25.2" lengthAdjust="spacing">new</text>
-<text x="456.4" y="507" fill="#faf9f5" textLength="50.4" lengthAdjust="spacing">cursor</text>
-<text x="515.2" y="507" fill="#faf9f5" textLength="25.2" lengthAdjust="spacing">API</text>
-<text x="103.6" y="529" fill="#999999" textLength="25.2" lengthAdjust="spacing">now</text>
-<text x="179.2" y="529" fill="#999999" textLength="33.6" lengthAdjust="spacing">Edit</text>
-<text x="221.2" y="529" fill="#999999">·</text>
-<text x="238.0" y="529" fill="#999999" textLength="168.0" lengthAdjust="spacing">src/pages/Orders.tsx</text>
-<text x="103.6" y="551" fill="#999999" textLength="25.2" lengthAdjust="spacing">cwd</text>
-<text x="179.2" y="551" fill="#999999" textLength="126.0" lengthAdjust="spacing">~/code/shop/web</text>
-<text x="36.4" y="573" fill="#d77757" textLength="16.8" lengthAdjust="spacing">↑↓</text>
-<text x="61.6" y="573" fill="#faf9f5" textLength="33.6" lengthAdjust="spacing">move</text>
-<text x="103.6" y="573" fill="#999999">·</text>
-<text x="120.4" y="573" fill="#d77757" textLength="42.0" lengthAdjust="spacing">enter</text>
-<text x="170.8" y="573" fill="#faf9f5" textLength="58.8" lengthAdjust="spacing">details</text>
-<text x="238.0" y="573" fill="#999999">·</text>
-<text x="254.8" y="573" fill="#d77757" textLength="25.2" lengthAdjust="spacing">tab</text>
-<text x="288.4" y="573" fill="#faf9f5" textLength="33.6" lengthAdjust="spacing">mode</text>
-<text x="330.4" y="573" fill="#999999">·</text>
-<text x="347.2" y="573" fill="#d77757">/</text>
-<text x="364.0" y="573" fill="#faf9f5" textLength="50.4" lengthAdjust="spacing">filter</text>
-<text x="422.8" y="573" fill="#999999">·</text>
-<text x="439.6" y="573" fill="#d77757">q</text>
-<text x="456.4" y="573" fill="#faf9f5" textLength="33.6" lengthAdjust="spacing">quit</text>
-<text x="893.2" y="573" fill="#999999" textLength="50.4" lengthAdjust="spacing">v0.1.0</text>
+<text x="103.6" y="265" fill="#999999" textLength="25.2" lengthAdjust="spacing">now</text>
+<text x="179.2" y="265" fill="#999999" textLength="33.6" lengthAdjust="spacing">Grep</text>
+<text x="221.2" y="265" fill="#999999">·</text>
+<text x="238.0" y="265" fill="#999999" textLength="126.0" lengthAdjust="spacing">OrderRepo::list</text>
+<text x="103.6" y="287" fill="#999999" textLength="25.2" lengthAdjust="spacing">cwd</text>
+<text x="179.2" y="287" fill="#999999" textLength="243.6" lengthAdjust="spacing">~/code/shop/api/crates/orders</text>
+<text x="61.6" y="331" fill="#faf9f5" textLength="16.8" lengthAdjust="spacing">3.</text>
+<text x="103.6" y="331" fill="#faf9f5" textLength="58.8" lengthAdjust="spacing">backend</text>
+<text x="170.8" y="331" fill="#999999" textLength="42.0" lengthAdjust="spacing">[own]</text>
+<text x="221.2" y="331" fill="#999999" textLength="16.8" lengthAdjust="spacing">×3</text>
+<text x="691.6" y="331" fill="#505050">—</text>
+<text x="742.0" y="331" fill="#faf9f5" textLength="33.6" lengthAdjust="spacing">1.1M</text>
+<text x="826.0" y="331" fill="#faf9f5" textLength="16.8" lengthAdjust="spacing">41</text>
+<text x="868.0" y="331" fill="#faf9f5">6</text>
+<text x="884.8" y="331" fill="#faf9f5" textLength="25.2" lengthAdjust="spacing">min</text>
+<text x="918.4" y="331" fill="#faf9f5" textLength="25.2" lengthAdjust="spacing">ago</text>
+<text x="103.6" y="353" fill="#999999" textLength="33.6" lengthAdjust="spacing">last</text>
+<text x="179.2" y="353" fill="#999999" textLength="33.6" lengthAdjust="spacing">Edit</text>
+<text x="221.2" y="353" fill="#999999">·</text>
+<text x="238.0" y="353" fill="#999999" textLength="168.0" lengthAdjust="spacing">src/routes/orders.rs</text>
+<text x="103.6" y="375" fill="#999999" textLength="25.2" lengthAdjust="spacing">cwd</text>
+<text x="179.2" y="375" fill="#999999" textLength="126.0" lengthAdjust="spacing">~/code/shop/api</text>
+<text x="36.4" y="419" fill="#eb9f7f" textLength="25.2" lengthAdjust="spacing">web</text>
+<text x="70.0" y="419" fill="#999999">·</text>
+<text x="86.8" y="419" fill="#999999">1</text>
+<text x="103.6" y="419" fill="#999999" textLength="58.8" lengthAdjust="spacing">running</text>
+<line x1="170.8" y1="414" x2="943.6" y2="414" stroke="#505050" stroke-width="1"/>
+<text x="61.6" y="441" fill="#999999" textLength="16.8" lengthAdjust="spacing">4.</text>
+<text x="86.8" y="441" fill="#d77757">✦</text>
+<text x="103.6" y="441" fill="#eb9f7f" font-weight="700" textLength="67.2" lengthAdjust="spacing">frontend</text>
+<text x="179.2" y="441" fill="#999999" textLength="42.0" lengthAdjust="spacing">[own]</text>
+<text x="229.6" y="441" fill="#999999" textLength="25.2" lengthAdjust="spacing">via</text>
+<text x="263.2" y="441" fill="#999999" textLength="67.2" lengthAdjust="spacing">workflow</text>
+<text x="632.8" y="441" fill="#e5b567" textLength="33.6" lengthAdjust="spacingAndGlyphs">▰▰▰▰</text>
+<text x="674.8" y="441" fill="#e5b567" textLength="25.2" lengthAdjust="spacing">88%</text>
+<text x="742.0" y="441" fill="#faf9f5" textLength="33.6" lengthAdjust="spacing">233k</text>
+<text x="826.0" y="441" fill="#faf9f5" textLength="16.8" lengthAdjust="spacing">15</text>
+<text x="901.6" y="441" fill="#faf9f5">4</text>
+<text x="918.4" y="441" fill="#faf9f5" textLength="25.2" lengthAdjust="spacing">min</text>
+<text x="103.6" y="463" fill="#999999" textLength="25.2" lengthAdjust="spacing">now</text>
+<text x="179.2" y="463" fill="#999999" textLength="33.6" lengthAdjust="spacing">Edit</text>
+<text x="221.2" y="463" fill="#999999">·</text>
+<text x="238.0" y="463" fill="#999999" textLength="168.0" lengthAdjust="spacing">src/pages/Orders.tsx</text>
+<text x="103.6" y="485" fill="#999999" textLength="25.2" lengthAdjust="spacing">cwd</text>
+<text x="179.2" y="485" fill="#999999" textLength="126.0" lengthAdjust="spacing">~/code/shop/web</text>
+<text x="36.4" y="507" fill="#d77757" textLength="16.8" lengthAdjust="spacing">↑↓</text>
+<text x="61.6" y="507" fill="#faf9f5" textLength="33.6" lengthAdjust="spacing">move</text>
+<text x="103.6" y="507" fill="#999999">·</text>
+<text x="120.4" y="507" fill="#d77757" textLength="42.0" lengthAdjust="spacing">enter</text>
+<text x="170.8" y="507" fill="#faf9f5" textLength="58.8" lengthAdjust="spacing">details</text>
+<text x="238.0" y="507" fill="#999999">·</text>
+<text x="254.8" y="507" fill="#d77757" textLength="25.2" lengthAdjust="spacing">tab</text>
+<text x="288.4" y="507" fill="#faf9f5" textLength="33.6" lengthAdjust="spacing">mode</text>
+<text x="330.4" y="507" fill="#999999">·</text>
+<text x="347.2" y="507" fill="#d77757">/</text>
+<text x="364.0" y="507" fill="#faf9f5" textLength="50.4" lengthAdjust="spacing">filter</text>
+<text x="422.8" y="507" fill="#999999">·</text>
+<text x="439.6" y="507" fill="#d77757">q</text>
+<text x="456.4" y="507" fill="#faf9f5" textLength="33.6" lengthAdjust="spacing">quit</text>
+<text x="893.2" y="507" fill="#999999" textLength="50.4" lengthAdjust="spacing">v0.1.0</text>
 </g>
 </svg>

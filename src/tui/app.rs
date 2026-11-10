@@ -91,7 +91,7 @@ pub struct TabHit {
 
 /// Una línea de la lista: la fila de pantalla `row` es de la línea
 /// seleccionable `cursor` (el valor de `App::cursor` que la elige, es decir,
-/// `Item::n() - 1`). Las cuatro líneas de un bloque de activos llevan una
+/// `Item::n() - 1`). Las líneas de un bloque de activos (tres o cuatro) llevan una
 /// entrada cada una con el mismo `cursor`; las cabeceras de sección, las
 /// líneas en blanco y las notas no llevan ninguna.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -216,7 +216,7 @@ pub struct NowLine {
     pub id: String,
     /// `agentType`, con «workflow» para las de workflow (`status::display_name`).
     pub name: String,
-    /// El `cwd` real del subagente (`status::NowRun::cwd`): la cuarta línea
+    /// El `cwd` real del subagente (`status::NowRun::cwd`): la última línea
     /// del bloque (`Item::LiveCwd`). El grupo va por la carpeta de lanzamiento.
     pub cwd: Option<PathBuf>,
     pub since: Option<DateTime<Utc>>,
@@ -225,8 +225,9 @@ pub struct NowLine {
     pub tools: usize,
     /// De dónde viene: agente definido, built-in o paso de workflow.
     pub kind: RunKind,
-    /// El encargo (`status::NowRun::task`); en un workflow, sin él no hay.
-    pub task: Option<String>,
+    /// La última skill invocada (`status::NowRun::skill`), tal cual
+    /// (`superpowers:brainstorming`). Con ella el bloque lleva `Item::LiveSkill`.
+    pub skill: Option<String>,
     /// Última herramienta usada (`Bash · git diff --stat`), para «ahora».
     pub last_tool: Option<String>,
     /// En curso (`RunState::Running`) o terminada y cuándo
@@ -290,24 +291,25 @@ pub enum Item {
         running: usize,
         recent: usize,
     },
-    /// Activos: primera línea de un bloque de cuatro (agente, tipo, tiempo,
+    /// Activos: primera línea de un bloque (agente, tipo, tiempo,
     /// herramientas), en curso o terminado (`line.state`). Es la fila
     /// seleccionable; `row` es la del agente definido si lo hay (un agente
     /// definido, o un workflow cuyo agente real lo es) y `None` si es built-in
     /// o un workflow sin agente definido. Enter abre en cualquier caso la ficha
-    /// de la ejecución (`line.id`). Le siguen `LiveTask`, `LiveNow` y `LiveCwd`.
+    /// de la ejecución (`line.id`). Le siguen `LiveSkill` (solo si la ejecución
+    /// tiene skill), `LiveNow` y `LiveCwd`: tres o cuatro líneas por bloque.
     Live {
         n: usize,
         line: NowLine,
         row: Option<Row>,
     },
-    /// Activos: segunda línea del bloque, «encargo …» (`line.task`). No se
-    /// selecciona; va siempre detrás de su `Live`.
-    LiveTask(NowLine),
-    /// Activos: tercera línea del bloque, «ahora …» (`line.last_tool`). No se
-    /// selecciona; va siempre detrás de su `LiveTask`.
+    /// Activos: «skill …» (`line.skill`), justo bajo el nombre. Solo existe si
+    /// la ejecución tiene skill. No se selecciona; va siempre detrás de su `Live`.
+    LiveSkill(NowLine),
+    /// Activos: «now …»/«last …» (`line.last_tool`). No se selecciona; va
+    /// siempre detrás de su `Live` o, si lo hay, de su `LiveSkill`.
     LiveNow(NowLine),
-    /// Activos: cuarta línea del bloque, el `cwd` real del subagente
+    /// Activos: última línea del bloque, el `cwd` real del subagente
     /// (`line.cwd`, que puede no coincidir con la carpeta del grupo). Sale
     /// siempre, aunque no se sepa (`None`), para que todos los bloques midan
     /// lo mismo. No se selecciona; va siempre detrás de su `LiveNow`.
@@ -687,8 +689,8 @@ impl App {
     /// carpeta del grupo (`group_dir`, lo que se ve en la regla), `cwd` real o
     /// encargo; los contadores `running`/`recent` del grupo se
     /// rehacen con lo que queda y un grupo sin líneas no sale. Cada ejecución
-    /// es un bloque de cuatro líneas (nombre, encargo, ahora/última y `cwd`)
-    /// que cuenta como una fila; entre bloques, y
+    /// es un bloque de tres líneas (nombre, ahora/última y `cwd`), cuatro si
+    /// tiene skill (va justo bajo el nombre), que cuenta como una fila; entre bloques, y
     /// antes de la regla de cada grupo menos el primero, un `Item::Blank`
     /// (que no es parte de ningún bloque para el scroll). Si su agente es
     /// uno definido (`NowRun::owner`), lleva su fila para la ficha.
@@ -742,7 +744,7 @@ impl App {
                     worked: r.worked,
                     tools: r.tools,
                     kind: r.kind,
-                    task: r.task.map(String::from),
+                    skill: r.skill.map(String::from),
                     last_tool: r.last_tool.map(String::from),
                     state: r.state,
                     runs: r.runs,
@@ -754,7 +756,9 @@ impl App {
                     line: line.clone(),
                     row,
                 });
-                items.push(Item::LiveTask(line.clone()));
+                if line.skill.is_some() {
+                    items.push(Item::LiveSkill(line.clone()));
+                }
                 items.push(Item::LiveNow(line.clone()));
                 items.push(Item::LiveCwd(line));
             }
@@ -1049,13 +1053,13 @@ impl App {
         }
     }
 
-    /// Última línea de la fila de la línea `line`: la cuarta de un bloque de
-    /// activos, o ella misma.
+    /// Última línea de la fila de la línea `line`: la `cwd` de un bloque de
+    /// activos (la tercera o la cuarta, según tenga skill), o ella misma.
     fn row_end(items: &[Item], line: usize) -> usize {
         let mut end = line;
         while matches!(
             items.get(end + 1),
-            Some(Item::LiveTask(_) | Item::LiveNow(_) | Item::LiveCwd(_))
+            Some(Item::LiveSkill(_) | Item::LiveNow(_) | Item::LiveCwd(_))
         ) {
             end += 1;
         }
@@ -2645,7 +2649,7 @@ pub(crate) mod tests {
         assert!(matches!(items[0], Item::Columns));
         assert!(!items.iter().any(|i| matches!(
             i,
-            Item::LiveGroup { .. } | Item::Live { .. } | Item::LiveTask(_) | Item::LiveNow(_)
+            Item::LiveGroup { .. } | Item::Live { .. } | Item::LiveSkill(_) | Item::LiveNow(_)
         )));
         assert!(
             row_named(&app, "backend").running(),
@@ -2705,17 +2709,18 @@ pub(crate) mod tests {
     #[test]
     fn the_blank_between_blocks_keeps_the_cursor_block_in_view() {
         let mut app = active(busy());
-        // bloque 2: líneas 7-10; con 4 de alto, la vista empieza en su nombre
+        // bloque 2 (sin skill): líneas 6-8; con 3 de alto, la vista empieza en
+        // su nombre
         app.cursor = 1;
-        assert_eq!(frame(&mut app, 4), 7);
-        assert_eq!(app.scroll, 7);
-        // el último (8): regla en 39, bloque 40-43; la vista acaba en el 43
+        assert_eq!(frame(&mut app, 3), 6);
+        assert_eq!(app.scroll, 6);
+        // el último (8): regla en 32, bloque 33-35; la vista acaba en el 35
         app.cursor = 7;
-        assert_eq!(frame(&mut app, 5), 40);
-        assert_eq!(app.scroll, 39);
+        assert_eq!(frame(&mut app, 4), 33);
+        assert_eq!(app.scroll, 32);
         // y de vuelta al primero, con las columnas y su regla
         app.cursor = 0;
-        assert_eq!(frame(&mut app, 5), 2);
+        assert_eq!(frame(&mut app, 4), 2);
         assert_eq!(app.scroll, 0);
     }
 
@@ -2734,31 +2739,30 @@ pub(crate) mod tests {
             ],
             "grupos por su actividad más reciente; running y recent por grupo"
         );
-        // columnas, regla, bloque 1 (2-5), blanco, bloque 2 (7-10), blanco,
+        // columnas, regla, bloque 1 (2-4), blanco, bloque 2 (6-8), blanco,
         // regla de station...: un blanco entre bloques y antes de cada regla
-        // salvo la primera; nunca al final. Cada bloque, cuatro líneas:
-        // nombre, encargo, ahora/última y cwd (siempre, aunque no lo haya)
+        // salvo la primera; nunca al final. Sin skill, cada bloque son tres
+        // líneas: nombre, ahora/última y cwd (siempre, aunque no lo haya)
         assert!(matches!(items[1], Item::LiveGroup { .. }));
         assert!(matches!(items[2], Item::Live { n: 1, .. }));
-        assert!(matches!(items[3], Item::LiveTask(_)));
-        assert!(matches!(items[4], Item::LiveNow(_)));
-        assert!(matches!(items[5], Item::LiveCwd(_)));
-        assert!(matches!(items[6], Item::Blank));
-        assert!(matches!(items[7], Item::Live { n: 2, .. }));
-        assert!(matches!(items[11], Item::Blank));
-        assert!(matches!(items[12], Item::LiveGroup { .. }));
-        assert!(matches!(items[13], Item::Live { n: 3, .. }));
-        assert!(matches!(items[17], Item::Blank));
-        assert!(matches!(items[28], Item::Live { n: 6, .. }));
-        assert!(matches!(items[32], Item::Blank));
-        assert!(matches!(items[33], Item::LiveGroup { .. }));
-        assert!(matches!(items[34], Item::Live { n: 7, .. }));
-        assert!(matches!(items[38], Item::Blank));
-        assert!(matches!(items[39], Item::LiveGroup { .. }));
-        assert!(matches!(items[40], Item::Live { n: 8, .. }));
-        assert!(matches!(items[42], Item::LiveNow(_)));
-        assert!(matches!(items[43], Item::LiveCwd(_)));
-        assert_eq!(items.len(), 44);
+        assert!(matches!(items[3], Item::LiveNow(_)));
+        assert!(matches!(items[4], Item::LiveCwd(_)));
+        assert!(matches!(items[5], Item::Blank));
+        assert!(matches!(items[6], Item::Live { n: 2, .. }));
+        assert!(matches!(items[9], Item::Blank));
+        assert!(matches!(items[10], Item::LiveGroup { .. }));
+        assert!(matches!(items[11], Item::Live { n: 3, .. }));
+        assert!(matches!(items[14], Item::Blank));
+        assert!(matches!(items[23], Item::Live { n: 6, .. }));
+        assert!(matches!(items[26], Item::Blank));
+        assert!(matches!(items[27], Item::LiveGroup { .. }));
+        assert!(matches!(items[28], Item::Live { n: 7, .. }));
+        assert!(matches!(items[31], Item::Blank));
+        assert!(matches!(items[32], Item::LiveGroup { .. }));
+        assert!(matches!(items[33], Item::Live { n: 8, .. }));
+        assert!(matches!(items[34], Item::LiveNow(_)));
+        assert!(matches!(items[35], Item::LiveCwd(_)));
+        assert_eq!(items.len(), 36);
         assert_eq!(
             monitor(&app),
             vec![
@@ -2785,7 +2789,7 @@ pub(crate) mod tests {
         assert_eq!(ended(&app, 3), RunState::Running);
         assert_eq!(ended(&app, 6), ended_at("2026-11-05T11:58:00Z"));
         assert_eq!(ended(&app, 7), RunState::Running);
-        let Item::LiveTask(wf) = &items[19] else {
+        let Item::LiveNow(wf) = &items[16] else {
             panic!("segunda línea de workflow")
         };
         assert_eq!(wf.name, "workflow-subagent: tarea");
@@ -2793,14 +2797,57 @@ pub(crate) mod tests {
         assert_eq!(wf.cwd.as_deref(), Some(Path::new(STATION)));
         assert_eq!(wf.worked, Duration::minutes(4), "lleva hasta ahora");
         assert_eq!(wf.tools, 7);
-        assert_eq!(wf.task, None, "en un workflow la description es el nombre");
+        assert_eq!(wf.skill, None);
         assert_eq!(wf.last_tool, None);
         assert_eq!(wf.since, Some("2026-11-05T11:56:00Z".parse().unwrap()));
-        let Item::Live { line, .. } = &items[13] else {
+        let Item::Live { line, .. } = &items[11] else {
             panic!("Explore")
         };
         assert_eq!(line.kind, RunKind::BuiltIn);
-        assert_eq!(line.task.as_deref(), Some("Explore: tarea"));
+    }
+
+    /// Un bloque con skill: cuatro líneas, la skill justo bajo el nombre; sin
+    /// skill, tres (nombre, ahora/última, cwd). El encargo ya no sale.
+    #[test]
+    fn a_block_has_a_skill_line_under_the_name_only_if_the_run_has_a_skill() {
+        let mut sk = run("Explore", STATION, "2026-11-05T11:56:00Z", 2, None, false);
+        sk.skill = Some("superpowers:brainstorming".into());
+        sk.task = Some("pintar la pantalla".into());
+        let mut plain = run(
+            "Plan",
+            "/Users/x/otro",
+            "2026-11-05T11:57:00Z",
+            2,
+            None,
+            false,
+        );
+        plain.task = Some("planear".into());
+        let app = active(with_runs(fixture(), vec![sk, plain]));
+        let items = app.items();
+        let live = |name: &str| {
+            items
+                .iter()
+                .position(|i| matches!(i, Item::Live { line, .. } if line.name == name))
+                .unwrap_or_else(|| panic!("sin bloque {name}"))
+        };
+        let i = live("Explore");
+        let Item::LiveSkill(line) = &items[i + 1] else {
+            panic!("la skill, justo bajo el nombre")
+        };
+        assert_eq!(line.skill.as_deref(), Some("superpowers:brainstorming"));
+        assert!(matches!(items[i + 2], Item::LiveNow(_)));
+        assert!(matches!(items[i + 3], Item::LiveCwd(_)));
+        assert_eq!(App::row_end(&items, i), i + 3, "el bloque mide cuatro");
+        let j = live("Plan");
+        assert!(
+            matches!(items[j + 1], Item::LiveNow(_)),
+            "sin skill no hay línea"
+        );
+        assert!(matches!(items[j + 2], Item::LiveCwd(_)));
+        assert_eq!(App::row_end(&items, j), j + 2, "el bloque mide tres");
+        assert!(!items
+            .iter()
+            .any(|it| matches!(it, Item::LiveSkill(l) if l.name == "Plan")));
     }
 
     #[test]
@@ -2991,7 +3038,7 @@ pub(crate) mod tests {
         let mut app = active(with_runs(fixture(), vec![wf]));
         let items = app.items();
         // taskflow (2 terminadas) va antes; el workflow abre station: la 3
-        let Item::Live { n, line, row } = &items[13] else {
+        let Item::Live { n, line, row } = &items[11] else {
             panic!("el workflow abre el grupo de station")
         };
         assert_eq!(*n, 3);
@@ -3190,7 +3237,7 @@ pub(crate) mod tests {
     }
 
     /// Una sesión lanzada en `~/lanzadera` cuyo subagente trabaja en
-    /// `~/obrador`: el grupo es la lanzadera y la cuarta línea, el obrador.
+    /// `~/obrador`: el grupo es la lanzadera y la línea cwd, el obrador.
     fn moved_run() -> App {
         let mut r = run(
             "Explore",
@@ -3205,7 +3252,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_fourth_line_of_a_block_carries_the_real_cwd() {
+    fn the_last_line_of_a_block_carries_the_real_cwd() {
         let app = moved_run();
         let items = app.items();
         assert!(
@@ -3217,10 +3264,9 @@ pub(crate) mod tests {
             .position(|i| matches!(i, Item::LiveGroup { section, .. } if section == "~/lanzadera"))
             .unwrap();
         assert!(matches!(items[rule + 1], Item::Live { .. }));
-        assert!(matches!(items[rule + 2], Item::LiveTask(_)));
-        assert!(matches!(items[rule + 3], Item::LiveNow(_)));
-        let Item::LiveCwd(line) = &items[rule + 4] else {
-            panic!("cuarta línea del bloque")
+        assert!(matches!(items[rule + 2], Item::LiveNow(_)));
+        let Item::LiveCwd(line) = &items[rule + 3] else {
+            panic!("última línea del bloque")
         };
         assert_eq!(line.cwd.as_deref(), Some(Path::new("/Users/x/obrador")));
     }
@@ -3301,23 +3347,27 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_block_scrolls_into_view_with_its_four_lines_running_or_finished() {
+    fn a_block_scrolls_into_view_with_all_its_lines_running_or_finished() {
         let mut app = active(busy());
         key(&mut app, KeyCode::Char('7'));
-        // 0 columnas; general-purpose en la 34 y sus otras tres líneas de la 35 a la 37
-        assert_eq!(frame(&mut app, 5), 34);
-        assert_eq!(app.scroll, 33, "se ven las cuatro líneas del bloque");
+        // 0 columnas; general-purpose en la 28 y sus otras dos líneas, 29 y 30;
+        // su regla en la 27
+        assert_eq!(frame(&mut app, 4), 28);
+        assert_eq!(
+            app.scroll, 27,
+            "se ven la regla y las tres líneas del bloque"
+        );
         key(&mut app, KeyCode::Char('1'));
-        frame(&mut app, 5);
+        frame(&mut app, 4);
         assert_eq!(app.scroll, 0, "el primero arrastra la regla y las columnas");
-        // una terminada (la 6, líneas 28 a 31) también se ve entera
+        // una terminada (la 6, líneas 23 a 25) también se ve entera
         key(&mut app, KeyCode::Char('6'));
-        assert_eq!(frame(&mut app, 5), 28);
-        assert_eq!(app.scroll, 27);
-        // la última (la 8, líneas 40 a 43): scroll mínimo, con la regla de su grupo (39) a la vista
+        assert_eq!(frame(&mut app, 4), 23);
+        assert_eq!(app.scroll, 22);
+        // la última (la 8, líneas 33 a 35): scroll mínimo, con la regla de su grupo (32) a la vista
         key(&mut app, KeyCode::Char('8'));
-        frame(&mut app, 5);
-        assert_eq!(app.scroll, 39);
+        frame(&mut app, 4);
+        assert_eq!(app.scroll, 32);
         key(&mut app, KeyCode::Home);
         frame(&mut app, 5);
         assert_eq!(app.scroll, 0);
