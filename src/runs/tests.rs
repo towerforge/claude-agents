@@ -708,3 +708,69 @@ fn a_run_knows_the_first_real_prompt_of_its_session() {
         Some("mejora el README")
     );
 }
+
+/// Línea literal de una llamada a una skill dentro de una transcripción de
+/// subagente (forma vista en disco).
+const SKILL_LINE: &str = r#"{"parentUuid":"p","isSidechain":true,"agentId":"a1","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_01Jgc7f24","name":"Skill","input":{"skill":"superpowers:brainstorming","args":"una idea"}}]},"type":"assistant","uuid":"u","timestamp":"2026-11-05T10:00:20.000Z","cwd":"/Users/x/app","sessionId":"s1"}"#;
+
+#[test]
+fn a_skill_call_shows_the_skill_as_its_argument() {
+    let info = parse_run_line(SKILL_LINE).unwrap();
+    assert_eq!(
+        info.tool_uses,
+        vec![("Skill".into(), Some("superpowers:brainstorming".into()))]
+    );
+    // Sin `input.skill` no hay argumento.
+    let bare = parse_run_line(&tool_line("Skill", "{}")).unwrap();
+    assert_eq!(bare.tool_uses, vec![("Skill".into(), None)]);
+}
+
+#[test]
+fn the_skill_is_the_last_one_invoked_and_stays_until_another_is_loaded() {
+    let mut t = Transcript::default();
+    t.add(parse_run_line(PROMPT_LINE).unwrap());
+    t.add(parse_run_line(&tool_line("Read", r#"{"file_path":"/Users/x/app/a.rs"}"#)).unwrap());
+    assert_eq!(t.steps.skill(), None);
+    t.add(parse_run_line(SKILL_LINE).unwrap());
+    t.add(parse_run_line(&tool_line("Bash", r#"{"command":"ls"}"#)).unwrap());
+    // Una skill cargada sigue mandando aunque luego se usen otras herramientas.
+    assert_eq!(t.steps.skill(), Some("superpowers:brainstorming"));
+    // Una llamada sin nombre de skill no la cambia.
+    t.add(parse_run_line(&tool_line("Skill", "{}")).unwrap());
+    assert_eq!(t.steps.skill(), Some("superpowers:brainstorming"));
+    t.add(
+        parse_run_line(&tool_line(
+            "Skill",
+            r#"{"skill":"superpowers:test-driven-development"}"#,
+        ))
+        .unwrap(),
+    );
+    assert_eq!(t.steps.skill(), Some("superpowers:test-driven-development"));
+}
+
+#[test]
+fn the_skill_survives_dropping_old_steps_and_reaches_the_run() {
+    let tmp = TempDir::new("skill");
+    let path = tmp.0.join("proj/s1/subagents/agent-a1.jsonl");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(meta_path(&path), r#"{"agentType":"docs","finished":false}"#).unwrap();
+    let mut text = format!("{SKILL_LINE}\n");
+    // Más pasos de los que se guardan: la llamada a la skill ya no está en `steps`.
+    for _ in 0..steps::MAX_STEPS {
+        text.push_str(&tool_line("Bash", r#"{"command":"ls"}"#));
+        text.push('\n');
+    }
+    append(&path, &text);
+    let mut runs = Runs::default();
+    runs.refresh(&tmp.0).unwrap();
+    let r = &runs.runs()[0];
+    assert!(r.steps.iter().all(|s| s.name != "Skill"));
+    assert_eq!(r.skill.as_deref(), Some("superpowers:brainstorming"));
+
+    // Sin ninguna skill invocada, no hay.
+    let other = tmp.0.join("proj/s1/subagents/agent-a2.jsonl");
+    std::fs::write(meta_path(&other), r#"{"agentType":"data"}"#).unwrap();
+    append(&other, &format!("{TOOL_LINE}\n"));
+    runs.refresh(&tmp.0).unwrap();
+    assert_eq!(find(&runs.runs(), "a2").skill, None);
+}

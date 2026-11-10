@@ -412,6 +412,9 @@ pub struct NowRun<'a> {
     pub task: Option<&'a str>,
     /// Última herramienta usada (`Bash · git diff --stat`).
     pub last_tool: Option<&'a str>,
+    /// Última skill invocada, tal cual (`superpowers:brainstorming`; `Run::skill`).
+    /// En una fila que funde varias ejecuciones, la de la representante.
+    pub skill: Option<&'a str>,
     /// El encargo completo, con sus saltos de línea (`Run::task_full`).
     pub task_full: Option<&'a str>,
     /// Los últimos pasos, del más antiguo al más reciente (`Run::steps`).
@@ -668,6 +671,7 @@ fn now_run<'a>(agents: &'a [Agent], r: &'a Run, now: DateTime<Utc>) -> NowRun<'a
         tools: r.tools,
         task,
         last_tool: r.last_tool.as_deref(),
+        skill: r.skill.as_deref(),
         task_full: r.task_full.as_deref(),
         steps: &r.steps,
         tool_counts: &r.tool_counts,
@@ -771,6 +775,7 @@ fn lone_call_line<'a>(agents: &'a [Agent], c: &'a Invocation) -> NowRun<'a> {
         tools: 0,
         task: c.prompt_line.as_deref().or(c.description.as_deref()),
         last_tool: None,
+        skill: None,
         task_full: None,
         steps: &[],
         tool_counts: &[],
@@ -1169,6 +1174,7 @@ mod tests {
         wf.session_id = Some("s".into());
         wf.task = Some("pintar".into());
         wf.last_tool = Some("Edit · README.md".into());
+        wf.skill = Some("superpowers:brainstorming".into());
         let all = [
             running("general-purpose", "2026-11-05T11:40:00Z", 15),
             run("docs", Some("/p"), "2026-11-05T11:50:00Z", 8),
@@ -1193,6 +1199,7 @@ mod tests {
                 tools: 4,
                 task: Some("pintar"),
                 last_tool: Some("Edit · README.md"),
+                skill: Some("superpowers:brainstorming"),
                 task_full: None,
                 steps: &[],
                 tool_counts: &[],
@@ -1852,9 +1859,14 @@ mod tests {
         let done = at_app(run("docs", None, "2026-11-05T11:20:00Z", 38), "toolu_done");
         let mut live = at_app(running("docs", "2026-11-05T11:10:00Z", 45), "toolu_live");
         live.tools = 9;
+        live.skill = Some("superpowers:brainstorming".into());
+        let mut done = done;
+        done.skill = Some("superpowers:writing-plans".into());
         let runs = [done, live];
         let groups = active_groups(&agents, &[], &runs, since, now, home());
         let l = &groups[0].lines[0];
+        // la skill es la de la representante (la en curso), no la de la terminada
+        assert_eq!(l.skill, Some("superpowers:brainstorming"));
         assert_eq!(groups[0].lines.len(), 1);
         assert_eq!((groups[0].running, groups[0].recent), (1, 0));
         assert_eq!(

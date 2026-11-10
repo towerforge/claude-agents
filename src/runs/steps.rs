@@ -34,6 +34,9 @@ impl ToolStep {
 pub(super) struct Steps {
     recent: VecDeque<ToolStep>,
     counts: HashMap<String, usize>,
+    /// Nombre de la última skill invocada (`Skill` con `input.skill`) en TODA
+    /// la ejecución: no se pierde aunque su paso salga de `recent`.
+    skill: Option<String>,
     /// Copias compartidas de lo anterior, rehechas por `seal` al acabar cada
     /// lectura: `Runs::runs()` solo clona el `Arc`, no los pasos.
     recent_arc: Arc<[ToolStep]>,
@@ -43,6 +46,9 @@ pub(super) struct Steps {
 impl Steps {
     pub(super) fn push(&mut self, step: ToolStep) {
         *self.counts.entry(step.name.clone()).or_default() += 1;
+        if step.name == "Skill" && step.arg.is_some() {
+            self.skill.clone_from(&step.arg);
+        }
         if self.recent.len() == MAX_STEPS {
             self.recent.pop_front();
         }
@@ -66,6 +72,11 @@ impl Steps {
     /// `Nombre · argumento` del último paso.
     pub(super) fn last_label(&self) -> Option<String> {
         self.recent.back().map(ToolStep::label)
+    }
+
+    /// La skill que manda: la última invocada; sigue hasta que se carga otra.
+    pub(super) fn skill(&self) -> Option<&str> {
+        self.skill.as_deref()
     }
 
     /// Los pasos guardados, del más antiguo al más reciente.

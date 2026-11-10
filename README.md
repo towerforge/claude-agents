@@ -52,7 +52,7 @@ No configuration: it looks for agents under your home directory (`~/.claude/agen
 ## Features
 
 - **Global and project agents**, grouped by project; a project agent only matches sessions launched inside its project, even if the main agent later did a `cd` elsewhere.
-- **Live monitor** of what is running and what finished within the window: task, current tool, context, tokens and time. Refreshes every 2 s.
+- **Live monitor** of what is running and what finished within the window: skill in use, current tool, context, tokens and time. Refreshes every 2 s.
 - **Claude Code's own agents and workflow steps** too, labeled `[claude]` and `[workflow]` next to your `[own]` ones.
 - **Time worked per day**, without pauses over 5 minutes.
 - **Tokens and context** per run, with the model.
@@ -66,7 +66,7 @@ No configuration: it looks for agents under your home directory (`~/.claude/agen
 
 Three views, as tabs in the header:
 
-- **active** (default): one block per agent and project with `task`, `now`/`last` and the subagent's `cwd`; running ones first, marked `✦`. Groups go by the folder where the Claude Code session was launched.
+- **active** (default): one block per agent and project with `now`/`last`, the subagent's `cwd` and, if it loaded one, its `skill`; running ones first, marked `✦`. Groups go by the folder where the Claude Code session was launched.
 - **all**: every agent on disk by project, with a 14-day bar, time worked, runs and last use.
 - **ranking**: agents with work in the period, from most to least.
 
