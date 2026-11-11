@@ -66,7 +66,7 @@ No configuration: it looks for agents under your home directory (`~/.claude/agen
 
 Three views, as tabs in the header:
 
-- **active** (default): one row per running run, marked `✦`, with its task, context, time and tokens, and `skill` and `now` under it; each one hangs from its agent's name, on a line of its own, and two or more running runs of the same agent share it. Below them, one line per agent for what finished within the window. Groups go by the folder where the Claude Code session was launched.
+- **active** (default): one block per agent, under its name on a line of its own, marked `✦` while something in it is running: one row per running run, with its task, context, time and tokens, and `skill` and `now` under it; then one row for what it finished within the window. A blank line separates the blocks. Groups go by the folder where the Claude Code session was launched.
 - **all**: every agent on disk by project, with a 14-day bar, time worked, runs and last use.
 - **ranking**: agents with work in the period, from most to least.
 
@@ -75,7 +75,7 @@ Three views, as tabs in the header:
 ### Flags
 
 ```sh
-claude-agents                       # interactive screen, 10 min window, whole home
+claude-agents                       # interactive screen, 5 min window, whole home
 claude-agents -m 60                 # last hour
 claude-agents -r ~/code -r ~/work   # narrows the search
 claude-agents -p -v                 # the table, plus the open sessions with pid and command
@@ -84,7 +84,7 @@ claude-agents -p -v                 # the table, plus the open sessions with pid
 | Flag | Meaning | Default |
 |---|---|---|
 | `-r`, `--root <DIR>` | Directories to search for `.claude/agents/*.md` (repeatable). `~/.claude/agents` is always added | the home directory |
-| `-m`, `--minutes <N>` | Window in minutes: an agent is active if it was used within it or has a run in progress | `10` |
+| `-m`, `--minutes <N>` | Window in minutes: an agent is active if it was used within it or has a run in progress | `5` |
 | `-v`, `--verbose` | Also shows open Claude sessions, with pid and command (only with `--plain`) | |
 | `-p`, `--plain` | Prints the table and exits, instead of opening the interactive screen. This also happens when the output is not a terminal | |
 | `-V`, `--version` | Prints the version and exits | |
@@ -94,10 +94,10 @@ claude-agents -p -v                 # the table, plus the open sessions with pid
 ```
 STATE     NAME      LAST USED     WORKED  PATH
 RUNNING   reviewer  2 min ago  1 h 4 min  ~/code/shop/api/.claude/agents/reviewer.md
-ACTIVE    backend   6 min ago     35 min  ~/code/shop/api/.claude/agents/backend.md
+ACTIVE    backend   4 min ago     35 min  ~/code/shop/api/.claude/agents/backend.md
 inactive  docs      3 d ago        4 min  ~/code/shop/web/.claude/agents/docs.md
 
-3 agents, 2 active (window: 10 min). Open Claude sessions: 2
+3 agents, 2 active (window: 5 min). Open Claude sessions: 2
 ```
 
 Details: [docs/interface.md](docs/interface.md#the---plain-table).

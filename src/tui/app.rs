@@ -234,12 +234,15 @@ pub struct NowLine {
     pub state: RunState,
     /// Ejecuciones (o llamadas) fundidas en la fila, ≥ 1: en curso siempre 1;
     /// solo las terminadas funden las de su agente. `id` es la que la
-    /// representa. La vista pinta `×N` solo si es mayor que 1.
+    /// representa. En `Item::LiveAgent`, en cambio, las de todo el bloque
+    /// del agente (lo que deja el filtro): de ahí sale `×N`, solo si es
+    /// mayor que 1.
     pub runs: usize,
-    /// Posición de una fila en curso en el racimo de su agente
-    /// (`status::Chain`), rehecha sobre lo que deja el filtro: la cabeza
-    /// lleva `Head(N)` con N filas visibles, y una que queda sola, `Single`.
-    /// Las terminadas, siempre `Single`.
+    /// Posición de la fila en el bloque (racimo) de su agente
+    /// (`status::Chain`), rehecha sobre lo que deja el filtro: primero las en
+    /// curso y la terminada, si la hay, al final. La cabeza lleva `Head(N)`
+    /// con N filas visibles (en curso más la terminada), la última `Last` y
+    /// una que queda sola, `Single`, esté en curso o terminada.
     pub chain: Chain,
     /// Tokens de todas las ejecuciones de la fila (columna «tokens»).
     pub tokens: u64,
@@ -290,7 +293,7 @@ pub enum Item {
     /// nombre corto es cosa de la vista. `running` son las filas en curso del
     /// grupo (una por ejecución) y `recent` las terminadas (una por agente),
     /// contadas sobre lo que deja el filtro (`running + recent` son las filas
-    /// que le siguen). No se selecciona.
+    /// que le siguen, repartidas en bloques por agente). No se selecciona.
     LiveGroup {
         section: String,
         running: usize,
@@ -302,18 +305,19 @@ pub enum Item {
     /// agente real lo es) y `None` si es built-in o un workflow sin agente
     /// definido. Enter abre en cualquier caso la ficha de la ejecución
     /// (`line.id`). En curso le siguen siempre `LiveSkill` (solo si tiene
-    /// skill) y `LiveNow`, y si es la primera de su racimo (o va sola) la
-    /// precede `LiveAgent`. Terminada, una sola línea.
+    /// skill) y `LiveNow`; terminada, nada (va la última de su bloque). Si es
+    /// la primera del bloque de su agente (`Head` o `Single`, en curso o
+    /// terminada) la precede `LiveAgent`.
     Live {
         n: usize,
         line: NowLine,
         row: Option<Row>,
     },
-    /// Activos: la línea del agente de un racimo en curso, justo encima de
-    /// su cabeza (`Chain::Head`, o `Chain::Single` si va sola: un racimo de
-    /// uno): nombre, etiqueta y `×N` (sin él si va sola), sin número ni
-    /// cifras. No se selecciona; es parte de la fila de debajo (scroll y
-    /// clic). Las terminadas no la llevan.
+    /// Activos: la línea del agente de un bloque, justo encima de su primera
+    /// fila (`Chain::Head`, o `Chain::Single` si va sola: un bloque de uno),
+    /// esté en curso o terminada: nombre, etiqueta y `×N` (`line.runs`, las
+    /// ejecuciones de todo el bloque; sin él si es 1), sin número ni cifras.
+    /// No se selecciona; es parte de la fila de debajo (scroll y clic).
     LiveAgent(NowLine),
     /// Activos: «skill …» (`line.skill`), justo bajo una fila en curso que
     /// tiene skill. No se selecciona; va siempre detrás de su `Live`.
@@ -358,6 +362,9 @@ pub enum Item {
         row: Row,
         work: PeriodStats,
     },
+    /// Línea en blanco: antes de la regla de cada grupo menos el primero y,
+    /// en activos, entre bloques de agente del mismo grupo. No se selecciona
+    /// ni es parte de ninguna fila.
     Blank,
 }
 
@@ -695,21 +702,21 @@ impl App {
     }
 
     /// Lo de activos: por proyecto (`status::active_groups`, ya en su orden
-    /// final: los grupos por su actividad más reciente; dentro, primero las en
-    /// curso, una por ejecución y en racimos por agente, y luego las
-    /// terminadas, una por agente), numerado de corrido por todo. El filtro
-    /// se aplica sobre las filas: nombre, carpeta del grupo (`group_dir`, lo
-    /// que se ve en el título), `cwd` real o encargo; un grupo sin filas no
-    /// sale, sus contadores `running`/`recent` se rehacen con lo que queda y
-    /// los racimos también (`rechain`). Arriba del todo, la cabecera de
-    /// columnas. Una fila en curso mide dos líneas (fila y `now`), tres si
-    /// tiene skill (justo bajo la fila); una terminada, una. La cabeza de un
-    /// racimo en curso, y la en curso que va sola (un racimo de uno), lleva
-    /// además, encima, la línea de su agente (`Item::LiveAgent`). Sin blancos
-    /// entre filas: solo un `Item::Blank` antes de la regla de cada grupo
-    /// menos el primero (que no es parte de ninguna fila para el scroll). Si
-    /// su agente es uno definido (`NowRun::owner`), lleva su fila para la
-    /// ficha.
+    /// final: los grupos por su actividad más reciente; dentro, un bloque por
+    /// agente con sus en curso, una por ejecución, y detrás su terminada, una
+    /// por agente; primero los agentes con algo en curso y luego los que solo
+    /// tienen terminada), numerado de corrido por todo. El filtro se aplica
+    /// sobre las filas: nombre, carpeta del grupo (`group_dir`, lo que se ve
+    /// en el título), `cwd` real o encargo; un grupo sin filas no sale, sus
+    /// contadores `running`/`recent` se rehacen con lo que queda y los
+    /// bloques también (`rechain`). Arriba del todo, la cabecera de columnas.
+    /// Una fila en curso mide dos líneas (fila y `now`), tres si tiene skill
+    /// (justo bajo la fila); una terminada, una. La primera fila de cada
+    /// bloque lleva además, encima, la línea de su agente (`Item::LiveAgent`).
+    /// Un `Item::Blank` antes de la regla de cada grupo menos el primero y
+    /// otro entre bloques de agente del mismo grupo; ninguno es parte de una
+    /// fila para el scroll. Si su agente es uno definido (`NowRun::owner`),
+    /// lleva su fila para la ficha.
     fn live_items(&self, needle: &str, n: &mut usize) -> Vec<Item> {
         let keep = |r: &status::NowRun| {
             let dir = |d: Option<&Path>| {
@@ -723,12 +730,14 @@ impl App {
         };
         let mut items = Vec::new();
         for group in self.groups() {
-            let lines: Vec<status::NowRun> = rechain(group.lines, keep);
-            if lines.is_empty() {
+            let blocks = rechain(group.lines, keep);
+            if blocks.is_empty() {
                 continue;
             }
-            let running = lines
+            let rows = blocks.iter().map(Vec::len).sum::<usize>();
+            let running = blocks
                 .iter()
+                .flatten()
                 .filter(|r| r.state == RunState::Running)
                 .count();
             if items.is_empty() {
@@ -740,55 +749,67 @@ impl App {
             items.push(Item::LiveGroup {
                 section: group.section,
                 running,
-                recent: lines.len() - running,
+                recent: rows - running,
             });
-            for r in lines {
-                *n += 1;
-                let row = r.owner.map(|i| Row {
-                    n: *n,
-                    ..self.row_of(i)
-                });
-                let line = NowLine {
-                    id: r.id.clone(),
-                    name: r.name.to_string(),
-                    task: r.task.map(String::from),
-                    since: r.since,
-                    worked: r.worked,
-                    kind: r.kind,
-                    skill: r.skill.map(String::from),
-                    last_tool: r.last_tool.map(String::from),
-                    state: r.state,
-                    runs: r.runs,
-                    tokens: r.tokens,
-                    context: r.context,
-                    chain: r.chain,
-                };
-                let running = line.state == RunState::Running;
-                // en curso, el nombre del agente va en su propia línea encima
-                // de la cabeza de su racimo, aunque el racimo sea de una
-                if running && matches!(line.chain, Chain::Head(_) | Chain::Single) {
-                    items.push(Item::LiveAgent(line.clone()));
+            for (b, block) in blocks.into_iter().enumerate() {
+                if b > 0 {
+                    // aire entre bloques de agente del mismo grupo
+                    items.push(Item::Blank);
                 }
-                items.push(Item::Live {
-                    n: *n,
-                    line: line.clone(),
-                    row,
-                });
-                // las terminadas son una sola línea; las en curso, siempre
-                // desplegadas: skill (si la hay) y now
-                if running {
-                    if line.skill.is_some() {
-                        items.push(Item::LiveSkill(line.clone()));
+                let runs = block.iter().map(|r| r.runs).sum();
+                for r in block {
+                    *n += 1;
+                    let row = r.owner.map(|i| Row {
+                        n: *n,
+                        ..self.row_of(i)
+                    });
+                    let line = NowLine {
+                        id: r.id.clone(),
+                        name: r.name.to_string(),
+                        task: r.task.map(String::from),
+                        since: r.since,
+                        worked: r.worked,
+                        kind: r.kind,
+                        skill: r.skill.map(String::from),
+                        last_tool: r.last_tool.map(String::from),
+                        state: r.state,
+                        runs: r.runs,
+                        tokens: r.tokens,
+                        context: r.context,
+                        chain: r.chain,
+                    };
+                    let running = line.state == RunState::Running;
+                    // el nombre del agente va en su propia línea encima de la
+                    // primera fila de su bloque, aunque sea de una o solo
+                    // terminada; con las ejecuciones de todo el bloque (×N)
+                    if matches!(line.chain, Chain::Head(_) | Chain::Single) {
+                        items.push(Item::LiveAgent(NowLine {
+                            runs,
+                            ..line.clone()
+                        }));
                     }
-                    items.push(Item::LiveNow(line));
+                    items.push(Item::Live {
+                        n: *n,
+                        line: line.clone(),
+                        row,
+                    });
+                    // las terminadas son una sola línea; las en curso, siempre
+                    // desplegadas: skill (si la hay) y now
+                    if running {
+                        if line.skill.is_some() {
+                            items.push(Item::LiveSkill(line.clone()));
+                        }
+                        items.push(Item::LiveNow(line));
+                    }
                 }
             }
         }
         items
     }
 
-    /// Activos, el monitor en directo: un grupo por proyecto con lo en curso y,
-    /// debajo, lo terminado en la ventana, numerado de corrido. Sin secciones
+    /// Activos, el monitor en directo: un grupo por proyecto con un bloque por
+    /// agente (lo en curso y, debajo, lo terminado en la ventana), numerado
+    /// de corrido. Sin secciones
     /// ni plegados. Si no hay nada y no se filtra, el último uso de cualquier
     /// agente; si el filtro lo deja vacío, nada.
     fn monitor_items(&self) -> Vec<Item> {
@@ -1060,8 +1081,7 @@ impl App {
     /// se vea: todo lo de encima si es la primera (columnas, regla del
     /// ranking, o la regla de grupo en activos) o su cabecera si es la primera de su sección.
     fn row_top(items: &[Item], line: usize) -> usize {
-        // la cabeza de un racimo (o la en curso sola) empieza en la línea
-        // de su agente
+        // la primera fila de un bloque empieza en la línea de su agente
         let line = match line.checked_sub(1).map(|l| &items[l]) {
             Some(Item::LiveAgent(_)) => line - 1,
             _ => line,
@@ -1589,23 +1609,18 @@ impl App {
     }
 }
 
-/// Las filas de un grupo de activos que deja `keep`, con los racimos de en
-/// curso rehechos sobre lo que queda: un racimo empieza en la `Head` o la
-/// `Single` de `status`, y sus supervivientes se vuelven a marcar (una sola,
-/// `Single`; varias, `Head(N)`…`Last`). Las terminadas no se tocan.
+/// Las filas de un grupo de activos que deja `keep`, en racimos (bloques
+/// por agente) rehechos sobre lo que queda: un racimo empieza en la `Head` o
+/// la `Single` de `status`, esté en curso o terminada (la terminada de un
+/// agente cierra su racimo), y sus supervivientes se vuelven a marcar (una
+/// sola, `Single`; varias, `Head(N)`…`Last`). No se reordena nada. Un racimo
+/// que el filtro deja vacío no sale.
 fn rechain<'a>(
     lines: Vec<status::NowRun<'a>>,
     keep: impl Fn(&status::NowRun) -> bool,
-) -> Vec<status::NowRun<'a>> {
+) -> Vec<Vec<status::NowRun<'a>>> {
     let mut clusters: Vec<Vec<status::NowRun<'a>>> = Vec::new();
-    let mut done = Vec::new();
     for l in lines {
-        if l.state != RunState::Running {
-            if keep(&l) {
-                done.push(l);
-            }
-            continue;
-        }
         if matches!(l.chain, Chain::Single | Chain::Head(_)) || clusters.is_empty() {
             clusters.push(Vec::new());
         }
@@ -1613,21 +1628,19 @@ fn rechain<'a>(
             clusters.last_mut().expect("recién creado").push(l);
         }
     }
-    let mut out = Vec::new();
-    for c in clusters {
+    clusters.retain(|c| !c.is_empty());
+    for c in &mut clusters {
         let n = c.len();
-        for (i, mut l) in c.into_iter().enumerate() {
+        for (i, l) in c.iter_mut().enumerate() {
             l.chain = match (n, i) {
                 (1, _) => Chain::Single,
                 (_, 0) => Chain::Head(n),
                 (_, i) if i + 1 == n => Chain::Last,
                 _ => Chain::Middle,
             };
-            out.push(l);
         }
     }
-    out.extend(done);
-    out
+    clusters
 }
 
 /// `haystack` contiene `needle` (ya en minúsculas) sin mirar mayúsculas.
@@ -2796,25 +2809,30 @@ pub(crate) mod tests {
         );
     }
 
-    /// Sin blancos entre filas, el cursor sigue viendo su fila entera (con
-    /// su línea `now`) al bajar y subir; el blanco antes de un título de grupo
-    /// no es parte de ninguna fila.
+    /// El cursor sigue viendo su fila entera (la línea de su agente encima y
+    /// su `now` debajo) al bajar y subir; los blancos, antes de un título de
+    /// grupo o entre bloques de agente, no son parte de ninguna fila.
     #[test]
     fn a_running_row_keeps_its_now_line_in_view() {
         let mut app = active(busy());
-        // Explore (3): regla de station en 5, su agente en 6, la fila en 7 y
-        // su now en 8; con 4 de alto la vista empieza en la regla
+        // Explore (3): regla de station en 8, su agente en 9, la fila en 10 y
+        // su now en 11; con 4 de alto la vista empieza en la regla
         app.cursor = 2;
-        assert_eq!(frame(&mut app, 4), 7);
-        assert_eq!(app.scroll, 5);
-        // general-purpose (7): agente en 18, fila en 19 y now en 20; la vista
-        // acaba en el 20
+        assert_eq!(frame(&mut app, 4), 10);
+        assert_eq!(app.scroll, 8);
+        // backend (5): blanco en 16, agente en 17, fila en 18 y now en 19;
+        // la vista acaba en el 19 y el blanco de encima no cuenta
+        app.cursor = 4;
+        assert_eq!(frame(&mut app, 4), 18);
+        assert_eq!(app.scroll, 16);
+        // general-purpose (7): regla en 24, agente en 25, fila en 26 y now en
+        // 27; la vista acaba en el 27
         app.cursor = 6;
-        assert_eq!(frame(&mut app, 4), 19);
-        assert_eq!(app.scroll, 17);
-        // y de vuelta al primero, con las columnas y su regla
+        assert_eq!(frame(&mut app, 4), 26);
+        assert_eq!(app.scroll, 24);
+        // y de vuelta al primero, con las columnas, su regla y su agente
         app.cursor = 0;
-        assert_eq!(frame(&mut app, 4), 2);
+        assert_eq!(frame(&mut app, 4), 3);
         assert_eq!(app.scroll, 0);
     }
 
@@ -2832,9 +2850,10 @@ pub(crate) mod tests {
             ],
             "grupos por su actividad más reciente; en curso y luego terminadas"
         );
-        // Columnas arriba y sin blancos entre filas: solo uno antes de cada
-        // regla de grupo salvo la primera, nunca al final. Una terminada mide
-        // una línea; una en curso sola, tres (su agente encima, la fila y su
+        // Columnas arriba; un blanco antes de cada regla de grupo salvo la
+        // primera y otro entre bloques de agente del mismo grupo, nunca al
+        // final. Todo bloque lleva encima la línea de su agente; una
+        // terminada mide una línea más; una en curso, dos (la fila y su
         // `now`), sin skill.
         let shape: Vec<&str> = items
             .iter()
@@ -2852,14 +2871,16 @@ pub(crate) mod tests {
         assert_eq!(
             shape,
             vec![
-                "columns", "group", "row", "row", // taskflow: 1, 2 terminadas
+                "columns", "group", // taskflow
+                "agent", "row", // 1 visual, terminada
+                "blank", "agent", "row", // 2 react-structure-checker, terminada
                 "blank", "group", // station
                 "agent", "row", "now", // 3 Explore
-                "agent", "row", "now", // 4 workflow
-                "agent", "row", "now", // 5 backend
-                "row", // 6 frontend, terminada
+                "blank", "agent", "row", "now", // 4 workflow
+                "blank", "agent", "row", "now", // 5 backend
+                "blank", "agent", "row", // 6 frontend, terminada
                 "blank", "group", "agent", "row", "now", // otro: 7 general-purpose
-                "blank", "group", "row", // station/front: 8 docs, terminada
+                "blank", "group", "agent", "row", // station/front: 8 docs, terminada
             ]
         );
         assert_eq!(
@@ -2888,7 +2909,7 @@ pub(crate) mod tests {
         assert_eq!(ended(&app, 3), RunState::Running);
         assert_eq!(ended(&app, 6), ended_at("2026-11-05T11:58:00Z"));
         assert_eq!(ended(&app, 7), RunState::Running);
-        let Item::LiveNow(wf) = &items[11] else {
+        let Item::LiveNow(wf) = &items[15] else {
             panic!("segunda línea de workflow")
         };
         assert_eq!(wf.name, "workflow-subagent: tarea");
@@ -2898,7 +2919,7 @@ pub(crate) mod tests {
         assert_eq!(wf.last_tool, None);
         assert_eq!(wf.since, Some("2026-11-05T11:56:00Z".parse().unwrap()));
         assert_eq!(wf.chain, Chain::Single, "único en curso de su agente");
-        let Item::Live { line, .. } = &items[7] else {
+        let Item::Live { line, .. } = &items[10] else {
             panic!("Explore")
         };
         assert_eq!(line.kind, RunKind::BuiltIn);
@@ -3176,10 +3197,11 @@ pub(crate) mod tests {
         wf.task = Some("revisar el cruce".into());
         let mut app = active(with_runs(fixture(), vec![wf]));
         let items = app.items();
-        // taskflow (2 terminadas) va antes; el workflow abre station: la 3,
-        // bajo la línea de su agente
-        assert!(matches!(items[6], Item::LiveAgent(_)));
-        let Item::Live { n, line, row } = &items[7] else {
+        // taskflow (2 terminadas, dos bloques con su agente y un blanco entre
+        // ellos) va antes; el workflow abre station: la 3, bajo la línea de su
+        // agente
+        assert!(matches!(items[9], Item::LiveAgent(_)));
+        let Item::Live { n, line, row } = &items[10] else {
             panic!("el workflow abre el grupo de station")
         };
         assert_eq!(*n, 3);
@@ -3492,24 +3514,26 @@ pub(crate) mod tests {
     fn a_block_scrolls_into_view_with_all_its_lines_running_or_finished() {
         let mut app = active(busy());
         key(&mut app, KeyCode::Char('7'));
-        // general-purpose en la 19, su agente en la 18 y su now en la 20; su
-        // regla en la 17
-        assert_eq!(frame(&mut app, 4), 19);
+        // general-purpose en la 26, su agente en la 25 y su now en la 27; su
+        // regla en la 24
+        assert_eq!(frame(&mut app, 4), 26);
         assert_eq!(
-            app.scroll, 17,
+            app.scroll, 24,
             "se ven la regla y las tres líneas de la fila"
         );
         key(&mut app, KeyCode::Char('1'));
         frame(&mut app, 3);
         assert_eq!(app.scroll, 0, "el primero arrastra la regla y las columnas");
-        // una terminada (la 6, en la 15) mide una línea
+        // una terminada (la 6, en la 22, con su agente en la 21) mide una
+        // línea más la de su agente
         key(&mut app, KeyCode::Char('6'));
         frame(&mut app, 3);
-        assert_eq!(app.scroll, 13, "la 6 en la última línea de la vista");
-        // la última (la 8, en la 23): con la regla de su grupo (22) a la vista
+        assert_eq!(app.scroll, 20, "la 6 en la última línea de la vista");
+        // la última (la 8, en la 31): con la regla de su grupo (29) y su
+        // agente (30) a la vista
         key(&mut app, KeyCode::Char('8'));
-        assert_eq!(frame(&mut app, 3), 23);
-        assert_eq!(app.scroll, 21);
+        assert_eq!(frame(&mut app, 3), 31);
+        assert_eq!(app.scroll, 29);
         key(&mut app, KeyCode::Home);
         frame(&mut app, 5);
         assert_eq!(app.scroll, 0);
@@ -3843,8 +3867,9 @@ pub(crate) mod tests {
     /// Station con `backend` ejecutado cuatro veces y `frontend` una:
     /// `toolu_b1` y `toolu_b2` terminadas (se funden en una fila, b2 la
     /// representa), `toolu_b3` (11:55) y `toolu_b4` (11:50) en curso, en
-    /// racimo, una fila cada una. Filas: 1 b3 (cabeza), 2 b4 (última),
-    /// 3 frontend (terminó 11:45), 4 backend ×2 (terminó 11:35).
+    /// racimo, una fila cada una, y la terminada de backend lo cierra.
+    /// Filas: 1 b3 (cabeza), 2 b4 (en medio), 3 backend ×2 (terminó 11:35,
+    /// última), 4 frontend (terminó 11:45, en su propio bloque).
     fn fused() -> App {
         let mut app = App::new(60, PathBuf::from("/Users/x"), "0.1.0", NOW.parse().unwrap());
         app.tz = Some(utc());
@@ -3922,8 +3947,10 @@ pub(crate) mod tests {
             .collect()
     }
 
+    /// Un bloque por agente: sus en curso (una fila por ejecución) y detrás
+    /// su terminada (una por agente, que funde las suyas), cerrando el racimo.
     #[test]
-    fn a_row_per_running_run_in_a_chain_and_one_per_agent_for_the_finished() {
+    fn a_row_per_running_run_in_a_chain_closed_by_the_finished_row_of_its_agent() {
         let app = fused();
         assert_eq!(
             chained(&app),
@@ -3933,7 +3960,7 @@ pub(crate) mod tests {
                     "backend".into(),
                     1,
                     "toolu_b3".into(),
-                    Chain::Head(2),
+                    Chain::Head(3),
                     some("revisar el cruce")
                 ),
                 (
@@ -3941,24 +3968,24 @@ pub(crate) mod tests {
                     "backend".into(),
                     1,
                     "toolu_b4".into(),
-                    Chain::Last,
+                    Chain::Middle,
                     some("revisar los tests")
                 ),
                 (
                     3,
+                    "backend".into(),
+                    2,
+                    "toolu_b2".into(),
+                    Chain::Last,
+                    some("backend: tarea")
+                ),
+                (
+                    4,
                     "frontend".into(),
                     1,
                     "toolu_f1".into(),
                     Chain::Single,
                     some("frontend: tarea")
-                ),
-                (
-                    4,
-                    "backend".into(),
-                    2,
-                    "toolu_b2".into(),
-                    Chain::Single,
-                    some("backend: tarea")
                 ),
             ]
         );
@@ -3967,8 +3994,9 @@ pub(crate) mod tests {
         assert_eq!(live_groups(&app), vec![(STATION_SECTION.into(), 2, 2)]);
     }
 
-    /// El filtro deja filas sueltas de un racimo: lo que queda se vuelve a
-    /// encadenar (una sola, `Single`) para que no se pinte un `└─` huérfano.
+    /// El filtro deja filas sueltas de un racimo (en curso o su terminada):
+    /// lo que queda se vuelve a encadenar (una sola, `Single`) para que no se
+    /// pinte un `└─` huérfano.
     #[test]
     fn the_filter_works_on_rows_and_rechains_what_is_left() {
         let mut app = fused();
@@ -3976,17 +4004,112 @@ pub(crate) mod tests {
         assert_eq!(live_groups(&app), vec![(STATION_SECTION.into(), 0, 1)]);
         assert_eq!(app.count(), 1);
         let mut app = fused();
-        type_filter(&mut app, "tests"); // encargo de b4, la última del racimo
+        type_filter(&mut app, "tests"); // encargo de b4, en medio del racimo
         assert_eq!(live_groups(&app), vec![(STATION_SECTION.into(), 1, 0)]);
         let rows = chained(&app);
         assert_eq!((rows[0].3.as_str(), rows[0].4), ("toolu_b4", Chain::Single));
         let mut app = fused();
-        type_filter(&mut app, "revisar"); // b3 y b4: el racimo entero
+        type_filter(&mut app, "revisar"); // b3 y b4: el racimo sin su terminada
         let rows = chained(&app);
         assert_eq!(
             rows.iter().map(|r| r.4).collect::<Vec<_>>(),
             vec![Chain::Head(2), Chain::Last]
         );
+        // la terminada es un miembro más del racimo y lo cierra
+        let mut app = fused();
+        type_filter(&mut app, "backend");
+        assert_eq!(
+            chained(&app)
+                .into_iter()
+                .map(|r| (r.3, r.4))
+                .collect::<Vec<_>>(),
+            vec![
+                ("toolu_b3".to_string(), Chain::Head(3)),
+                ("toolu_b4".to_string(), Chain::Middle),
+                ("toolu_b2".to_string(), Chain::Last),
+            ]
+        );
+        // solo las terminadas: cada una, sola en su bloque
+        let mut app = fused();
+        type_filter(&mut app, ": tarea");
+        assert_eq!(
+            chained(&app)
+                .into_iter()
+                .map(|r| (r.3, r.4))
+                .collect::<Vec<_>>(),
+            vec![
+                ("toolu_b2".to_string(), Chain::Single),
+                ("toolu_f1".to_string(), Chain::Single),
+            ]
+        );
+    }
+
+    /// Un blanco entre bloques de agente del mismo grupo, que no se
+    /// selecciona ni rompe la numeración; ni al principio del grupo ni al
+    /// final.
+    #[test]
+    fn a_blank_line_separates_the_agent_blocks_of_a_group() {
+        let app = fused();
+        let shape: Vec<String> = app
+            .items()
+            .iter()
+            .map(|i| match i {
+                Item::Columns => "columns".into(),
+                Item::LiveGroup { .. } => "group".into(),
+                Item::Live { n, .. } => format!("row {n}"),
+                Item::LiveSkill(_) => "skill".into(),
+                Item::LiveNow(_) => "now".into(),
+                Item::LiveAgent(l) => format!("agent {}", l.name),
+                Item::Blank => "blank".into(),
+                _ => "other".into(),
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                "columns",
+                "group",
+                "agent backend",
+                "row 1",
+                "now",
+                "row 2",
+                "now",
+                "row 3",
+                "blank",
+                "agent frontend",
+                "row 4",
+            ]
+        );
+        assert_eq!(app.count(), 4);
+    }
+
+    /// La línea del agente lleva en `runs` las ejecuciones de todo su
+    /// bloque (en curso más las que funde la terminada): de ahí sale `×N`.
+    #[test]
+    fn the_agent_line_counts_the_runs_of_its_whole_block() {
+        let app = fused();
+        let agents: Vec<(String, usize)> = app
+            .items()
+            .into_iter()
+            .filter_map(|i| match i {
+                Item::LiveAgent(l) => Some((l.name, l.runs)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            agents,
+            vec![("backend".to_string(), 4), ("frontend".to_string(), 1)]
+        );
+        let mut app = fused();
+        type_filter(&mut app, "revisar");
+        let Some(Item::LiveAgent(l)) = app
+            .items()
+            .into_iter()
+            .find(|i| matches!(i, Item::LiveAgent(_)))
+        else {
+            panic!("backend")
+        };
+        assert_eq!(l.runs, 2, "solo lo que deja el filtro");
     }
 
     /// La cabeza de un racimo lleva encima la línea de su agente, que es
@@ -4000,15 +4123,15 @@ pub(crate) mod tests {
             .position(|i| matches!(i, Item::Live { n: 1, .. }))
             .unwrap();
         assert!(
-            matches!(&items[head - 1], Item::LiveAgent(l) if l.name == "backend" && l.chain == Chain::Head(2))
+            matches!(&items[head - 1], Item::LiveAgent(l) if l.name == "backend" && l.chain == Chain::Head(3))
         );
         assert_eq!(
             items
                 .iter()
                 .filter(|i| matches!(i, Item::LiveAgent(_)))
                 .count(),
-            1,
-            "solo la cabeza; ni la última ni las sueltas"
+            2,
+            "una por bloque: backend y frontend (solo terminada)"
         );
         assert!(items[head - 1].n().is_none(), "no se selecciona");
         // la primera fila arrastra todo lo de encima
@@ -4027,8 +4150,8 @@ pub(crate) mod tests {
         assert_eq!(App::row_end(&v, 2), 2, "sin sublíneas en este corte");
     }
 
-    /// Una en curso sola (también la que deja sola el filtro) lleva encima
-    /// la línea de su agente, como un racimo de uno; la terminada, no.
+    /// Una fila sola (en curso, la que deja sola el filtro o una terminada)
+    /// lleva encima la línea de su agente, como un racimo de uno.
     #[test]
     fn a_single_run_in_progress_has_its_agent_line_above_it_inside_its_row() {
         let agents = |app: &App| -> Vec<(String, Chain, Option<usize>)> {
@@ -4045,10 +4168,13 @@ pub(crate) mod tests {
         let app = fused();
         assert_eq!(
             agents(&app),
-            vec![("backend".into(), Chain::Head(2), Some(1))],
-            "ni la última del racimo ni las terminadas (frontend, sola)"
+            vec![
+                ("backend".into(), Chain::Head(3), Some(1)),
+                ("frontend".into(), Chain::Single, Some(4)),
+            ],
+            "ni la del medio ni la última del racimo; sí la terminada sola"
         );
-        // el filtro deja sola la última del racimo: lleva su línea
+        // el filtro deja sola una del racimo: lleva su línea
         let mut app = fused();
         type_filter(&mut app, "tests");
         assert_eq!(
@@ -4083,7 +4209,7 @@ pub(crate) mod tests {
         assert_eq!(open_id(&app), "toolu_b4");
         assert_eq!(app.run_nav(), Some((2, 2)));
         key(&mut app, KeyCode::Esc);
-        key(&mut app, KeyCode::Char('4'));
+        key(&mut app, KeyCode::Char('3'));
         key(&mut app, KeyCode::Enter);
         assert_eq!(open_id(&app), "toolu_b2", "la que representa la terminada");
         assert_eq!(app.run_nav(), Some((1, 2)), "sus run_ids");
@@ -4115,12 +4241,12 @@ pub(crate) mod tests {
         assert!(app.run_detail.as_ref().unwrap().ended.is_none());
         key(&mut app, KeyCode::Esc);
 
-        key(&mut app, KeyCode::Char('4'));
+        key(&mut app, KeyCode::Char('3'));
         key(&mut app, KeyCode::Enter);
         key(&mut app, KeyCode::Left);
         assert_eq!(
             (open_id(&app).as_str(), app.run_nav(), app.cursor),
-            ("toolu_b1", Some((2, 2)), 3),
+            ("toolu_b1", Some((2, 2)), 2),
             "la terminada no cambia de fila"
         );
         key(&mut app, KeyCode::Left);
@@ -4133,7 +4259,7 @@ pub(crate) mod tests {
     #[test]
     fn without_siblings_left_and_right_do_nothing() {
         let mut app = fused();
-        key(&mut app, KeyCode::Char('3'));
+        key(&mut app, KeyCode::Char('4'));
         key(&mut app, KeyCode::Enter);
         assert_eq!((open_id(&app).as_str(), app.run_nav()), ("toolu_f1", None));
         key(&mut app, KeyCode::Left);
@@ -4145,18 +4271,23 @@ pub(crate) mod tests {
     fn up_and_down_walk_every_row_and_open_its_run() {
         let mut app = fused();
         key(&mut app, KeyCode::Enter);
-        for (id, cursor) in [("toolu_b4", 1), ("toolu_f1", 2), ("toolu_b2", 3)] {
+        for (id, cursor) in [("toolu_b4", 1), ("toolu_b2", 2), ("toolu_f1", 3)] {
             key(&mut app, KeyCode::Down);
             assert_eq!((open_id(&app).as_str(), app.cursor), (id, cursor));
         }
         key(&mut app, KeyCode::Down);
-        assert_eq!(open_id(&app), "toolu_b2", "extremo");
+        assert_eq!(open_id(&app), "toolu_f1", "extremo");
         // desde una que no representa a su fila, ↑↓ parten de su fila
+        key(&mut app, KeyCode::Up);
+        key(&mut app, KeyCode::Left);
+        assert_eq!(open_id(&app), "toolu_b1");
+        key(&mut app, KeyCode::Down);
+        assert_eq!((open_id(&app).as_str(), app.cursor), ("toolu_f1", 3));
+        key(&mut app, KeyCode::Up);
         key(&mut app, KeyCode::Left);
         assert_eq!(open_id(&app), "toolu_b1");
         key(&mut app, KeyCode::Up);
-        assert_eq!((open_id(&app).as_str(), app.cursor), ("toolu_f1", 2));
-        key(&mut app, KeyCode::Up);
+        assert_eq!((open_id(&app).as_str(), app.cursor), ("toolu_b4", 1));
         key(&mut app, KeyCode::Up);
         assert_eq!((open_id(&app).as_str(), app.cursor), ("toolu_b3", 0));
         key(&mut app, KeyCode::Up);
@@ -4168,7 +4299,7 @@ pub(crate) mod tests {
     #[test]
     fn the_refresh_keeps_the_open_run_when_the_representative_changes() {
         let mut app = fused();
-        key(&mut app, KeyCode::Char('4'));
+        key(&mut app, KeyCode::Char('3'));
         key(&mut app, KeyCode::Enter);
         key(&mut app, KeyCode::Left);
         assert_eq!(open_id(&app), "toolu_b1");
@@ -4193,8 +4324,8 @@ pub(crate) mod tests {
                 .map(|r| (r.3, r.4))
                 .collect::<Vec<_>>(),
             vec![
-                ("toolu_b4".to_string(), Chain::Single),
-                ("toolu_b3".to_string(), Chain::Single),
+                ("toolu_b4".to_string(), Chain::Head(2)),
+                ("toolu_b3".to_string(), Chain::Last),
                 ("toolu_f1".to_string(), Chain::Single),
             ]
         );
@@ -4206,16 +4337,16 @@ pub(crate) mod tests {
     #[test]
     fn esc_returns_to_the_row_that_contains_the_open_run() {
         let mut app = fused();
-        key(&mut app, KeyCode::Char('3'));
+        key(&mut app, KeyCode::Char('4'));
         key(&mut app, KeyCode::Enter);
-        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Up);
         key(&mut app, KeyCode::Left);
         assert_eq!(open_id(&app), "toolu_b1");
         app.cursor = 0; // fuera de sitio a propósito
         key(&mut app, KeyCode::Esc);
         assert!(app.run_detail.is_none());
         assert_eq!(
-            app.cursor, 3,
+            app.cursor, 2,
             "toolu_b1 vive en la fila terminada de backend"
         );
         // una en curso vuelve a SU fila, no a la cabeza de su racimo
@@ -4229,7 +4360,7 @@ pub(crate) mod tests {
     #[test]
     fn the_agent_detail_opens_from_a_run_that_is_not_the_representative() {
         let mut app = fused();
-        key(&mut app, KeyCode::Char('4'));
+        key(&mut app, KeyCode::Char('3'));
         key(&mut app, KeyCode::Enter);
         key(&mut app, KeyCode::Left);
         assert_eq!(open_id(&app), "toolu_b1");
@@ -4300,9 +4431,9 @@ pub(crate) mod tests {
         assert_eq!((ctx.used, ctx.window, ctx.percent()), (50_000, 200_000, 25));
         let b4 = live_line(&app, 2);
         assert_eq!((b4.tokens, b4.context.map(|c| c.used)), (500, Some(30_000)));
-        let frontend = live_line(&app, 3);
+        let frontend = live_line(&app, 4);
         assert_eq!((frontend.tokens, frontend.context), (300, None));
-        let backend = live_line(&app, 4);
+        let backend = live_line(&app, 3);
         assert_eq!(
             (backend.tokens, backend.context),
             (3000, None),
