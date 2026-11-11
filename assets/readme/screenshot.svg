@@ -34,12 +34,12 @@
 <text x="187.6" y="111" fill="#999999">1</text>
 <text x="204.4" y="111" fill="#999999" textLength="50.4" lengthAdjust="spacing">recent</text>
 <line x1="263.2" y1="106" x2="943.6" y2="106" stroke="#505050" stroke-width="1"/>
+<text x="36.4" y="133" fill="#d77757">❯</text>
+<text x="61.6" y="133" fill="#eb9f7f" textLength="16.8" lengthAdjust="spacing">1.</text>
 <text x="86.8" y="133" fill="#d77757">✦</text>
 <text x="103.6" y="133" fill="#eb9f7f" font-weight="700" textLength="67.2" lengthAdjust="spacing">reviewer</text>
 <text x="179.2" y="133" fill="#999999" textLength="42.0" lengthAdjust="spacing">[own]</text>
-<text x="229.6" y="133" fill="#505050" textLength="16.8" lengthAdjust="spacing">×3</text>
-<text x="36.4" y="155" fill="#d77757">❯</text>
-<text x="61.6" y="155" fill="#eb9f7f" textLength="16.8" lengthAdjust="spacing">1.</text>
+<text x="229.6" y="133" fill="#505050" textLength="16.8" lengthAdjust="spacing">×2</text>
 <text x="103.6" y="155" fill="#505050">├</text>
 <text x="120.4" y="155" fill="#faf9f5" textLength="50.4" lengthAdjust="spacing">Review</text>
 <text x="179.2" y="155" fill="#faf9f5" textLength="25.2" lengthAdjust="spacing">the</text>
@@ -62,7 +62,6 @@
 <text x="238.0" y="199" fill="#999999" textLength="42.0" lengthAdjust="spacing">cargo</text>
 <text x="288.4" y="199" fill="#999999" textLength="33.6" lengthAdjust="spacing">test</text>
 <text x="330.4" y="199" fill="#999999" textLength="151.2" lengthAdjust="spacing">orders::pagination</text>
-<text x="61.6" y="221" fill="#999999" textLength="16.8" lengthAdjust="spacing">2.</text>
 <text x="103.6" y="221" fill="#505050">├</text>
 <text x="120.4" y="221" fill="#faf9f5" textLength="42.0" lengthAdjust="spacing">Check</text>
 <text x="170.8" y="221" fill="#faf9f5" textLength="25.2" lengthAdjust="spacing">the</text>
@@ -83,7 +82,6 @@
 <text x="179.2" y="243" fill="#999999" textLength="33.6" lengthAdjust="spacing">Read</text>
 <text x="221.2" y="243" fill="#999999">·</text>
 <text x="238.0" y="243" fill="#999999" textLength="184.8" lengthAdjust="spacing">src/payments/client.rs</text>
-<text x="61.6" y="265" fill="#999999" textLength="16.8" lengthAdjust="spacing">3.</text>
 <text x="103.6" y="265" fill="#505050">└</text>
 <text x="120.4" y="265" fill="#999999" textLength="50.4" lengthAdjust="spacing">Review</text>
 <text x="179.2" y="265" fill="#999999" textLength="25.2" lengthAdjust="spacing">the</text>
@@ -95,10 +93,10 @@
 <text x="809.2" y="265" fill="#999999" textLength="25.2" lengthAdjust="spacing">min</text>
 <text x="842.8" y="265" fill="#999999" textLength="25.2" lengthAdjust="spacing">ago</text>
 <text x="910.0" y="265" fill="#999999" textLength="33.6" lengthAdjust="spacing">1.2M</text>
+<text x="61.6" y="309" fill="#999999" textLength="16.8" lengthAdjust="spacing">2.</text>
 <text x="86.8" y="309" fill="#d77757">✦</text>
 <text x="103.6" y="309" fill="#eb9f7f" font-weight="700" textLength="58.8" lengthAdjust="spacing">Explore</text>
 <text x="170.8" y="309" fill="#999999" textLength="67.2" lengthAdjust="spacing">[claude]</text>
-<text x="61.6" y="331" fill="#999999" textLength="16.8" lengthAdjust="spacing">4.</text>
 <text x="103.6" y="331" fill="#505050">└</text>
 <text x="120.4" y="331" fill="#faf9f5" textLength="33.6" lengthAdjust="spacing">Find</text>
 <text x="162.4" y="331" fill="#faf9f5" textLength="42.0" lengthAdjust="spacing">where</text>
@@ -124,12 +122,12 @@
 <text x="187.6" y="397" fill="#999999">1</text>
 <text x="204.4" y="397" fill="#999999" textLength="50.4" lengthAdjust="spacing">recent</text>
 <line x1="263.2" y1="392" x2="943.6" y2="392" stroke="#505050" stroke-width="1"/>
+<text x="61.6" y="419" fill="#999999" textLength="16.8" lengthAdjust="spacing">3.</text>
 <text x="86.8" y="419" fill="#d77757">✦</text>
 <text x="103.6" y="419" fill="#eb9f7f" font-weight="700" textLength="67.2" lengthAdjust="spacing">frontend</text>
 <text x="179.2" y="419" fill="#999999" textLength="42.0" lengthAdjust="spacing">[own]</text>
 <text x="229.6" y="419" fill="#999999" textLength="25.2" lengthAdjust="spacing">via</text>
 <text x="263.2" y="419" fill="#999999" textLength="67.2" lengthAdjust="spacing">workflow</text>
-<text x="61.6" y="441" fill="#999999" textLength="16.8" lengthAdjust="spacing">5.</text>
 <text x="103.6" y="441" fill="#505050">└</text>
 <text x="120.4" y="441" fill="#faf9f5" textLength="67.2" lengthAdjust="spacing">Paginate</text>
 <text x="196.0" y="441" fill="#faf9f5" textLength="25.2" lengthAdjust="spacing">the</text>
@@ -146,9 +144,9 @@
 <text x="179.2" y="485" fill="#999999" textLength="33.6" lengthAdjust="spacing">Edit</text>
 <text x="221.2" y="485" fill="#999999">·</text>
 <text x="238.0" y="485" fill="#999999" textLength="168.0" lengthAdjust="spacing">src/pages/Orders.tsx</text>
+<text x="61.6" y="529" fill="#999999" textLength="16.8" lengthAdjust="spacing">4.</text>
 <text x="103.6" y="529" fill="#999999" textLength="33.6" lengthAdjust="spacing">docs</text>
 <text x="145.6" y="529" fill="#999999" textLength="42.0" lengthAdjust="spacing">[own]</text>
-<text x="61.6" y="551" fill="#999999" textLength="16.8" lengthAdjust="spacing">6.</text>
 <text x="103.6" y="551" fill="#505050">└</text>
 <text x="120.4" y="551" fill="#999999" textLength="67.2" lengthAdjust="spacing">Document</text>
 <text x="196.0" y="551" fill="#999999" textLength="25.2" lengthAdjust="spacing">the</text>

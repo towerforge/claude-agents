@@ -51,6 +51,12 @@ from each line of the `.jsonl`, `timestamp`, `cwd`, `sessionId`, the
 `tool_use` blocks of `message.content` and, on assistant lines, `message.id`,
 `message.model` and `message.usage`.
 
+Recent versions of Claude Code (2.1.319 and later) also write `api-request*`
+lines (`api-request`, `api-request-blob`) in those transcripts: the request to
+the API, not a message of the run. Their `message` repeats `tool_use` blocks
+already written in `assistant` lines, so only their `timestamp` and
+`sessionId` are read: they add no tools, steps, skills or launched runs.
+
 1. **Time worked** of a run: the sum of the gaps between consecutive
    `timestamp`s, not counting those over **5 minutes**. This way a run resumed
    hours later does not count the wait.
@@ -60,8 +66,22 @@ from each line of the `.jsonl`, `timestamp`, `cwd`, `sessionId`, the
    gap from the last line to now is under 5 min, that gap. With `finished:
    false` but more than 10 min untouched, it is **interrupted**: it adds up the
    time worked and does not show as running. Without `finished` in the meta
-   (the ones launched by a workflow), it is running as long as the `.jsonl` was
-   written less than **2 minutes** ago.
+   (the ones launched by a workflow), it is running as long as its transcript
+   is not **closed** and the `.jsonl` was written less than **2 minutes** ago.
+   With `finished: true` it is never running.
+
+   A transcript is closed (`Run.closed`) when its last `assistant` or `user`
+   line is either of these; lines of other types (`attachment`, `system`…) do
+   not count:
+
+   - the `tool_result` without error (`is_error` not `true`) of a
+     `SubagentHandback` or `StructuredOutput` `tool_use`; or
+   - an `assistant` message with `stop_reason` `end_turn` or `stop_sequence`
+     and no `tool_use` block.
+
+   If anything else is written after that, the run is no longer closed and
+   counts as running again. A closed run does not add the gap up to now. With
+   `finished: false` the ending is not looked at: only the 10 minutes decide.
 4. **Which agent it goes to**: the same rule as calls, with `agentType` as the
    name: a global agent matches any run, a project one only runs whose session
    was launched inside the project (see [Launch folder](#launch-folder); the
@@ -105,7 +125,7 @@ For the active monitor, the following is also taken from each run's transcript:
   loaded skill stays in force until another one is loaded, so it is kept even
   when that step falls out of the last 200 steps. Empty if the run never invoked one.
 
-For the run details, also:
+For the [run screen](interface.md#the-run-screen), also:
 
 - **Full task** (`task_full`): the same first user message, but whole and with
   its line breaks, without the leading `ENCARGO (de …):` (or `TASK (from …):`)
@@ -116,9 +136,13 @@ For the run details, also:
 - **Tools** (`tool_counts`): uses per tool across the whole run, not only the
   200 steps, from most to least used and, on a tie, by name. The sum is
   `tools`.
+- **Skills** (`skills`): every `Skill` `tool_use` block with a non-empty
+  `input.skill`, each with the time of its line and its name, from the oldest
+  to the most recent; the last 50 are kept. The last one is the `skill` above.
+  They do not depend on the 200 steps either.
 
-Steps and counts are stored shared (`Arc`), so refreshing the screen does not
-copy them.
+Steps, skills and counts are stored shared (`Arc`), so refreshing the screen
+does not copy them.
 
 It is read like the history: the first pass whole and then only what was
 appended to each `.jsonl`; the meta is reread if its date or size changes. The
@@ -148,6 +172,9 @@ From the assistant lines of each run's transcript (`Run.usage`):
   with a copy of the parent's message that launched it, with the fork's own
   call (its `toolUseId`) inside: that line's usage is not the fork's and is
   skipped.
+- **Tokens of an agent** (the `tokens` column in all): the sum of that figure
+  over all its runs, ever, the same runs that make its total time; running
+  ones add what they carry so far.
 - **Model**: the latest `message.model` seen.
 - **Context**: `input + cache_read + cache_creation` of the latest assistant
   message. The window is 1M if the model id contains `[1m]` or if the run ever
@@ -192,8 +219,8 @@ directory:
   the temporary `cwd` the run was launched with, whether or not it was resolved
   (`None` if it was never temporary); `RunDetail.temp_cwd` carries it to the
   details, along with `cwd_resolved` (`true` if `cwd` is already another: the
-  session's was taken). With that the details paint the [temp folder
-  notice](interface.md#run-details). A call without a run does not have it.
+  session's was taken). With that the run screen paints the [temp folder
+  notice](interface.md#the-run-screen). A call without a run does not have it.
 - **Call** (`Invocation.cwd`): the first non-temporary `cwd` in the very file
   where the call is.
 
@@ -227,8 +254,9 @@ It decides three things, falling back to the `cwd` when it is not known:
 - which project agents match, and therefore `[own]` or `[claude]`, the time,
   runs and last use of each agent, in every view and in `--plain`: a project
   agent launched after a `cd /tmp` is still the project's;
-- the project in the [run details](interface.md#run-details) header, which adds
-  a `cwd` line when the subagent's differs.
+- the `running in` line of the [agent screen](interface.md#the-agent-screen)
+  and of the [run screen](interface.md#the-run-screen); the latter adds a `cwd`
+  line when the subagent's differs.
 
 The subagent's own `cwd` is kept apart: the active list does not show it, but
 `/` searches it there, and it is what the agent details' runs list shows.
@@ -250,11 +278,14 @@ own binary.
 
 - One JSON object per line and per run, with `"v":1` (a line of another
   version, or a broken one, is skipped). Only runs that are not in progress go
-  in; a running one goes in once it ends. It stores what the views need: agent,
+  in; a running one goes in once it ends, and a workflow run as soon as its
+  transcript is [closed](#how-worked-time-is-calculated), without waiting for
+  the 2 minutes. It stores what the views need: agent,
   description, session and its first prompt, links, `cwd`, launch folder
   (`launch_dir`), times, worked time
-  and its 15-minute slots, tool counts, task, tokens, model and context. Not the
-  steps, the last tool, the skill or the temporary `cwd`. Around 1 MB for some
+  and its 15-minute slots, tool counts, task, tokens, model and context, the
+  meta's `finished` and whether the transcript was closed (`closed`). Not the
+  steps, the last tool, the skills or the temporary `cwd`. Around 1 MB for some
   400 runs.
 - It is rewritten whole and atomically (a temporary file next to it, then
   `rename`), only when some run is new or changed, and merged first with what
@@ -264,11 +295,13 @@ own binary.
 - When reading, the transcript wins: the cache only adds the runs whose
   transcript is gone. Those count wherever the history counts (worked time,
   runs, the per-day chart, last use and the ranking), but they have no steps:
-  their details say `from the history cache · steps are not kept`. The ranking
+  their run screen says `from the history cache · steps are not kept`. The ranking
   says how many there are (`history kept: N runs older than Claude's cleanup`).
 - Lines written before `launch_dir` existed are read without a launch folder
-  (they are grouped and matched by their `cwd`); there is no migration and the
-  version stays `"v":1`.
+  (they are grouped and matched by their `cwd`), and lines written before
+  `closed` existed are read as not closed (they were kept once no longer in
+  progress, so they do not show as running either); there is no migration and
+  the version stays `"v":1`.
 - Tests never write there: they use their own temporary folders, or no cache.
 
 To start over, delete the file.
@@ -352,14 +385,28 @@ it off the network, set `CLAUDE_AGENTS_NO_UPDATE_CHECK=1` and do not run
 - «Running» relies on the meta's `finished` and the `.jsonl`'s date: a run that
   waits more than 10 min without writing anything (an unanswered permission, a
   long tool) shows as interrupted until it writes again. A workflow run, whose
-  meta carries no `finished`, stops showing as running after 2 min without
-  writing, and keeps showing for up to 2 min after finishing.
+  meta carries no `finished`, stops showing as running as soon as its
+  transcript ends in a final message (a `SubagentHandback` or
+  `StructuredOutput` result, or an assistant turn with no tools). One that
+  stops writing without that message (interrupted, or waiting on a long tool)
+  stops showing as running after 2 min, and keeps showing for up to those
+  2 min after it stopped.
+- A workflow run that ends a turn in plain text and is then asked to go on (a
+  step with an output schema that answers `end_turn` without calling
+  `StructuredOutput`, for example) shows as finished for the moment it takes
+  the next line to arrive; once that line is read it is running again.
 - Active merges the finished runs of the same agent in a project into a single
-  row: they can only be seen one by one from the details, with `←` `→`, and the
-  `recent` and `in window` counters count those rows, not runs (running runs
-  get a row each). An own agent and a `[claude]` one with the same name, or a
-  `visual [workflow]`, are different rows. The window (`-m`) decides which runs
-  get in: one older than it does not count in the `×N`.
+  row: they can only be seen one by one in the agent screen (`Enter` on the
+  block), and the `recent` and `in window` counters count those rows, not runs
+  (running runs get a row each). An own agent and a `[claude]` one with the
+  same name, or a `visual [workflow]`, are different rows. The window (`-m`)
+  decides which runs get in: one older than it does not count in the `×N` nor
+  show in the agent screen. The cursor and the numbers of the list go by agent
+  block, not by run.
+- The agent screen ignores the `/` filter: it always shows all the runs of the
+  block. The `×N` of the list counts only the running runs the filter leaves
+  (never the finished ones), so it can be lower than the screen's `N runs`
+  and its `run i of n`, with or without a filter.
 - Old calls, from before Claude Code stored one transcript per run, have no run
   of their own: they add no time or days, and in the details they only count in
   `+ N old calls with no recorded duration`. If they fall within the window, the
@@ -368,8 +415,8 @@ it off the network, set `CLAUDE_AGENTS_NO_UPDATE_CHECK=1` and do not run
 - Claude Code agents (`general-purpose`, `Explore`, `fork`…) have no definition
   on disk and do not show in all or in the ranking, even if they have runs. They
   do show in active, running and as finished within the window, but they add no
-  time or runs to any agent; there `Enter` opens the run details, but there are
-  no agent details (`a` does nothing). The same goes for a project agent from a
+  time or runs to any agent; there `Enter` opens the agent screen and, from it,
+  each run, but there are no agent details (`a` does nothing). The same goes for a project agent from a
   session launched outside its project; what counts is the [launch
   folder](#launch-folder), not the subagent's `cwd`.
 - If the parent session's transcript cannot be read (or has no real `cwd` in its
@@ -380,15 +427,15 @@ it off the network, set `CLAUDE_AGENTS_NO_UPDATE_CHECK=1` and do not run
 - Workflow runs with `agentType` `workflow-subagent` are not assigned to any
   agent for time, runs or ranking. They show in active, running and as finished
   within the window, and there the agent is resolved by the `description` (and
-  `a` in the run details opens that agent's details), but that run does not add
+  `a` in the agent screen opens that agent's details), but that run does not add
   to the agent's details or mark it with `✦` in all.
 - A workflow run launched with an explicit `agentType` adds time to that agent
   and shows in the «Runs» of its details, but it has no `Agent` call in the
   parent transcript: its last use comes from the run's last step.
-- The run details keep only the last 200 steps (the per-tool count does count
-  all) and the full task is cut at 2000 characters; in the details, the task
-  shows 8 lines at most and the tools 3. Its header uses the project's short
-  name, without the list's disambiguation of twin folders.
+- The run screen keeps only the last 200 steps (the per-tool count does count
+  all) and the last 50 skill invocations, and the full task is cut at 2000
+  characters; on screen, the task shows 8 lines at most, the tools 3 and the
+  skills 6.
 - Time worked is an approximation: it counts the time between transcript lines,
   not CPU or model time, and discards any pause over 5 min even if it was work
   (a long tool).
@@ -419,7 +466,7 @@ it off the network, set `CLAUDE_AGENTS_NO_UPDATE_CHECK=1` and do not run
   so an agent whose only uses were old calls without a run of their own may
   show as `never` once those transcripts are deleted. Runs whose transcripts
   were deleted before the tool ever ran are not in the cache either.
-- Runs from the history cache have no steps, last tool or skill, and nothing in
+- Runs from the history cache have no steps, last tool or skills, and nothing in
   them changes any more. Those kept before the launch folder existed, if their
   transcript is gone, go by their `cwd`: one launched after a `cd` can show in
   another group, or as `[claude]` if it left its project.

@@ -148,6 +148,7 @@ fn stored(r: &Run) -> Run {
         temp_cwd: None,
         last_tool: None,
         skill: None,
+        skills: Arc::from([]),
         steps: Arc::from([]),
         from_cache: true,
         ..r.clone()
@@ -216,6 +217,7 @@ fn to_line(r: &Run) -> String {
         "last": r.last.as_ref().map(stamp),
         "modified": stamp(&r.modified),
         "finished": r.finished,
+        "closed": r.closed,
         "worked_ms": ms(r.worked),
         "worked_slots": r.worked_slots.iter().map(|(s, d)| json!([stamp(s), ms(*d)])).collect::<Vec<_>>(),
         "tools": r.tools,
@@ -278,6 +280,9 @@ fn from_line(line: &str) -> Option<Run> {
         last: at("last"),
         modified: at("modified").unwrap_or_default(),
         finished: doc.get("finished").and_then(Value::as_bool),
+        // Las entradas anteriores a este campo no lo traen: `false`. Se
+        // guardaron ya paradas, así que tampoco cuentan como en curso.
+        closed: doc.get("closed").and_then(Value::as_bool) == Some(true),
         worked: delta(doc.get("worked_ms")),
         worked_slots: pairs("worked_slots")
             .filter_map(|(s, d)| Some((time(s)?, delta(Some(d)))))
@@ -308,7 +313,7 @@ fn from_line(line: &str) -> Option<Run> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runs::{Runs, ToolStep};
+    use crate::runs::{Runs, SkillUse, ToolStep};
 
     fn at(t: &str) -> DateTime<Utc> {
         t.parse().unwrap()
@@ -401,6 +406,11 @@ mod tests {
             .into(),
             last_tool: Some("Read".into()),
             skill: Some("superpowers:brainstorming".into()),
+            skills: vec![SkillUse {
+                at: at("2026-11-05T10:00:20Z"),
+                name: "superpowers:brainstorming".into(),
+            }]
+            .into(),
             temp_cwd: Some(PathBuf::from("/tmp/claude-501/x")),
             ..done("a1")
         };
@@ -408,6 +418,43 @@ mod tests {
         assert_eq!(back, stored(&r));
         assert!(back.from_cache && back.steps.is_empty() && back.last_tool.is_none());
         assert_eq!(back.skill, None);
+        assert!(back.skills.is_empty());
+    }
+
+    #[test]
+    fn the_closed_ending_survives_the_round_trip() {
+        let r = Run {
+            finished: None,
+            closed: true,
+            ..done("a1")
+        };
+        let back = from_line(&to_line(&r)).unwrap();
+        assert!(back.closed);
+        // Guardada al cerrarse, con el fichero recién tocado: no vuelve en curso.
+        assert!(!back.in_progress(at("2026-11-05T10:03:30Z")));
+        // Una línea anterior a este campo: no cerrada.
+        let old = to_line(&r).replace(r#""closed":true,"#, "");
+        assert!(!from_line(&old).unwrap().closed);
+    }
+
+    #[test]
+    fn a_closed_run_without_finished_is_kept_at_once() {
+        let tmp = TempDir::new("closed");
+        let path = tmp.0.join("runs.jsonl");
+        let mut kept = Kept::new(path.clone());
+        let open = Run {
+            finished: None,
+            ..done("a1")
+        };
+        let now = at("2026-11-05T10:03:30Z");
+        kept.keep(std::slice::from_ref(&open), now);
+        assert!(read(&path).unwrap().is_empty());
+        let closed = Run {
+            closed: true,
+            ..open
+        };
+        kept.keep(&[closed], now);
+        assert!(read(&path).unwrap()["a1"].closed);
     }
 
     #[test]

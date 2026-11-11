@@ -1,21 +1,23 @@
 //! Pintado de la pantalla: cabecera con pestañas, el monitor de activos (bloques
 //! de tres o cuatro líneas por proyecto, en curso y terminados en la ventana), la lista
 //! por grupos de todos, ranking, ficha y pie. Misma gramática que las listas de moon:
-//! `❯` en la fila del cursor, número en cada fila seleccionable, reglas
-//! ` título ─── info ` y pie con las teclas. Aquí no se decide nada: se pinta
-//! lo que da `App`.
+//! `❯` en la fila del cursor, número en cada fila seleccionable (en activos,
+//! uno por bloque, en la línea de su agente), reglas ` título ─── info ` y pie
+//! con las teclas. Aquí no se decide nada: se pinta lo que da `App`.
 
 use crate::report;
 use crate::status::{
     Chain, Context, LaunchedBy, Period, PeriodStats, RankKey, RunDetail, RunKind, RunLink, RunState,
 };
+use crate::tui::app::agent::AgentRun;
 use crate::tui::app::{
-    App, Hits, Item, LastUse, Mode, NowLine, Order, Row, RowHit, RunLine, TabHit, DAYS, MAX_DAYS,
+    AgentItem, AgentView, App, Hits, Item, LastUse, Mode, NowLine, Order, Row, RowHit, RunLine,
+    TabHit, DAYS, MAX_DAYS,
 };
 use crate::tui::theme::Theme;
 use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use ratatui::Frame;
@@ -63,22 +65,49 @@ const LOADING_PATH_MIN: usize = 4;
 
 const DETAIL_KEYS: &[(&str, &str)] = &[("esc", "back"), ("↑↓", "other agent"), ("q", "quit")];
 
-/// Pie de la ficha de ejecución. Cada una sale solo si vale (`run_footer`).
+/// Pie de la pantalla de la ejecución. Cada una sale solo si vale
+/// (`run_footer`); `esc` lleva detrás a dónde vuelve (`back to <agente>`).
 const RUN_KEYS: &[(&str, &str)] = &[
     ("esc", "back"),
     // ←→ solo sale si el agente tiene más de una ejecución (`run_nav`).
-    ("↑↓", "other agent"),
     ("←→", "other run"),
     ("tab", "launched"),
     ("enter", "open"),
     ("pgup/pgdn", "steps"),
     ("p", "parent"),
+    ("q", "quit"),
+];
+/// Las teclas de la pantalla de la ejecución que se quitan, en este orden,
+/// si el pie no cabe (esc y q nunca): los pasos, que también mueve la rueda;
+/// la madre y las hijas, que son desvíos; `←→`, que es por donde se anda en
+/// esta pantalla; y `enter`, que solo sale con una hija elegida, la última.
+const RUN_MINOR_KEYS: &[&str] = &["pgup/pgdn", "p", "tab", "←→", "enter"];
+/// Pie de la pantalla del agente. `←→` y `a` salen solo si valen
+/// (`agent_footer`).
+const AGENT_KEYS: &[(&str, &str)] = &[
+    ("esc", "back"),
+    ("↑↓", "run"),
+    ("enter", "open run"),
+    ("←→", "other agent"),
     ("a", "agent"),
     ("q", "quit"),
 ];
-/// Las teclas de la ficha de ejecución que se quitan, en este orden, si el
-/// pie no cabe (esc y q nunca).
-const RUN_MINOR_KEYS: &[&str] = &["←→", "a", "pgup/pgdn", "↑↓", "p", "tab", "enter"];
+/// Las teclas de la pantalla del agente que se quitan, en este orden, si el
+/// pie no cabe (esc y q nunca): la ficha de siempre, que es un desvío; las
+/// flechas, que se adivinan; y `enter`, la acción de la pantalla, la última.
+const AGENT_MINOR_KEYS: &[&str] = &["a", "←→", "↑↓", "enter"];
+/// Columnas mínimas para la tarea de una ejecución en la pantalla del
+/// agente; con menos, se van las cifras de la derecha.
+const AGENT_TASK_MIN: usize = 8;
+/// Líneas que se guardan para las ejecuciones antes de dar sitio a las
+/// rutas de la cabecera: una regla y una fila en curso con `now` y `skills`.
+const AGENT_ROWS_MIN: usize = 4;
+/// Ancho de la etiqueta (`now`, `skills`) de las sublíneas de una ejecución
+/// en la pantalla del agente.
+const AGENT_LABEL_W: usize = 8;
+/// Ancho de la etiqueta de las líneas bajo la cabecera de las dos pantallas
+/// de activos (`launched by`, `defined in`, `running in`, `cwd`), con su hueco.
+const META_LABEL_W: usize = 13;
 /// Ancho mínimo de la ruta temporal en el aviso; con menos, no sale.
 const NOTICE_PATH_MIN: usize = 8;
 /// Líneas como mucho del encargo y de las herramientas en la ficha de ejecución.
@@ -86,8 +115,13 @@ const RUN_TASK_MAX: usize = 8;
 const RUN_TOOLS_MAX: usize = 3;
 /// Hijas como mucho en «launched»; con más, una ventana que sigue a la elegida.
 const RUN_LAUNCHED_MAX: usize = 6;
-/// Ancho de la etiqueta de las filas de uso («cache write» y dos de hueco).
-const USAGE_LABEL_W: usize = 13;
+/// Ancho de la etiqueta de las dos filas de uso («context» y dos de hueco).
+const USAGE_LABEL_W: usize = 9;
+/// Skills como mucho en «skills»; con más, las más recientes.
+const RUN_SKILLS_MAX: usize = 6;
+/// Columnas mínimas del nombre del agente en la cabecera de la ejecución;
+/// con menos, se va con su `›`.
+const RUN_AGENT_MIN: usize = 4;
 /// La barra de contexto de la ficha: elástica entre estos dos anchos; con
 /// menos sitio, no sale.
 const USAGE_GAUGE_MIN: usize = 8;
@@ -103,8 +137,8 @@ const RUN_TAG_MIN_W: usize = 50;
 
 /// Por debajo de este ancho la lista no lleva barrita de días.
 const SPARK_MIN_W: usize = 100;
-/// Por debajo de este ancho la lista no lleva la columna de ejecuciones.
-const RUNS_MIN_W: usize = 80;
+/// Por debajo de este ancho la lista no lleva la columna de tokens.
+const TOKENS_MIN_W: usize = 80;
 /// Desde este ancho de terminal salen las columnas «ctx» y «tokens» de
 /// activos; por debajo solo queda «time».
 const LIVE_FIGURES_MIN_W: usize = 70;
@@ -379,8 +413,8 @@ fn kind_tag(kind: RunKind, room: usize) -> String {
     }
 }
 
-/// La etiqueta de una fila de activos: la de `kind_tag` más ` ×N` en gris si
-/// la fila funde varias ejecuciones (`runs > 1`). El orden es
+/// La etiqueta de la línea del agente en activos: la de `kind_tag` más ` ×N`
+/// en gris si el bloque tiene varias en curso (`runs > 1`). El orden es
 /// `[own] via workflow ×3` (o `[workflow] ×3`); si no cabe en `room` se pierde
 /// primero `via workflow`, luego ` ×N` y por último el origen: nombre > origen
 /// > ×N > `via workflow`.
@@ -427,17 +461,30 @@ fn today(app: &App) -> NaiveDate {
 pub fn render(app: &mut App, frame: &mut Frame, t: &Theme) {
     let area = frame.area();
     let w = area.width as usize;
-    // cabecera, segunda línea, cuerpo, pie
-    let body_h = area.height.saturating_sub(3) as usize;
+    // las pantallas del agente y de la ejecución van a pantalla completa:
+    // sin la fila de pestañas ni la segunda línea
+    let full = app.hides_tabs();
+    let head = if full { 0 } else { 2 };
+    // cabecera y segunda línea (si van), cuerpo, pie
+    let body_h = (area.height as usize).saturating_sub(head + 1);
     // el mapa de clics se rehace con lo que pinta este fotograma
     app.hits = Hits::default();
-    let (top, tabs) = top_line(app, t, area);
-    app.hits.tabs = tabs;
-    let mut lines = vec![top, second_line(app, t, w)];
+    let mut lines = Vec::new();
+    if !full {
+        let (top, tabs) = top_line(app, t, area);
+        app.hits.tabs = tabs;
+        lines.push(top);
+        lines.push(second_line(app, t, w));
+    }
     let mut scrollbar = None;
+    let agent = app.agent_view().filter(|_| full);
     let footer = if app.run_detail.is_some() {
         lines.extend(run_detail_lines(app, t, w, body_h));
         run_footer(app, t, w)
+    } else if let Some(v) = agent {
+        let (body, pos) = agent_lines(app, &v, t, area, w, body_h);
+        lines.extend(body);
+        agent_footer(app, t, w, pos)
     } else if app.detail && app.current().is_some() {
         lines.extend(detail_lines(app, t, w, body_h));
         footer_with_version(
@@ -461,7 +508,7 @@ pub fn render(app: &mut App, frame: &mut Frame, t: &Theme) {
         let bar = app.loaded && body_h > 0 && items.len() > body_h;
         let list_w = if bar { w.saturating_sub(1) } else { w };
         if bar {
-            let body = Rect::new(area.x, area.y + 2, area.width, body_h as u16);
+            let body = Rect::new(area.x, area.y + head as u16, area.width, body_h as u16);
             scrollbar = Some((body, items.len()));
         }
         if !app.loaded {
@@ -484,16 +531,15 @@ pub fn render(app: &mut App, frame: &mut Frame, t: &Theme) {
             // los umbrales responsive miran la terminal, no la barra de scroll
             let cols = Columns::of(app, &items, w, list_w);
             // la fila seleccionable de cada línea: la suya, o en un bloque de
-            // activos la de su `Live`, aunque el scroll lo haya dejado arriba
+            // activos la de su `LiveAgent`, aunque el scroll lo haya dejado arriba
             let mut block = None;
             for (i, item) in items.iter().enumerate().take(app.scroll + body_h) {
                 let cursor = match item {
-                    // la línea del agente (racimo o en curso sola) es de la fila de debajo
-                    Item::LiveAgent(_) => items.get(i + 1).and_then(Item::n).map(|n| n - 1),
-                    Item::LiveSkill(_) | Item::LiveNow(_) => block,
+                    // las filas de un bloque y sus sublíneas son del bloque
+                    Item::Live { .. } | Item::LiveSkill(_) | Item::LiveNow(_) => block,
                     _ => item.n().map(|n| n - 1),
                 };
-                if matches!(item, Item::Live { .. }) {
+                if matches!(item, Item::LiveAgent { .. }) {
                     block = cursor;
                 }
                 if i < app.scroll {
@@ -503,7 +549,7 @@ pub fn render(app: &mut App, frame: &mut Frame, t: &Theme) {
                 lines.extend(item_lines(app, item, &cols, t, list_w));
                 if let Some(cursor) = cursor {
                     // solo las líneas que caben en el cuerpo
-                    for y in first..lines.len().min(2 + body_h) {
+                    for y in first..lines.len().min(head + body_h) {
                         app.hits.rows.push(RowHit {
                             row: area.y + y as u16,
                             cursor,
@@ -513,10 +559,10 @@ pub fn render(app: &mut App, frame: &mut Frame, t: &Theme) {
             }
             if kept > 0 {
                 // con sitio, separada de las filas por una línea en blanco
-                if lines.len() < 2 + body_h {
+                if lines.len() < head + body_h {
                     lines.push(Line::default());
                 }
-                lines.truncate(2 + body_h);
+                lines.truncate(head + body_h);
                 let note = format!(
                     "history kept: {} older than Claude's cleanup",
                     plural(kept, "run", "runs")
@@ -534,10 +580,10 @@ pub fn render(app: &mut App, frame: &mut Frame, t: &Theme) {
             footer_with_version(app, t, w, keys, None)
         }
     };
-    while lines.len() < 2 + body_h {
+    while lines.len() < head + body_h {
         lines.push(Line::default());
     }
-    lines.truncate(2 + body_h);
+    lines.truncate(head + body_h);
     lines.push(footer);
     frame.render_widget(Paragraph::new(lines), area);
     if let Some((body, total)) = scrollbar {
@@ -595,16 +641,28 @@ fn centered(mut spans: Vec<Span<'static>>, w: usize) -> Line<'static> {
     Line::from(spans)
 }
 
-/// ` ✦ visual [propio] vía workflow · station              lleva 4 min · 38 herr.`
+/// ` visual [own] › ✦ run 1 of 4            running 4 min · 5 tools · 412k tok`
 ///
-/// Cabecera de la ficha de ejecución. La estrella que parpadea en `claude` si
-/// está en curso (en blanco si terminó, el hueco se guarda), el nombre (como en la lista: `claude-soft`
-/// negrita en curso, `ink` terminada), la etiqueta de origen (`[propio]`,
-/// `[claude]`, y `vía workflow` si procede) y el proyecto en gris, y a la derecha lo trabajado y las herramientas. Terminada, en vez de
-/// lo trabajado, `terminó hace N min`. Estrecha, pierde `lleva …` (menos de 70
-/// columnas) y la etiqueta (menos de 50).
+/// Cabecera de la pantalla de la ejecución. En gris, de dónde se viene: el
+/// agente, su etiqueta de origen (`[own]`, `[claude]`, y `via workflow` si
+/// procede) y `›`. Luego lo que se mira: la estrella si está en curso y
+/// `run i of n` (`App::run_nav`: su número en la pantalla del agente) por
+/// estado, `claude-soft` negrita en curso e `ink` terminada, que no lleva
+/// estrella ni su hueco. A la derecha, en gris y hasta la columna de las
+/// reglas, lo trabajado, las herramientas y los tokens; terminada,
+/// `ended N min ago`.
+///
+/// `run i of n` es el título de la pantalla y el ancla de `←→`: sale
+/// siempre, también `run 1 of 1`. Estrecha, cede por este orden:
+/// `running …` y los tokens (menos de 70 columnas), la etiqueta (menos de
+/// 50), el nombre del agente, que se corta con `…` y sin sitio para cuatro
+/// columnas se va con su `›` (el pie lo repite en `esc back to …`), y por
+/// último las cifras de la derecha.
+///
+/// Si la ejecución ya no está en la ventana de activos no hay `i of n` que
+/// decir: la cabecera es la estrella y el nombre por estado con su etiqueta.
 fn run_header_line(app: &App, d: &RunDetail, t: &Theme, w: usize) -> Line<'static> {
-    // los tokens, con el ancho de `lleva …`
+    // los tokens, con el ancho de `running …`
     let tok = if w >= RUN_WORKED_MIN_W && d.tokens > 0 {
         format!(" · {} tok", report::tokens(d.tokens))
     } else {
@@ -623,45 +681,52 @@ fn run_header_line(app: &App, d: &RunDetail, t: &Theme, w: usize) -> Line<'stati
         }
         None => tools(d.tools),
     };
-    let right_w = width(&right) + 1;
-    // el proyecto es la carpeta donde se lanzó la sesión; si no se sabe, el cwd
-    let project_dir = d.launch_dir.as_ref().or(d.cwd.as_ref());
-    let mut shown_project = project_dir.is_none();
-    let mut spans = vec![Span::raw(" "), star_slot(d.ended.is_none(), app.now, t)];
-    let mut room = w.saturating_sub(1 + STAR_W + right_w + 2);
-    let name = truncate(&d.name, room);
-    room = room.saturating_sub(width(&name));
-    spans.push(Span::styled(name, state_name_style(d.ended.is_some(), t)));
-    if w >= RUN_TAG_MIN_W {
-        let tag = kind_tag(d.kind, room.saturating_sub(1));
-        room -= width(&tag);
-        if !tag.is_empty() {
-            spans.push(Span::styled(tag, t.muted()));
+    let running = d.ended.is_none();
+    let state = state_name_style(!running, t);
+    // lo que queda a la izquierda, con dos de hueco y la columna del borde
+    let mut room = w.saturating_sub(1 + width(&right) + 2 + 1);
+    let mut spans = vec![Span::raw(" ")];
+    match app.run_nav() {
+        Some((i, n)) => {
+            let star = if running { STAR_W } else { 0 };
+            let label = format!("run {i} of {n}");
+            let fixed = star + width(&label);
+            let sep = " › ";
+            // el agente, solo si tras él caben `›` y el título entero
+            let name_room = room.saturating_sub(fixed + width(sep));
+            if name_room >= RUN_AGENT_MIN.min(width(&d.name)) {
+                let name = truncate(&d.name, name_room);
+                let left = name_room - width(&name);
+                spans.push(Span::styled(name, t.muted()));
+                if w >= RUN_TAG_MIN_W {
+                    let tag = kind_tag(d.kind, left);
+                    if !tag.is_empty() {
+                        spans.push(Span::styled(tag, t.muted()));
+                    }
+                }
+                spans.push(Span::styled(sep, t.muted()));
+            }
+            if running {
+                spans.push(star_slot(true, app.now, t));
+            }
+            let label_room = w.saturating_sub(spans_width(&spans) + 1);
+            spans.push(Span::styled(truncate(&label, label_room), state));
+        }
+        None => {
+            spans.push(star_slot(running, app.now, t));
+            room = room.saturating_sub(STAR_W);
+            let name = truncate(&d.name, room);
+            room -= width(&name);
+            spans.push(Span::styled(name, state));
+            if w >= RUN_TAG_MIN_W {
+                let tag = kind_tag(d.kind, room);
+                if !tag.is_empty() {
+                    spans.push(Span::styled(tag, t.muted()));
+                }
+            }
         }
     }
-    if let Some(dir) = project_dir {
-        let project = short_project(&dir.to_string_lossy());
-        if 3 + width(&project) <= room {
-            spans.push(Span::styled(format!(" · {project}"), t.muted()));
-            room -= 3 + width(&project);
-            shown_project = true;
-        }
-    }
-    // «ejecución i/n» cede antes que `lleva …` y que el proyecto: solo sale
-    // con ancho para `lleva` y si sobra sitio tras el nombre y el proyecto
-    let mut right = right;
-    if let Some((i, n)) = app.run_nav() {
-        let nav = format!("run {i}/{n} · ");
-        if w >= RUN_WORKED_MIN_W && shown_project && width(&nav) <= room {
-            right = format!("{nav}{right}");
-        }
-    }
-    split_line(
-        spans,
-        vec![Span::styled(format!("{right} "), t.muted())],
-        w,
-        t,
-    )
+    split_line(spans, vec![Span::styled(right, t.muted())], w, t)
 }
 
 /// `   lanzada desde la carpeta temporal de Claude · proyecto tomado de la sesión · ~/tmp/x`
@@ -698,13 +763,7 @@ fn cwd_notice(app: &App, d: &RunDetail, t: &Theme, w: usize) -> Option<Line<'sta
     if launch == cwd {
         return None;
     }
-    let label = "   cwd          ";
-    let room = w.saturating_sub(width(label) + 1);
-    let path = truncate(&report::shorten(cwd, &app.home), room);
-    Some(Line::from(Span::styled(
-        format!("{label}{path}"),
-        t.muted(),
-    )))
+    Some(path_line(app, "cwd", cwd, t, w))
 }
 
 /// El encargo entero, con sus saltos de línea, ajustado a `room` columnas.
@@ -745,8 +804,8 @@ fn run_tool_lines(d: &RunDetail, room: usize) -> Vec<Vec<(String, String)>> {
 /// id corto y su primer prompt entre comillas, recortado), otra ejecución
 /// (su nombre en `ink` y su etiqueta: `p` la abre) o una que ya no está.
 fn launched_by_line(d: &RunDetail, t: &Theme, w: usize) -> Option<Line<'static>> {
-    let label = "   launched by  ";
-    let room = w.saturating_sub(width(label) + 1);
+    let label = format!("   {}", pad("launched by", META_LABEL_W, false));
+    let room = w.saturating_sub(width(&label) + 1);
     let mut spans = vec![Span::styled(label, t.muted())];
     match d.launched_by.as_ref()? {
         LaunchedBy::Session { id, prompt } => {
@@ -791,11 +850,19 @@ fn context_gauge(c: Context, width: usize, t: &Theme) -> Vec<Span<'static>> {
     ]
 }
 
-/// ` usage ──────────── sonnet-5-5` y sus filas:
+/// ` usage ──────────── sonnet-5-5` y sus dos filas:
 ///
-/// `   context       71%  ████████▍░░░░  142k of 200k`, y entrada, salida,
-/// lectura y escritura de caché con la cifra en corto, alineada a la derecha
-/// en `ink`. Sin coste en dólares: se va por suscripción y la cifra a precio
+/// ```text
+///    context  71%   ████████▍░░░░  142k of 200k
+///    tokens   412k  input 18k · output 24k · cache read 351k · cache write 19k
+/// ```
+///
+/// Etiqueta en gris, la cifra de la fila en `ink` negrita (el porcentaje, en
+/// ámbar desde `CTX_WARN`) y, en una misma columna, el detalle: la barra y
+/// `usado of ventana` en gris, y el desglose con las etiquetas en gris y las
+/// cifras en `ink`. Estrecha, la barra encoge y se va, y el desglose baja a
+/// más líneas bajo su columna sin perder ninguna cifra. Sin dato, `—` en
+/// `subtle`. Sin coste en dólares: se va por suscripción y la cifra a precio
 /// de API no es lo que se paga. Vacío si no hay nada que contar.
 fn usage_lines(d: &RunDetail, t: &Theme, w: usize) -> Vec<Line<'static>> {
     if d.tokens == 0 && d.context.is_none() && d.usage.model.is_none() {
@@ -810,38 +877,37 @@ fn usage_lines(d: &RunDetail, t: &Theme, w: usize) -> Vec<Line<'static>> {
     let ctx = d
         .context
         .map_or("—".to_string(), |c| format!("{}%", c.percent()));
-    let rows = [
-        ("input", report::tokens(tk.input)),
-        ("output", report::tokens(tk.output)),
-        ("cache read", report::tokens(tk.cache_read)),
-        ("cache write", report::tokens(tk.cache_creation)),
-    ];
-    let value_w = rows
-        .iter()
-        .map(|(_, v)| width(v))
-        .chain([width(&ctx)])
-        .max()
-        .unwrap_or(0);
-    let row = |label: &str, value: &str| -> Vec<Span<'static>> {
+    let total = tokens_cell(d.tokens);
+    let value_w = width(&ctx).max(width(&total));
+    let head = |label: &str, value: &str, style: Style| -> Vec<Span<'static>> {
         vec![
             Span::styled(
                 format!("   {}", pad(label, USAGE_LABEL_W, false)),
                 t.muted(),
             ),
             Span::styled(
-                pad(value, value_w, true),
-                if value == "—" { t.line() } else { t.text() },
+                pad(value, value_w, false),
+                if value == "—" { t.line() } else { style },
             ),
         ]
     };
     let mut lines = vec![section_line(t, "usage", t.soft(), &model, w)];
-    let mut first = row("context", &ctx);
-    if d.context.is_some_and(|c| c.percent() >= CTX_WARN) {
-        first[1] = Span::styled(first[1].content.to_string(), t.warn());
-    }
+    let warn = d.context.is_some_and(|c| c.percent() >= CTX_WARN);
+    let figure = t.text_bold();
+    let mut first = head(
+        "context",
+        &ctx,
+        if warn {
+            t.warn().add_modifier(Modifier::BOLD)
+        } else {
+            figure
+        },
+    );
+    // la columna del detalle: tras la etiqueta, la cifra y dos de hueco
+    let detail = spans_width(&first) + 2;
     if let Some(c) = d.context {
         let of = format!("{} of {}", report::tokens(c.used), report::tokens(c.window));
-        let room = w.saturating_sub(spans_width(&first) + 2 + 2 + width(&of) + 1);
+        let room = w.saturating_sub(detail + 2 + width(&of) + 1);
         let gauge = room.min(USAGE_GAUGE_MAX);
         if gauge >= USAGE_GAUGE_MIN {
             first.push(Span::raw("  "));
@@ -852,10 +918,81 @@ fn usage_lines(d: &RunDetail, t: &Theme, w: usize) -> Vec<Line<'static>> {
         }
     }
     lines.push(Line::from(first));
-    lines.extend(
-        rows.iter()
-            .map(|(label, value)| Line::from(row(label, value))),
-    );
+    let mut second = head("tokens", &total, figure);
+    if d.tokens == 0 {
+        lines.push(Line::from(second));
+        return lines;
+    }
+    second.push(Span::raw("  "));
+    let parts = [
+        ("input", report::tokens(tk.input)),
+        ("output", report::tokens(tk.output)),
+        ("cache read", report::tokens(tk.cache_read)),
+        ("cache write", report::tokens(tk.cache_creation)),
+    ];
+    let room = w.saturating_sub(detail + 1);
+    let mut line = second;
+    let mut used = 0;
+    for (label, value) in parts {
+        let item = width(label) + 1 + width(&value);
+        if used > 0 && used + 3 + item > room {
+            lines.push(Line::from(std::mem::take(&mut line)));
+            line.push(Span::raw(" ".repeat(detail)));
+            used = 0;
+        }
+        if used > 0 {
+            line.push(Span::styled(" · ", t.muted()));
+            used += 3;
+        }
+        // sin sitio ni para una sola, se corta la etiqueta y la cifra se queda
+        let label = truncate(label, room.saturating_sub(1 + width(&value)));
+        used += width(&label) + 1 + width(&value);
+        line.push(Span::styled(label, t.muted()));
+        line.push(Span::styled(format!(" {value}"), t.text()));
+    }
+    lines.push(Line::from(line));
+    lines
+}
+
+/// ` skills · 2 ──────────────` y una línea por skill invocada:
+///
+/// `   3 min ago  frontend-design`
+///
+/// De la más reciente a la más antigua: cuándo, en gris y en columna, y el
+/// nombre en `ink`, cortado con `…`. Como mucho `rows`: las más recientes, y
+/// la regla dice cuáles (`1-6/9`). Vacío si no invocó ninguna.
+fn skills_lines(app: &App, d: &RunDetail, t: &Theme, w: usize, rows: usize) -> Vec<Line<'static>> {
+    let n = d.skills.len();
+    if n == 0 || rows == 0 {
+        return Vec::new();
+    }
+    let info = if n > rows {
+        format!("1-{rows}/{n}")
+    } else {
+        String::new()
+    };
+    let mut lines = vec![section_line(
+        t,
+        &format!("skills · {n}"),
+        t.soft(),
+        &info,
+        w,
+    )];
+    let shown: Vec<_> = d.skills.iter().rev().take(rows).collect();
+    let whens: Vec<String> = shown
+        .iter()
+        .map(|s| report::relative(s.at, app.now))
+        .collect();
+    let when_w = whens.iter().map(|s| width(s)).max().unwrap_or(0);
+    let room = w.saturating_sub(3 + when_w + 2 + 1);
+    for (s, when) in shown.iter().zip(&whens) {
+        lines.push(Line::from(vec![
+            Span::raw("   "),
+            Span::styled(pad(when, when_w, false), t.muted()),
+            Span::raw("  "),
+            Span::styled(truncate(&one_line(&s.name), room), t.text()),
+        ]));
+    }
     lines
 }
 
@@ -963,13 +1100,15 @@ fn launched_lines(
     lines
 }
 
-/// Cuerpo de la ficha de una ejecución: cabecera, quién la lanzó, el aviso
-/// de carpeta temporal y las secciones encargo, uso, herramientas, lanzadas y
-/// pasos (el más reciente primero). Reparte el alto `h`: los pasos se
-/// reservan `RUN_STEPS_MIN` y se quedan lo que sobra; lo demás entra entero o
-/// no entra, por este orden: quién la lanzó, el aviso, la línea en blanco,
-/// herramientas, las dos primeras líneas del encargo, lanzadas, uso y el
-/// resto del encargo. Nunca se pinta más de `h` líneas.
+/// Cuerpo de la pantalla de una ejecución: cabecera, quién la lanzó, dónde
+/// corre (`running in`), los avisos de carpeta temporal y de `cwd`, y las
+/// secciones uso, encargo, skills, herramientas, lanzadas y pasos (el más
+/// reciente primero). Reparte el alto `h`: los pasos se reservan
+/// `RUN_STEPS_MIN` y se quedan lo que sobra; lo demás entra entero o no
+/// entra, por este orden: quién la lanzó, dónde corre, los avisos, la línea
+/// en blanco, herramientas, la regla y la primera línea del encargo, uso, la
+/// segunda línea del encargo, skills, lanzadas y el resto del encargo. Nunca
+/// se pinta más de `h` líneas.
 fn run_detail_lines(app: &mut App, t: &Theme, w: usize, h: usize) -> Vec<Line<'static>> {
     let room = w.saturating_sub(4);
     let Some(d) = app.run_detail.as_ref() else {
@@ -992,6 +1131,8 @@ fn run_detail_lines(app: &mut App, t: &Theme, w: usize, h: usize) -> Vec<Line<'s
     // bajo la cabecera, antes que lo demás: quién la lanzó y el aviso
     for extra in [
         launched_by_line(d, t, w),
+        d.group_dir()
+            .map(|dir| path_line(app, "running in", dir, t, w)),
         temp_notice(app, d, t, w),
         cwd_notice(app, d, t, w),
     ]
@@ -1017,17 +1158,28 @@ fn run_detail_lines(app: &mut App, t: &Theme, w: usize, h: usize) -> Vec<Line<'s
     if show_task {
         avail -= 2;
     }
+    let show_usage = !usage.is_empty() && avail >= usage.len();
+    if show_usage {
+        avail -= usage.len();
+    }
+    // la segunda línea del encargo, antes que las skills y las lanzadas
+    let task_more = usize::from(show_task && task.len() > 1 && avail >= 1);
+    avail -= task_more;
+    let skills_h = d.skills.len().min(RUN_SKILLS_MAX);
+    let show_skills = skills_h > 0 && avail > skills_h;
+    if show_skills {
+        avail -= 1 + skills_h;
+    }
     let launched_h = d.launched.len().min(RUN_LAUNCHED_MAX);
     let show_launched = launched_h > 0 && avail > launched_h;
     if show_launched {
         avail -= 1 + launched_h;
     }
-    let show_usage = !usage.is_empty() && avail >= usage.len();
-    if show_usage {
-        avail -= usage.len();
-    }
     let want = task.len().clamp(1, RUN_TASK_MAX);
-    let task_h = want.min(1 + avail);
+    let task_h = want.min(1 + task_more + avail);
+    if show_usage {
+        lines.extend(usage);
+    }
     if show_task {
         lines.push(section_line(t, "task", t.soft(), "", w));
         if task.is_empty() {
@@ -1043,8 +1195,8 @@ fn run_detail_lines(app: &mut App, t: &Theme, w: usize, h: usize) -> Vec<Line<'s
             lines.push(Line::from(Span::styled(format!("   {l}"), t.text())));
         }
     }
-    if show_usage {
-        lines.extend(usage);
+    if show_skills {
+        lines.extend(skills_lines(app, d, t, w, skills_h));
     }
     if show_tools {
         lines.push(section_line(t, "tools", t.soft(), "", w));
@@ -1127,21 +1279,33 @@ fn run_detail_lines(app: &mut App, t: &Theme, w: usize, h: usize) -> Vec<Line<'s
     lines
 }
 
-/// Pie de la ficha de ejecución: `a agente` solo si la ficha del agente se
-/// puede abrir, `←→ otra ejecución` solo si hay varias, `tab launched` si
-/// lanzó alguna, `enter open` con una elegida, `p parent` si la lanzó otra
-/// ejecución que sigue en disco y `pgup/pgdn` si hay pasos; si no cabe, se
-/// quitan en el orden de `RUN_MINOR_KEYS`.
+/// Pie de la pantalla de la ejecución: `esc back to <agente>` (o `back` a
+/// secas si vuelve a activos), `←→ other run` solo si hay varias,
+/// `tab launched` si lanzó alguna, `enter open` con una elegida,
+/// `pgup/pgdn steps` si hay pasos y `p parent` si la lanzó otra ejecución
+/// que sigue en disco. Si no cabe, tras la versión se quitan las teclas en
+/// el orden de `RUN_MINOR_KEYS` y, al final, `back to <agente>` se queda en
+/// `back`.
 fn run_footer(app: &App, t: &Theme, w: usize) -> Line<'static> {
     let d = app.run_detail.as_ref();
     let launched = d.is_some_and(|d| !d.launched.is_empty());
     let steps = d.is_some_and(|d| !d.from_cache);
+    // a dónde vuelve Esc: `back to visual`, o `back` a secas si es a activos
+    let back = app
+        .esc_target()
+        .map_or_else(|| "back".to_string(), |name| format!("back to {name}"));
     let mut keys: Vec<(&str, &str)> = RUN_KEYS
         .iter()
         .copied()
+        .map(|(k, label)| {
+            if k == "esc" {
+                (k, back.as_str())
+            } else {
+                (k, label)
+            }
+        })
         .filter(|(k, _)| match *k {
-            "a" => app.can_open_agent(),
-            "←→" => app.run_nav().is_some(),
+            "←→" => app.run_nav().is_some_and(|(_, n)| n > 1),
             "tab" => launched,
             // sin elegida, enter vuelve como esc: no se anuncia dos veces
             "enter" => app.launched_sel.is_some(),
@@ -1156,7 +1320,402 @@ fn run_footer(app: &App, t: &Theme, w: usize) -> Line<'static> {
         }
         keys.retain(|(k, _)| k != minor);
     }
+    if spans_width(&keys_spans(app, t, &keys, false, false)) >= w {
+        for key in &mut keys {
+            if key.0 == "esc" {
+                key.1 = "back";
+            }
+        }
+    }
     footer_with_version(app, t, w, keys_spans(app, t, &keys, false, false), None)
+}
+
+/// Anchos de la pantalla del agente, sacados de sus ejecuciones: el número
+/// y las columnas `ctx`, `time` y `tokens`, cada una tan ancha como su cifra
+/// más larga o su cabecera. Bajo `LIVE_FIGURES_MIN_W` solo queda `time`
+/// (`figures`), como en activos; y si ni así quedan `AGENT_TASK_MIN`
+/// columnas para la tarea, tampoco (`timed`).
+struct AgentCols {
+    num: usize,
+    ctx: usize,
+    time: usize,
+    tokens: usize,
+    /// Salen las tres columnas.
+    figures: bool,
+    /// Sale al menos `time`.
+    timed: bool,
+}
+
+impl AgentCols {
+    fn of(app: &App, v: &AgentView, w: usize) -> Self {
+        let runs = || {
+            v.items.iter().filter_map(|i| match i {
+                AgentItem::Run(r) => Some(r.as_ref()),
+                _ => None,
+            })
+        };
+        let widest = |head: &str, cells: &mut dyn Iterator<Item = usize>| {
+            cells.chain([width(head)]).max().unwrap_or(0)
+        };
+        let mut cols = Self {
+            num: runs().map(|r| r.n).max().unwrap_or(1).to_string().len(),
+            ctx: widest(
+                "ctx",
+                &mut runs().map(|r| spans_width(&ctx_spans(r.line.context, t_plain()))),
+            ),
+            time: widest("time", &mut runs().map(|r| width(&live_time(app, &r.line)))),
+            tokens: widest("tokens", &mut runs().map(|r| width(&agent_tokens_cell(r)))),
+            figures: w >= LIVE_FIGURES_MIN_W,
+            timed: true,
+        };
+        let fits = |c: &Self| w > c.lead() + AGENT_TASK_MIN + NAME_GAP + c.right();
+        if !fits(&cols) {
+            cols.figures = false;
+        }
+        cols.timed = fits(&cols);
+        cols
+    }
+
+    /// Lo que va delante de la tarea: cursor, número, `. ` y la estrella.
+    fn lead(&self) -> usize {
+        3 + self.num + 2 + STAR_W
+    }
+
+    /// Ancho de las cifras de la derecha, sin la columna libre del borde.
+    fn right(&self) -> usize {
+        match (self.figures, self.timed) {
+            (true, _) => self.ctx + COL_GAP + self.time + COL_GAP + self.tokens,
+            (false, true) => self.time,
+            (false, false) => 0,
+        }
+    }
+
+    /// Las cabeceras de las columnas, para la derecha de la primera regla.
+    fn header(&self) -> String {
+        let gap = " ".repeat(COL_GAP);
+        match (self.figures, self.timed) {
+            (true, _) => format!(
+                "ctx{gap}{}{gap}{}",
+                pad("time", self.time, true),
+                pad("tokens", self.tokens, true)
+            ),
+            (false, true) => "time".to_string(),
+            (false, false) => String::new(),
+        }
+    }
+}
+
+/// La celda «tokens» de una ejecución de la pantalla del agente: en corto, o
+/// `—` si no hay ninguno o es una llamada sin ejecución (nunca `0`).
+fn agent_tokens_cell(r: &AgentRun) -> String {
+    if r.lone_call {
+        "—".to_string()
+    } else {
+        live_tokens_cell(&r.line)
+    }
+}
+
+/// ` ✦ visual [own] · 4 runs                2 working now · 2 finished · 4.6M tok`
+///
+/// Cabecera de la pantalla del agente: la estrella (parpadea si hay algo en
+/// curso; en blanco si no), el nombre por estado (`claude-soft` negrita en
+/// curso, `ink` si todo terminó), y en gris la etiqueta de origen y
+/// `· N runs`. A la derecha, hasta la columna de las reglas, `N working now`
+/// en `claude` negrita y, en gris, `· N finished · N tok`; lo que vale cero
+/// no sale. Estrecha, cede por este orden: los tokens, `N finished`,
+/// `· N runs`, la etiqueta, `N working now` y, al final, se corta el nombre.
+fn agent_header_line(app: &App, v: &AgentView, t: &Theme, w: usize) -> Line<'static> {
+    let mut parts: Vec<(String, Style)> = Vec::new();
+    if v.running > 0 {
+        parts.push((format!("{} working now", v.running), t.accent_bold()));
+    }
+    if v.finished > 0 {
+        parts.push((format!("{} finished", v.finished), t.muted()));
+    }
+    if v.tokens > 0 {
+        parts.push((format!("{} tok", report::tokens(v.tokens)), t.muted()));
+    }
+    let right = |n: usize| -> Vec<Span<'static>> {
+        let mut spans = Vec::new();
+        for (i, (text, style)) in parts.iter().take(n).enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(" · ", t.muted()));
+            }
+            spans.push(Span::styled(text.clone(), *style));
+        }
+        spans
+    };
+    let runs = format!(" · {}", plural(v.running + v.finished, "run", "runs"));
+    let tag = kind_tag(v.kind, usize::MAX);
+    let lead = 1 + STAR_W;
+    let full = lead + width(&v.name) + width(&tag) + width(&runs);
+    // lo que cabe a la derecha con la izquierda entera
+    let kept = (1..=parts.len())
+        .rev()
+        .find(|&n| full + 2 + spans_width(&right(n)) < w);
+    let mut spans = vec![Span::raw(" "), star_slot(v.running > 0, app.now, t)];
+    let name_style = state_name_style(v.running == 0, t);
+    let right = match kept {
+        Some(n) => {
+            spans.push(Span::styled(v.name.clone(), name_style));
+            spans.push(Span::styled(format!("{tag}{runs}"), t.muted()));
+            right(n)
+        }
+        None => {
+            // sin sitio para todo: el nombre, y luego lo que quepa
+            let mut room = w.saturating_sub(lead + 1);
+            let name = truncate(&v.name, room);
+            room -= width(&name);
+            spans.push(Span::styled(name, name_style));
+            let first = right(1.min(parts.len()));
+            let first_w = spans_width(&first);
+            let first = if first_w > 0 && first_w + 2 <= room {
+                room -= first_w + 2;
+                first
+            } else {
+                Vec::new()
+            };
+            let tag = if w >= RUN_TAG_MIN_W || first.is_empty() {
+                kind_tag(v.kind, room)
+            } else {
+                String::new()
+            };
+            room -= width(&tag);
+            let runs = if width(&runs) <= room && !tag.is_empty() {
+                runs
+            } else {
+                String::new()
+            };
+            spans.push(Span::styled(format!("{tag}{runs}"), t.muted()));
+            first
+        }
+    };
+    split_line(spans, right, w, t)
+}
+
+/// `   running in   ~/Offing/offing`
+///
+/// Una línea de ruta bajo la cabecera de las dos pantallas de activos, en
+/// gris, con el valor en la misma columna que `launched by`. La ruta lleva
+/// `~` y se corta con `…`.
+fn path_line(app: &App, label: &str, path: &std::path::Path, t: &Theme, w: usize) -> Line<'static> {
+    let label = format!("   {}", pad(label, META_LABEL_W, false));
+    let room = w.saturating_sub(width(&label) + 1);
+    let path = truncate(&report::shorten(path, &app.home), room);
+    Line::from(Span::styled(format!("{label}{path}"), t.muted()))
+}
+
+/// ` ❯ 1. ✦ paint the active screen with design B   ▰▰▰▰▰▰▱▱ 71%   4 min   412k`
+///
+/// Una ejecución de la pantalla del agente: cursor y número como en las
+/// demás listas (`❯` en `claude`; el número en `claude-soft` bajo el cursor
+/// y en gris fuera), la estrella si está en curso, la tarea en una línea
+/// (`ink` en curso, gris terminada; en negrita la del cursor) y, pegadas al
+/// borde bajo sus cabeceras, `ctx`, `time` y `tokens` en gris (el medidor
+/// en `claude`; las rayas de «sin dato» en `subtle`).
+fn agent_run_line(
+    app: &App,
+    r: &AgentRun,
+    selected: bool,
+    cols: &AgentCols,
+    t: &Theme,
+    w: usize,
+) -> Line<'static> {
+    let running = r.line.state == RunState::Running;
+    let num = cols.num;
+    let mut spans = vec![
+        Span::styled(if selected { " ❯ " } else { "   " }, t.accent()),
+        Span::styled(
+            format!("{:>num$}. ", r.n),
+            if selected { t.soft() } else { t.muted() },
+        ),
+        star_slot(running, app.now, t),
+    ];
+    let right_w = cols.right();
+    let gap = if right_w > 0 { NAME_GAP } else { 0 };
+    let room = w.saturating_sub(cols.lead() + gap + right_w + 1);
+    let task = r
+        .line
+        .task
+        .as_deref()
+        .map(one_line)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "—".to_string());
+    let task = truncate(&task, room);
+    let mut style = if running { t.text() } else { t.muted() };
+    if selected {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    let used = width(&task);
+    spans.push(Span::styled(task, style));
+    if right_w == 0 {
+        return Line::from(spans);
+    }
+    spans.push(Span::raw(" ".repeat(room - used + gap)));
+    let time = Span::styled(pad(&live_time(app, &r.line), cols.time, true), t.muted());
+    if cols.figures {
+        let ctx = ctx_spans(r.line.context, t);
+        spans.push(Span::raw(" ".repeat(cols.ctx - spans_width(&ctx))));
+        spans.extend(ctx);
+        spans.push(Span::raw(" ".repeat(COL_GAP)));
+        spans.push(time);
+        spans.push(Span::raw(" ".repeat(COL_GAP)));
+        let cell = agent_tokens_cell(r);
+        let style = tokens_style(&cell, t);
+        spans.push(Span::styled(pad(&cell, cols.tokens, true), style));
+    } else {
+        spans.push(time);
+    }
+    Line::from(spans)
+}
+
+/// `        now     Bash · git diff --stat`
+///
+/// Una sublínea de una ejecución en curso, bajo su tarea: la etiqueta en
+/// `subtle` con ancho fijo y el valor en gris, como en activos, cortado con
+/// `…` a una línea. Sin valor, `—`.
+fn agent_sub_line(
+    label: &str,
+    value: Option<&str>,
+    cols: &AgentCols,
+    t: &Theme,
+    w: usize,
+) -> Line<'static> {
+    let room = w.saturating_sub(cols.lead() + AGENT_LABEL_W + 1);
+    let value = value
+        .map(one_line)
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "—".to_string());
+    Line::from(vec![
+        Span::raw(" ".repeat(cols.lead())),
+        Span::styled(pad(label, AGENT_LABEL_W, false), t.line()),
+        Span::styled(truncate(&value, room), t.muted()),
+    ])
+}
+
+/// La pantalla del agente: la cabecera (`agent_header_line`), en gris
+/// `defined in` (solo si lo define un `.md`: un built-in o un paso de
+/// workflow suelto no llevan línea, su etiqueta ya dice de dónde salen) y
+/// `running in`, una línea en blanco y las líneas de `AgentView::items`
+/// desde el desplazamiento de `App::agent_window`: las reglas
+/// ` working now · N ` (`claude`) y ` finished · N ` (`claude-soft`), la
+/// primera que se vea con las cabeceras de las columnas a la derecha; las
+/// ejecuciones (`agent_run_line`) y, bajo las que están en curso, `now` y
+/// `skills` (`agent_sub_line`).
+///
+/// Si no cabe todo en `h` líneas, cede primero el blanco y luego las rutas,
+/// mientras queden `AGENT_ROWS_MIN` líneas para las ejecuciones. Apunta en
+/// `Hits::rows` cada línea de una ejecución con su número menos 1 y
+/// devuelve, si hay más de las que se ven, cuáles se ven (`2-4/7`) para el
+/// pie.
+fn agent_lines(
+    app: &mut App,
+    v: &AgentView,
+    t: &Theme,
+    area: Rect,
+    w: usize,
+    h: usize,
+) -> (Vec<Line<'static>>, Option<String>) {
+    let cols = AgentCols::of(app, v, w);
+    let mut lines = vec![agent_header_line(app, v, t, w)];
+    let meta: Vec<Line<'static>> = [("defined in", &v.definition), ("running in", &v.dir)]
+        .into_iter()
+        .filter_map(|(label, path)| Some(path_line(app, label, path.as_deref()?, t, w)))
+        .collect();
+    let rows_h = h.saturating_sub(1);
+    let need = v.items.len().min(AGENT_ROWS_MIN);
+    if rows_h >= meta.len() + need {
+        let all = rows_h > meta.len() + v.items.len();
+        lines.extend(meta);
+        if all {
+            lines.push(Line::default());
+        }
+    }
+    lines.truncate(h);
+    let room = h.saturating_sub(lines.len());
+    let off = app.agent_window(&v.items, v.cursor, room);
+    let mut columns = true;
+    let mut seen: Option<(usize, usize)> = None;
+    for item in v.items.iter().skip(off).take(room) {
+        let line = match item {
+            AgentItem::Section { running, count } => {
+                let (title, style) = if *running {
+                    (format!("working now · {count}"), t.accent())
+                } else {
+                    (format!("finished · {count}"), t.soft())
+                };
+                // la primera regla que se ve lleva las cabeceras de columnas
+                let info = if std::mem::take(&mut columns) {
+                    cols.header()
+                } else {
+                    String::new()
+                };
+                agent_rule(t, &title, style, &info, w)
+            }
+            AgentItem::Run(r) => {
+                seen = Some((seen.map_or(r.n, |(first, _)| first), r.n));
+                agent_run_line(app, r, r.n == v.cursor, &cols, t, w)
+            }
+            AgentItem::Now { last_tool, .. } => {
+                agent_sub_line("now", last_tool.as_deref(), &cols, t, w)
+            }
+            AgentItem::Skill { skill, .. } => agent_sub_line("skills", Some(skill), &cols, t, w),
+            AgentItem::Blank => Line::default(),
+        };
+        if let Some(n) = item.n() {
+            app.hits.rows.push(RowHit {
+                row: area.y + lines.len() as u16,
+                cursor: n - 1,
+            });
+        }
+        lines.push(line);
+    }
+    let total = v.running + v.finished;
+    let pos = seen
+        .filter(|_| v.items.len() > room)
+        .map(|(first, last)| format!("{first}-{last}/{total}"));
+    (lines, pos)
+}
+
+/// ` working now · 2 ─────────── ctx   time   tokens` y ` finished · 2 ─────────`
+///
+/// Una regla de la pantalla del agente: como `section_line`, pero sin info
+/// la línea llega hasta la última columna de las cifras, sin hueco al final.
+fn agent_rule(t: &Theme, title: &str, style: Style, info: &str, w: usize) -> Line<'static> {
+    if !info.is_empty() {
+        return section_line(t, title, style, info, w);
+    }
+    let title = format!(" {title}");
+    let fill = w.saturating_sub(width(&title) + 2);
+    Line::from(vec![
+        Span::styled(title, style),
+        Span::styled(format!(" {}", "─".repeat(fill)), t.line()),
+    ])
+}
+
+/// Pie de la pantalla del agente: `←→ other agent` solo si hay más bloques
+/// en activos y `a agent` solo si es un agente definido; a la derecha, las
+/// ejecuciones que se ven si no caben todas (`pos`). Si no cabe, se quitan
+/// las teclas en el orden de `AGENT_MINOR_KEYS`, después de la versión.
+fn agent_footer(app: &App, t: &Theme, w: usize, pos: Option<String>) -> Line<'static> {
+    let mut keys: Vec<(&str, &str)> = AGENT_KEYS
+        .iter()
+        .copied()
+        .filter(|(k, _)| match *k {
+            "a" => app.can_open_agent(),
+            "←→" => app.agent_nav().is_some_and(|(_, n)| n > 1),
+            _ => true,
+        })
+        .collect();
+    // el contador, con su hueco delante
+    let pos_w = pos.as_deref().map_or(0, |p| width(p) + 2);
+    for minor in AGENT_MINOR_KEYS {
+        if spans_width(&keys_spans(app, t, &keys, false, false)) + pos_w < w {
+            break;
+        }
+        keys.retain(|(k, _)| k != minor);
+    }
+    footer_with_version(app, t, w, keys_spans(app, t, &keys, false, false), pos)
 }
 
 /// Barra vertical a la derecha del cuerpo, como la de moon: carril `│` en
@@ -1326,16 +1885,35 @@ fn second_line(app: &App, t: &Theme, w: usize) -> Line<'static> {
     Line::from(left)
 }
 
-/// Lo que va a la derecha de una fila: el total trabajado y las ejecuciones
+/// Lo que va a la derecha de una fila: el total trabajado y los tokens
 /// (vacíos sin ejecuciones) y la última vez (vacía si está en curso: ya lo
 /// dice la estrella).
 fn row_right(app: &App, row: &Row) -> (String, String, String) {
-    let (worked, runs) = if row.work.runs == 0 {
+    let (worked, tokens) = if row.work.runs == 0 {
         (String::new(), String::new())
     } else {
-        (report::worked(row.work.total), row.work.runs.to_string())
+        (report::worked(row.work.total), tokens_cell(row.work.tokens))
     };
-    (worked, runs, row_when(app, row))
+    (worked, tokens, row_when(app, row))
+}
+
+/// Los tokens en corto, como en el ranking; `—` si no hay.
+fn tokens_cell(tokens: u64) -> String {
+    if tokens == 0 {
+        "—".to_string()
+    } else {
+        report::tokens(tokens)
+    }
+}
+
+/// El estilo de la celda de tokens de «all»: `ink-muted`, y la raya de «sin
+/// contar» en `subtle`, como en activos.
+fn tokens_style(cell: &str, t: &Theme) -> Style {
+    if cell == "—" {
+        t.line()
+    } else {
+        t.muted()
+    }
 }
 
 fn row_when(app: &App, row: &Row) -> String {
@@ -1399,8 +1977,10 @@ struct Columns {
     /// que el bloque acabe en el borde, como el texto de las reglas.
     name_room: usize,
     spark: bool,
-    runs: bool,
+    /// todos: sale la columna «tokens» (la terminal llega a `TOKENS_MIN_W`).
+    tokens: bool,
     worked_w: usize,
+    /// Ancho de la columna «runs» del ranking.
     runs_w: usize,
     when_w: usize,
     // activos: bloques en curso
@@ -1421,7 +2001,7 @@ struct Columns {
     max: f64,
     /// Las columnas de cifras del ranking que caben, en orden.
     rank_cols: Vec<RankKey>,
-    /// Ancho de la columna «tokens» del ranking.
+    /// Ancho de la columna «tokens»: la de «todos» y la del ranking.
     tokens_w: usize,
     /// todos: las cifras de cada grupo abierto, por su ruta.
     groups: std::collections::HashMap<String, GroupSum>,
@@ -1429,12 +2009,13 @@ struct Columns {
     twins: std::collections::HashSet<String>,
 }
 
-/// Lo que suma un grupo abierto de «todos» para su regla: ejecuciones,
-/// cuántas filas están en curso, la última llamada de cualquiera y el trabajo
+/// Lo que suma un grupo abierto de «todos» para su regla: ejecuciones (solo
+/// para saber si hay alguna), tokens, cuántas filas están en curso, la última llamada de cualquiera y el trabajo
 /// de cada día.
 #[derive(Default)]
 struct GroupSum {
     runs: usize,
+    tokens: u64,
     running: usize,
     last: Option<DateTime<Utc>>,
     days: Vec<TimeDelta>,
@@ -1443,6 +2024,7 @@ struct GroupSum {
 impl GroupSum {
     fn add(&mut self, row: &Row) {
         self.runs += row.work.runs;
+        self.tokens += row.work.tokens;
         self.running += usize::from(row.running());
         self.last = self.last.max(row.last).max(row.ever);
         if self.days.len() < row.history.len() {
@@ -1453,20 +2035,20 @@ impl GroupSum {
         }
     }
 
-    /// Ejecuciones (vacías si no hay) y último uso (vacío si hay algo en
+    /// Tokens (vacíos sin ejecuciones) y último uso (vacío si hay algo en
     /// curso), como en las filas.
     fn right(&self, app: &App) -> (String, String) {
-        let runs = if self.runs == 0 {
+        let tokens = if self.runs == 0 {
             String::new()
         } else {
-            self.runs.to_string()
+            tokens_cell(self.tokens)
         };
         let when = if self.running > 0 {
             String::new()
         } else {
             report::last_seen(self.last, app.now)
         };
-        (runs, when)
+        (tokens, when)
     }
 }
 
@@ -1487,14 +2069,14 @@ impl Columns {
         let mut c = Columns {
             prefix: 3 + num_w + 2,
             spark: term_w >= SPARK_MIN_W,
-            runs: term_w >= RUNS_MIN_W,
+            tokens: term_w >= TOKENS_MIN_W,
             ..Default::default()
         };
         let ranking = app.mode == Mode::Ranking;
         c.worked_w = width("worked");
-        c.runs_w = width("runs");
+        c.tokens_w = width("tokens");
         if ranking {
-            c.tokens_w = width("tokens");
+            c.runs_w = width("runs");
         } else {
             c.when_w = width("last used");
         }
@@ -1512,10 +2094,10 @@ impl Columns {
             match item {
                 Item::Row(r) => {
                     c.groups.entry(r.section.clone()).or_default().add(r);
-                    let (worked, runs, when) = row_right(app, r);
+                    let (worked, tokens, when) = row_right(app, r);
                     name = name.max(width(&app.agent(r.agent).name) + 2);
                     c.worked_w = c.worked_w.max(width(&worked));
-                    c.runs_w = c.runs_w.max(width(&runs));
+                    c.tokens_w = c.tokens_w.max(width(&tokens));
                     c.when_w = c.when_w.max(width(&when));
                 }
                 Item::Rank { row, work } => {
@@ -1541,8 +2123,8 @@ impl Columns {
         // lo de la derecha del nombre y el margen de la última columna
         if !ranking {
             for g in c.groups.values() {
-                let (runs, when) = g.right(app);
-                c.runs_w = c.runs_w.max(width(&runs));
+                let (tokens, when) = g.right(app);
+                c.tokens_w = c.tokens_w.max(width(&tokens));
                 c.when_w = c.when_w.max(width(&when));
             }
         }
@@ -1651,8 +2233,12 @@ impl Columns {
     /// Ancho del bloque de datos de la lista, sin el hueco tras el nombre.
     fn data_w(&self) -> usize {
         let spark = if self.spark { spark_w() + SPARK_GAP } else { 0 };
-        let runs = if self.runs { self.runs_w + COL_GAP } else { 0 };
-        spark + self.worked_w + runs + COL_GAP + self.when_w
+        let tokens = if self.tokens {
+            self.tokens_w + COL_GAP
+        } else {
+            0
+        };
+        spark + self.worked_w + tokens + COL_GAP + self.when_w
     }
 }
 
@@ -1668,8 +2254,8 @@ fn item_lines(app: &App, item: &Item, cols: &Columns, t: &Theme, w: usize) -> Ve
             running,
             recent,
         } => live_group_line(cols, section, *running, *recent, t, w),
-        Item::Live { n, line, .. } => live_line(app, *n, line, cols, t, w),
-        Item::LiveAgent(line) => live_agent_line(app, line, cols, t, w),
+        Item::Live { line } => live_line(app, line, cols, t, w),
+        Item::LiveAgent { n, line, .. } => live_agent_line(app, *n, line, cols, t, w),
         Item::LiveSkill(line) => live_skill_line(line, cols, t, w),
         Item::LiveNow(line) => live_now_line(line, cols, t, w),
         Item::Quiet { last } => return quiet_lines(app, last.as_ref(), t, w),
@@ -1709,7 +2295,8 @@ fn item_lines(app: &App, item: &Item, cols: &Columns, t: &Theme, w: usize) -> Ve
 /// `ink-muted` y, si alguno está en curso, cuántos en `claude`; la regla acaba
 /// dos columnas antes del bloque de la derecha y, en las mismas columnas que
 /// las filas, las cifras del grupo: la barrita (suma por día), el total en
-/// `ink` negrita, las ejecuciones y el último uso.
+/// `ink` negrita (lo único en `ink` de la columna: las filas van en
+/// `ink-muted`), los tokens y el último uso.
 fn group_line(
     app: &App,
     section: &str,
@@ -1766,11 +2353,15 @@ fn group_line(
         pad(&worked, cols.worked_w, true),
         t.text_bold(),
     ));
-    let (runs, when) = sum.right(app);
-    if cols.runs {
+    let (tokens, when) = sum.right(app);
+    if cols.tokens {
         spans.push(Span::styled(
-            format!("{}{}", " ".repeat(COL_GAP), pad(&runs, cols.runs_w, true)),
-            t.muted(),
+            format!(
+                "{}{}",
+                " ".repeat(COL_GAP),
+                pad(&tokens, cols.tokens_w, true)
+            ),
+            tokens_style(&tokens, t),
         ));
     }
     spans.push(Span::raw(" ".repeat(COL_GAP)));
@@ -1808,15 +2399,11 @@ pub(super) fn section_line(
     ])
 }
 
-/// Cursor y número de una línea seleccionable. `sober`: el número va en `ink`
-/// aunque esté seleccionada (las terminadas no se tiñen).
-fn prefix(
-    app: &App,
-    n: usize,
-    cols: &Columns,
-    t: &Theme,
-    sober: bool,
-) -> (bool, Vec<Span<'static>>) {
+/// Cursor y número de una línea seleccionable: `❯` en `claude` y el número en
+/// `claude-soft` bajo el cursor, en gris en las demás. Igual en todas las
+/// pestañas; en activos es la línea del agente, también la de un bloque ya
+/// terminado.
+fn prefix(app: &App, n: usize, cols: &Columns, t: &Theme) -> (bool, Vec<Span<'static>>) {
     let selected = n == app.cursor + 1;
     let num_w = cols.prefix - 5;
     (
@@ -1825,13 +2412,7 @@ fn prefix(
             Span::styled(if selected { " ❯ " } else { "   " }, t.accent()),
             Span::styled(
                 format!("{n:>num_w$}. "),
-                if sober {
-                    t.text()
-                } else if selected {
-                    t.soft()
-                } else {
-                    t.muted()
-                },
+                if selected { t.soft() } else { t.muted() },
             ),
         ],
     )
@@ -1949,24 +2530,18 @@ fn live_columns_line(cols: &Columns, t: &Theme, w: usize) -> Line<'static> {
     Line::from(Span::styled(truncate(&s, w), t.muted()))
 }
 
-/// ` ❯  1.   ├ Revisando convenciones   ▰▰▰▱▱▱▱▱ 41%   1 min   140k`
+/// `         ├ Revisando convenciones   ▰▰▰▱▱▱▱▱ 41%   1 min   140k`
 ///
-/// Una fila de activos: número, el hueco de la estrella en blanco (la
-/// estrella va en la línea del agente, `live_agent_line`; el hueco se reserva
-/// para que las columnas no se muevan), lo de la izquierda (`live_left`) y, a la derecha, pegadas al
-/// borde, «ctx», «time» y, la última, «tokens» (en estrecho, solo «time»).
-/// Las cifras en gris; terminada, `hace N min` en vez de lo trabajado.
-fn live_line(
-    app: &App,
-    n: usize,
-    r: &NowLine,
-    cols: &Columns,
-    t: &Theme,
-    w: usize,
-) -> Line<'static> {
+/// Una fila de activos, colgada de la línea de su agente: en blanco lo que
+/// allí ocupan el cursor, el número y la estrella (`live_agent_line`), para
+/// que el árbol caiga en la columna del nombre; luego lo de la izquierda
+/// (`live_left`) y, a la derecha, pegadas al borde, «ctx», «time» y, la
+/// última, «tokens» (en estrecho, solo «time»). Las cifras en gris;
+/// terminada, `hace N min` en vez de lo trabajado.
+fn live_line(app: &App, r: &NowLine, cols: &Columns, t: &Theme, w: usize) -> Line<'static> {
     let done = matches!(r.state, RunState::Done { .. });
-    let (_, mut spans) = prefix(app, n, cols, t, false);
-    spans.push(Span::raw(" ".repeat(STAR_W)));
+    // ni cursor ni número: van en la línea del agente del bloque
+    let mut spans = vec![Span::raw(" ".repeat(cols.prefix + STAR_W))];
     let room = live_name_room(cols, w);
     let left = live_left(r, room, done, t);
     let used = spans_width(&left);
@@ -1995,8 +2570,9 @@ fn live_line(
 /// Lo de la izquierda de una fila de activos, en `room` columnas como mucho:
 /// `├` (`└` la última de su bloque o la sola) en `subtle`, en la columna del
 /// nombre, un espacio y la tarea (`—` si no hay), en `ink` en curso y en gris
-/// terminada. El nombre va en su propia línea encima del bloque
-/// (`live_agent_line`), así que la fila no lo repite. Se recorta la tarea.
+/// terminada. El nombre, con el cursor y el número del bloque, va en su
+/// propia línea encima (`live_agent_line`), así que la fila no los repite.
+/// Se recorta la tarea.
 fn live_left(r: &NowLine, room: usize, done: bool, t: &Theme) -> Vec<Span<'static>> {
     let task = r
         .task
@@ -2021,8 +2597,8 @@ fn live_left(r: &NowLine, room: usize, done: bool, t: &Theme) -> Vec<Span<'stati
 
 /// `docs [own] ×3`: el nombre (`claude-soft` negrita si el bloque tiene algo
 /// en curso, gris si solo tiene terminada), su etiqueta de origen en gris si
-/// `tag` (desde 50 columnas) y ` ×N` en `subtle` con las ejecuciones de todo
-/// el bloque (`runs`), solo si son más de una, en `room` columnas como mucho:
+/// `tag` (desde 50 columnas) y ` ×N` en `subtle` con las ejecuciones en curso
+/// del bloque (`runs`), solo si son más de una, en `room` columnas como mucho:
 /// la etiqueta cede antes que el nombre (`live_tag`).
 fn live_name(r: &NowLine, room: usize, tag: bool, done: bool, t: &Theme) -> Vec<Span<'static>> {
     let name = truncate(&r.name, room);
@@ -2043,22 +2619,29 @@ fn live_name(r: &NowLine, room: usize, tag: bool, done: bool, t: &Theme) -> Vec<
     spans
 }
 
-/// `       ✦ docs [own] ×3`
+/// ` ❯  3. ✦ docs [own] ×3`
 ///
-/// La línea del agente de un bloque, encima de su primera fila y en la
-/// columna del nombre: en el hueco de la estrella de las filas, `✦`/`✧` que
-/// parpadea en `claude` si el bloque tiene algo en curso; luego nombre,
-/// etiqueta y `×N` (`live_name`), sin número ni cifras. La primera fila solo
-/// está terminada si lo está todo el bloque (la terminada va al final):
-/// entonces el hueco va en blanco y el nombre en gris.
-fn live_agent_line(app: &App, r: &NowLine, cols: &Columns, t: &Theme, w: usize) -> Line<'static> {
+/// La línea del agente de un bloque, encima de su primera fila: la única
+/// seleccionable del bloque, con el cursor y el número (`prefix`: uno por
+/// bloque, no por ejecución); luego `✦`/`✧`, que parpadea en `claude` si el
+/// bloque tiene algo en curso, y nombre, etiqueta y `×N` (`live_name`), sin
+/// cifras. La primera fila solo está terminada si lo está todo el bloque (la
+/// terminada va al final): entonces el hueco de la estrella va en blanco y el
+/// nombre en gris, y el número sigue como en cualquier otra lista (gris, o
+/// `claude-soft` bajo el cursor).
+fn live_agent_line(
+    app: &App,
+    n: usize,
+    r: &NowLine,
+    cols: &Columns,
+    t: &Theme,
+    w: usize,
+) -> Line<'static> {
     let indent = cols.prefix + STAR_W;
     let room = w.saturating_sub(indent + 1);
     let done = matches!(r.state, RunState::Done { .. });
-    let mut spans = vec![
-        Span::raw(" ".repeat(cols.prefix)),
-        star_slot(!done, app.now, t),
-    ];
+    let (_, mut spans) = prefix(app, n, cols, t);
+    spans.push(star_slot(!done, app.now, t));
     spans.extend(live_name(r, room, cols.live_tag, done, t));
     Line::from(spans)
 }
@@ -2143,25 +2726,26 @@ fn columns_line(cols: &Columns, t: &Theme) -> Line<'static> {
         s += &" ".repeat(SPARK_GAP);
     }
     s += &pad("worked", cols.worked_w, true);
-    if cols.runs {
+    if cols.tokens {
         s += &" ".repeat(COL_GAP);
-        s += &pad("runs", cols.runs_w, true);
+        s += &pad("tokens", cols.tokens_w, true);
     }
     s += &" ".repeat(COL_GAP);
     s += &pad("last used", cols.when_w, true);
     Line::from(Span::styled(s, t.muted()))
 }
 
-/// ` ❯  1. backend ✦          ▁▁▂▁▄█      48 min      5              `
+/// ` ❯  1. backend ✦          ▁▁▂▁▄█      48 min    1.2M              `
 ///
 /// Nombre y marca (✦/✧ si está en curso; nada si no, con su hueco guardado
 /// para que no bailen las columnas) a la izquierda; a la
 /// derecha, pegados al borde como el texto de las reglas, la barrita de los
-/// últimos días, trabajado, ejecuciones y último uso (vacío si está en curso),
-/// alineados a la derecha bajo su cabecera. El hueco sobrante queda entre el
+/// últimos días, trabajado, tokens y último uso (vacío si está en curso),
+/// alineados a la derecha bajo su cabecera y en `ink-muted`, también en la
+/// fila del cursor: el `ink` es del total del proyecto. El hueco sobrante queda entre el
 /// nombre y la barrita.
 fn row_line(app: &App, row: &Row, cols: &Columns, t: &Theme) -> Line<'static> {
-    let (selected, mut spans) = prefix(app, row.n, cols, t, false);
+    let (selected, mut spans) = prefix(app, row.n, cols, t);
     let never = never(row);
     let running = row.running();
     let mark = if running {
@@ -2192,12 +2776,17 @@ fn row_line(app: &App, row: &Row, cols: &Columns, t: &Theme) -> Line<'static> {
         spans.extend(spark_spans(row.days(DAYS), t));
         spans.push(Span::raw(" ".repeat(SPARK_GAP)));
     }
-    let (worked, runs, when) = row_right(app, row);
-    spans.push(Span::styled(pad(&worked, cols.worked_w, true), t.text()));
-    if cols.runs {
+    let (worked, tokens, when) = row_right(app, row);
+    // en gris: el `ink` queda para el total del proyecto, en su regla
+    spans.push(Span::styled(pad(&worked, cols.worked_w, true), t.muted()));
+    if cols.tokens {
         spans.push(Span::styled(
-            format!("{}{}", " ".repeat(COL_GAP), pad(&runs, cols.runs_w, true)),
-            t.muted(),
+            format!(
+                "{}{}",
+                " ".repeat(COL_GAP),
+                pad(&tokens, cols.tokens_w, true)
+            ),
+            tokens_style(&tokens, t),
         ));
     }
     spans.push(Span::raw(" ".repeat(COL_GAP)));
@@ -2221,7 +2810,7 @@ fn folded_line(
     t: &Theme,
     w: usize,
 ) -> Line<'static> {
-    let (selected, mut spans) = prefix(app, n, cols, t, false);
+    let (selected, mut spans) = prefix(app, n, cols, t);
     let head = format!("{} {title}", if open { "▾" } else { "▸" });
     let info = format!(" · {} unused", plural(total, "agent", "agents"));
     let room = w.saturating_sub(cols.prefix + 1 + 2);
@@ -2251,7 +2840,7 @@ fn rank_line(
     t: &Theme,
     w: usize,
 ) -> Line<'static> {
-    let (selected, mut spans) = prefix(app, row.n, cols, t, false);
+    let (selected, mut spans) = prefix(app, row.n, cols, t);
     let mark = if row.running() {
         star_mark(app, t)
     } else {
@@ -2309,8 +2898,7 @@ fn rank_line(
 fn rank_cell(work: &PeriodStats, key: RankKey) -> String {
     match key {
         RankKey::Worked => report::worked(work.worked),
-        RankKey::Tokens if work.tokens == 0 => "—".to_string(),
-        RankKey::Tokens => report::tokens(work.tokens),
+        RankKey::Tokens => tokens_cell(work.tokens),
         RankKey::Runs => work.runs.to_string(),
     }
 }
@@ -2777,7 +3365,7 @@ fn footer_with_version(
 mod tests {
     use super::*;
     use crate::status::{Context, LaunchedBy, RunLink};
-    use crate::tui::app::tests::{fixture, run, with_runs};
+    use crate::tui::app::tests::{counted, fixture, run, with_runs};
     use crate::tui::app::{Action, App, Msg};
     use chrono::TimeDelta;
     use ratatui::backend::TestBackend;
@@ -2863,6 +3451,32 @@ mod tests {
                 run("docs", STATION, "2026-11-04T09:00:00Z", 50, None, true),
                 run("docs", STATION, "2026-11-03T09:00:00Z", 22, None, true),
                 run("frontend", STATION, "2026-11-04T10:00:00Z", 5, None, true),
+            ],
+        )
+    }
+
+    /// `worked()` con tokens: docs 30.4M y 15.5M (45.9M) y frontend 412k; el
+    /// grupo suma 46.3M.
+    fn worked_with_tokens() -> App {
+        let tokens = |mut r: crate::runs::Run, total: u64| {
+            r.usage.tokens.input = total;
+            r
+        };
+        with_runs(
+            with_unused(),
+            vec![
+                tokens(
+                    run("docs", STATION, "2026-11-04T09:00:00Z", 50, None, true),
+                    30_400_000,
+                ),
+                tokens(
+                    run("docs", STATION, "2026-11-03T09:00:00Z", 22, None, true),
+                    15_500_000,
+                ),
+                tokens(
+                    run("frontend", STATION, "2026-11-04T10:00:00Z", 5, None, true),
+                    412_000,
+                ),
             ],
         )
     }
@@ -3235,21 +3849,13 @@ mod tests {
 
     /// Las cifras de la regla de un grupo abierto caen en las columnas de las
     /// filas: la barrita del grupo bajo «últimos 14 días», el total bajo
-    /// «trabajado», la suma de ejecuciones bajo «ejec.» y el último uso del
+    /// «trabajado», la suma de tokens bajo «tokens» y el último uso del
     /// grupo bajo «último uso», en el borde. La regla acaba dos columnas antes
     /// del bloque; la de un plegado, en el borde.
     #[test]
     fn open_group_rules_put_their_totals_in_the_row_columns() {
         for w in [150u16, 110, 90] {
-            let app = with_runs(
-                with_unused(),
-                vec![
-                    run("docs", STATION, "2026-11-04T09:00:00Z", 50, None, true),
-                    run("docs", STATION, "2026-11-03T09:00:00Z", 22, None, true),
-                    run("frontend", STATION, "2026-11-04T10:00:00Z", 5, None, true),
-                ],
-            );
-            let lines = draw(&mut { app }, w, 24);
+            let lines = draw(&mut worked_with_tokens(), w, 24);
             let edge = w as usize - 1;
             let head = &lines[2];
             let station = lines
@@ -3257,7 +3863,7 @@ mod tests {
                 .find(|l| l.starts_with(" station · "))
                 .unwrap_or_else(|| panic!("{w}: {lines:#?}"));
             let docs = line_of(&lines, "docs");
-            // total del grupo bajo trabajado, ejecuciones bajo ejec.
+            // total del grupo bajo trabajado, tokens bajo tokens
             assert_eq!(
                 end_col(station, "1 h 17 min"),
                 end_col(head, "worked"),
@@ -3265,10 +3871,12 @@ mod tests {
             );
             assert_eq!(end_col(station, "1 h 17 min"), end_col(docs, "1 h 12 min"));
             assert!(
-                station.contains("1 h 17 min      3    2 min ago"),
+                station.contains("1 h 17 min    46.3M    2 min ago"),
                 "{w}: {station:?}"
             );
-            assert_eq!(col(station, "3    2 min") + 1, end_col(head, "runs") as u16);
+            assert_eq!(end_col(station, "46.3M"), end_col(head, "tokens"));
+            assert_eq!(end_col(docs, "45.9M"), end_col(head, "tokens"));
+            assert!(!head.contains("runs"), "{w}: {head:?}");
             // último uso del grupo (el más reciente, frontend) en el borde
             assert_eq!(end_col(station, "2 min ago"), edge, "{w}: {station:?}");
             assert!(line_of(&lines, "frontend").ends_with("2 min ago"));
@@ -3352,11 +3960,13 @@ mod tests {
             .unwrap_or_else(|| panic!("{lines:#?}"));
         assert!(!station.contains("ago"), "{station:?}");
         let head = &lines[2];
-        assert_eq!(end_of(station), end_col(head, "runs"), "{station:?}");
+        // backend en curso, sin tokens aún: la raya bajo «tokens»
+        assert_eq!(end_of(station), end_col(head, "tokens"), "{station:?}");
+        assert!(station.trim_end().ends_with('—'), "{station:?}");
     }
 
     #[test]
-    fn the_group_total_is_bold_ink_and_its_runs_muted() {
+    fn the_group_total_is_bold_ink_and_its_tokens_muted() {
         let t = Theme::claude_256();
         let mut app = worked();
         let lines = draw(&mut app, 110, 16);
@@ -3369,8 +3979,9 @@ mod tests {
             .style()
             .add_modifier
             .contains(ratatui::style::Modifier::BOLD));
-        let at = col(station, "3    2 min");
-        assert_eq!(buf[(at, y)].style().fg, Some(t.ink_muted));
+        // sin tokens contados, la raya va en `subtle`, como en activos
+        let at = col(station, "—    2 min");
+        assert_eq!(buf[(at, y)].style().fg, Some(t.subtle));
         assert_eq!(buf[(col(station, "╸━"), y)].style().fg, Some(t.claude_soft));
         assert_eq!(
             buf[(col(station, "╸━") + 1, y)].style().fg,
@@ -3382,12 +3993,79 @@ mod tests {
     }
 
     #[test]
-    fn wide_rows_have_the_spark_worked_runs_and_last_use_under_their_headers() {
+    fn the_group_tokens_are_muted_when_counted() {
+        let t = Theme::claude_256();
+        let mut app = worked_with_tokens();
+        let lines = draw(&mut app, 110, 16);
+        let station = lines.iter().find(|l| l.starts_with(" station · ")).unwrap();
+        let y = y_of(&lines, station);
+        let buf = draw_buf(&mut app, 110, 16);
+        let cell = &buf[(col(station, "46.3M"), y)];
+        assert_eq!(cell.style().fg, Some(t.ink_muted));
+        assert!(!cell
+            .style()
+            .add_modifier
+            .contains(ratatui::style::Modifier::BOLD));
+    }
+
+    /// Bajo el total del proyecto (`ink` negrita), el tiempo de cada agente va
+    /// en `ink-muted` sin negrita, como sus tokens; también en la fila del
+    /// cursor, que solo resalta el nombre.
+    #[test]
+    fn a_row_worked_is_muted_without_bold_also_under_the_cursor() {
+        let t = Theme::claude_256();
+        let mut app = worked_with_tokens();
+        // el cursor baja hasta docs
+        for _ in 0..8 {
+            if line_of(&draw(&mut app, 110, 16), "docs").contains('❯') {
+                break;
+            }
+            press(&mut app, KeyCode::Down);
+        }
+        let lines = draw(&mut app, 110, 16);
+        let buf = draw_buf(&mut app, 110, 16);
+        let bold = ratatui::style::Modifier::BOLD;
+        let mut cursor = 0;
+        for (name, time, tokens) in [
+            ("docs", "1 h 12 min", "45.9M"),
+            ("frontend", "5 min", "412k"),
+        ] {
+            let line = line_of(&lines, name);
+            let y = y_of(&lines, line);
+            cursor += usize::from(line.contains('❯'));
+            for pat in [time, tokens] {
+                let cell = &buf[(col(line, pat), y)];
+                assert_eq!(cell.style().fg, Some(t.ink_muted), "{pat} en {line:?}");
+                assert!(!cell.style().add_modifier.contains(bold), "{pat}");
+            }
+        }
+        assert_eq!(cursor, 1, "{lines:#?}");
+    }
+
+    #[test]
+    fn a_row_without_counted_tokens_has_a_subtle_dash() {
+        let t = Theme::claude_256();
+        let mut app = worked();
+        let lines = draw(&mut app, 110, 16);
+        let buf = draw_buf(&mut app, 110, 16);
+        let line = line_of(&lines, "docs");
+        let y = y_of(&lines, line);
+        let at = col(line, "1 h 12 min") + width("1 h 12 min") as u16;
+        let dash = (at..110).find(|x| buf[(*x, y)].symbol() == "—").unwrap();
+        assert_eq!(buf[(dash, y)].style().fg, Some(t.subtle), "{line:?}");
+    }
+
+    #[test]
+    fn wide_rows_have_the_spark_worked_tokens_and_last_use_under_their_headers() {
         let lines = draw(&mut worked(), 110, 16);
         let head = &lines[2];
         let docs = line_of(&lines, "docs");
         assert!(docs.contains(&format!("{}╸━─", "─".repeat(11))), "{docs:?}");
-        assert!(docs.ends_with("1 h 12 min      2    8 min ago"), "{docs:?}");
+        // con ejecuciones y sin tokens contados, la raya
+        assert!(
+            docs.ends_with("1 h 12 min        —    8 min ago"),
+            "{docs:?}"
+        );
         // cada columna bajo su cabecera; la de la barrita, alineada a la derecha
         assert_eq!(
             end_col(head, "days"),
@@ -3396,13 +4074,14 @@ mod tests {
         );
         let end = |l: &str, pat: &str| col(l, pat) + width(pat) as u16;
         assert_eq!(end(head, "worked"), end(docs, "1 h 12 min"));
-        assert_eq!(end(head, "runs"), col(docs, "2    8 min") + 1);
+        assert_eq!(end(head, "tokens"), col(docs, "—    8 min") + 1);
+        assert!(!head.contains("runs"), "{head:?}");
         assert_eq!(width(head), width(docs), "{head:?}\n{docs:?}");
         assert!(head.ends_with("last used"), "{head:?}");
         // sin ejecuciones: barrita a cero y columnas vacías
         let visual = line_of(&lines, "visual");
         assert!(visual.contains(&"─".repeat(14)), "{visual:?}");
-        let gap = SPARK_GAP + 10 + COL_GAP + 4 + COL_GAP + 3;
+        let gap = SPARK_GAP + 10 + COL_GAP + 6 + COL_GAP + 3;
         assert!(
             visual.ends_with(&format!("─{}5 s ago", " ".repeat(gap))),
             "{visual:?}"
@@ -3422,17 +4101,29 @@ mod tests {
     }
 
     #[test]
-    fn under_100_columns_the_spark_goes_and_under_80_the_runs_too() {
-        let lines = draw(&mut worked(), 90, 16);
+    fn under_100_columns_the_spark_goes_and_under_80_the_tokens_too() {
+        let lines = draw(&mut worked_with_tokens(), 90, 24);
         assert!(!lines[2].contains("last 14"), "{:?}", lines[2]);
-        assert!(lines[2].contains("runs"), "{:?}", lines[2]);
+        assert!(lines[2].contains("tokens"), "{:?}", lines[2]);
         let docs = line_of(&lines, "docs");
         assert!(!docs.contains(['─', '╸', '━']), "{docs:?}");
-        assert!(docs.ends_with("1 h 12 min      2    8 min ago"), "{docs:?}");
-        let lines = draw(&mut worked(), 79, 16);
-        assert!(!lines[2].contains("runs"), "{:?}", lines[2]);
+        assert!(
+            docs.ends_with("1 h 12 min    45.9M    8 min ago"),
+            "{docs:?}"
+        );
+        let frontend = line_of(&lines, "frontend");
+        assert!(
+            frontend.ends_with("5 min     412k    2 min ago"),
+            "{frontend:?}"
+        );
+        let lines = draw(&mut worked_with_tokens(), 80, 24);
+        assert!(lines[2].contains("tokens"), "{:?}", lines[2]);
+        let lines = draw(&mut worked_with_tokens(), 79, 24);
+        assert!(!lines[2].contains("tokens"), "{:?}", lines[2]);
         let docs = line_of(&lines, "docs");
         assert!(docs.ends_with("1 h 12 min    8 min ago"), "{docs:?}");
+        let station = lines.iter().find(|l| l.starts_with(" station · ")).unwrap();
+        assert!(station.ends_with("1 h 17 min    2 min ago"), "{station:?}");
     }
 
     #[test]
@@ -3674,13 +4365,13 @@ mod tests {
         app
     }
 
-    /// La primera fila (numerada) que lleva `name`, o la que cuelga de la
-    /// línea del agente `name`: la que salga antes.
+    /// La primera fila de ejecución (la del árbol, que no lleva número) que lleva
+    /// `name`, o la que cuelga de la línea del agente `name`: la que salga
+    /// antes.
     fn blk(lines: &[String], name: &str) -> usize {
-        let numbered = lines.iter().position(|l| {
-            let head = l.trim_start().trim_start_matches('❯').trim_start();
-            head.starts_with(|c: char| c.is_ascii_digit()) && l.contains(name)
-        });
+        let numbered = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with(['├', '└']) && l.contains(name));
         let under = lines
             .iter()
             .position(|l| agent_line_of(l, name))
@@ -3692,10 +4383,15 @@ mod tests {
             .unwrap_or_else(|| panic!("sin bloque {name:?}: {lines:#?}"))
     }
 
-    /// Si `l` es la línea del agente `name` (sin número, en la columna del
-    /// nombre, con la estrella delante o su hueco en blanco).
+    /// Si `l` es la línea del agente `name` (con el cursor y el número de su
+    /// bloque delante, en la columna del nombre, con la estrella o su hueco
+    /// en blanco).
     fn agent_line_of(l: &str, name: &str) -> bool {
-        l.strip_prefix("       ")
+        let head = l.trim_start().trim_start_matches('❯').trim_start();
+        let digits = head.chars().take_while(char::is_ascii_digit).count();
+        (digits > 0)
+            .then(|| head[digits..].strip_prefix(". "))
+            .flatten()
             .and_then(|r| ["  ", "✦ ", "✧ "].iter().find_map(|s| r.strip_prefix(s)))
             .and_then(|r| r.strip_prefix(name))
             .is_some_and(|r| r.is_empty() || r.starts_with(' '))
@@ -3771,7 +4467,7 @@ mod tests {
     }
 
     /// El racimo: el agente en su propia línea encima de la cabeza (nombre,
-    /// etiqueta y ×N, sin número, estrella ni cifras), las tareas colgadas
+    /// etiqueta y ×N tras el número del bloque y la estrella, sin cifras), las tareas colgadas
     /// de `├`/`└` en la columna del nombre, la guía `│` bajo las que siguen
     /// y dos espacios bajo la última.
     #[test]
@@ -3779,14 +4475,14 @@ mod tests {
         let mut app = chain_app();
         let lines = draw(&mut app, 110, 30);
         let g = pos(&lines, " station · 3 running · 1 recent ──");
-        assert_eq!(lines[g + 1], "       ✦ docs [own] ×3", "{lines:#?}");
+        assert_eq!(lines[g + 1], "    3. ✦ docs [own] ×3", "{lines:#?}");
         let tree = [
-            "    3.   ├ Revisando convenciones de docs/README  ",
+            "         ├ Revisando convenciones de docs/README  ",
             "         │ skill  superpowers:brainstorming",
             "         │ now    Read · docs/interface.md",
-            "    4.   ├ Revisando targets del Makefile  ",
+            "         ├ Revisando targets del Makefile  ",
             "         │ now    Bash · grep -n release Makefile",
-            "    5.   └ Leyendo contact-form.astro y cookie-table  ",
+            "         └ Leyendo contact-form.astro y cookie-table  ",
             "           skill  frontend-design:frontend-design",
             "           now    —",
         ];
@@ -3811,8 +4507,8 @@ mod tests {
         // la terminada de otro agente, en su propio bloque tras una línea en
         // blanco
         assert_eq!(lines[g + 10], "", "{lines:#?}");
-        assert_eq!(lines[g + 11], "         frontend [own]", "{lines:#?}");
-        assert!(lines[g + 12].starts_with("    6.   └ —  "), "{lines:#?}");
+        assert_eq!(lines[g + 11], "    4.   frontend [own]", "{lines:#?}");
+        assert!(lines[g + 12].starts_with("         └ —  "), "{lines:#?}");
     }
 
     /// `docs` con una en curso y una terminada en station, junto a la
@@ -3842,7 +4538,7 @@ mod tests {
         app
     }
 
-    /// Un bloque por agente: su línea (con ×N de todo el bloque) y debajo
+    /// Un bloque por agente: su línea (sin ×N: solo una en curso) y debajo
     /// sus filas, la en curso con `├` y la guía `│` bajando por skill y now,
     /// y la terminada cerrando con `└`, sin nombre, la tarea en gris; un
     /// agente solo con terminada lleva igualmente su línea encima (nombre en
@@ -3855,14 +4551,14 @@ mod tests {
         let buf = draw_buf(&mut app, 110, 30);
         let g = pos(&lines, " station · 1 running · 2 recent ──");
         let want = [
-            "       ✦ docs [own] ×2",
-            "    3.   ├ Revisando convenciones de docs/README  ",
+            "    3. ✦ docs [own]",
+            "         ├ Revisando convenciones de docs/README  ",
             "         │ skill  superpowers:brainstorming",
             "         │ now    Read · docs/interface.md",
-            "    4.   └ docs: tarea  ",
+            "         └ docs: tarea  ",
             "",
-            "         frontend [own]",
-            "    5.   └ —  ",
+            "    4.   frontend [own]",
+            "         └ —  ",
         ];
         for (k, w) in want.iter().enumerate() {
             let got = &lines[g + 1 + k];
@@ -3886,14 +4582,14 @@ mod tests {
         // en estrecho el árbol sigue entero y nada se sale
         let narrow = draw(&mut app, 48, 30);
         let g = pos(&narrow, " station ");
-        assert_eq!(narrow[g + 1].trim_end(), "       ✦ docs", "{narrow:#?}");
+        assert_eq!(narrow[g + 1].trim_end(), "    3. ✦ docs", "{narrow:#?}");
         assert!(
-            narrow[g + 2].starts_with("    3.   ├ Revisando"),
+            narrow[g + 2].starts_with("         ├ Revisando"),
             "{narrow:#?}"
         );
         assert!(narrow[g + 3].starts_with("         │ skill  superpowers"));
         assert!(
-            narrow[g + 5].starts_with("    4.   └ docs: tarea"),
+            narrow[g + 5].starts_with("         └ docs: tarea"),
             "{narrow:#?}"
         );
         assert!(narrow.iter().all(|l| width(l) <= 48));
@@ -3934,9 +4630,9 @@ mod tests {
         let lines = draw(&mut app, 110, 60);
         let buf = draw_buf(&mut app, 110, 60);
         let g = pos(&lines, " station · 2 running · 1 recent ──");
-        assert_eq!(lines[g + 1], "       ✦ visual [workflow]", "{lines:#?}");
+        assert_eq!(lines[g + 1], "    3. ✦ visual [workflow]", "{lines:#?}");
         assert!(
-            lines[g + 2].starts_with("    3.   └ pintar la pantalla de activos  "),
+            lines[g + 2].starts_with("         └ pintar la pantalla de activos  "),
             "{:?}",
             lines[g + 2]
         );
@@ -3948,9 +4644,9 @@ mod tests {
         assert_eq!(lines[g + 3], "           skill  superpowers:brainstorming");
         assert_eq!(lines[g + 4], "           now    —");
         assert_eq!(lines[g + 5], "", "aire entre bloques");
-        assert_eq!(lines[g + 6], "       ✦ backend [own]", "sin ×1");
+        assert_eq!(lines[g + 6], "    4. ✦ backend [own]", "sin ×1");
         assert!(
-            lines[g + 7].starts_with("    4.   └ —  "),
+            lines[g + 7].starts_with("         └ —  "),
             "{:?}",
             lines[g + 7]
         );
@@ -3975,7 +4671,7 @@ mod tests {
         assert_eq!(at(g + 6), Some(3), "{lines:#?}");
         // la terminada sola, igual: su agente encima y la tarea colgada de └
         let d = run_of(&lines, "frontend");
-        assert!(lines[d].contains(".   └ "), "{:?}", lines[d]);
+        assert!(lines[d].starts_with("         └ "), "{:?}", lines[d]);
     }
 
     /// La línea del agente es de la cabeza: pulsarla abre esa fila.
@@ -3990,6 +4686,12 @@ mod tests {
         let at = |y: usize| hits.iter().find(|x| x.0 as usize == y).map(|x| x.1);
         assert_eq!(at(a), at(h), "{lines:#?}");
         assert!(at(a).is_some());
+        // y todas las del bloque (tres filas con sus skill y now) son del
+        // mismo cursor: se selecciona el bloque, no la ejecución
+        for y in a..=a + 8 {
+            assert_eq!(at(y), at(a), "línea {y}: {lines:#?}");
+        }
+        assert_eq!(at(a + 9), None, "el blanco tras el bloque no se pulsa");
     }
 
     /// Estrecho: la tarea se corta con «…» y el árbol sigue en su sitio; bajo
@@ -4002,12 +4704,12 @@ mod tests {
         let h = blk(&lines, "├ Revisando");
         assert!(lines[h].contains("docs/README "), "{:?}", lines[h]);
         assert!(lines[h].ends_with("1 min"), "{:?}", lines[h]);
-        assert!(lines.iter().any(|l| l == "       ✦ docs [own] ×3"));
+        assert!(lines.iter().any(|l| l == "    3. ✦ docs [own] ×3"));
         let lines = draw(&mut app, 45, 30);
         let h = blk(&lines, "├ Revisando");
         assert!(lines[h].contains('…'), "{:?}", lines[h]);
         assert!(lines[h].ends_with("1 min"), "{:?}", lines[h]);
-        assert!(lines.iter().any(|l| l == "       ✦ docs"), "{lines:#?}");
+        assert!(lines.iter().any(|l| l == "    3. ✦ docs"), "{lines:#?}");
         for w in 30u16..=160 {
             let lines = draw(&mut app, w, 30);
             assert!(
@@ -4027,17 +4729,17 @@ mod tests {
         let lines = draw(&mut app, 110, 60);
         let g = pos(&lines, " station · 2 running · 1 recent ──");
         let want = [
-            "       ✦ visual [workflow]",
-            "    3.   └ pintar",
+            "    3. ✦ visual [workflow]",
+            "         └ pintar",
             "           skill  superpowers:brainstorming",
             "           now    —",
             "",
-            "       ✦ backend [own]",
-            "    4.   └ —",
+            "    4. ✦ backend [own]",
+            "         └ —",
             "           now    —",
             "",
-            "         frontend [own]",
-            "    5.   └ —",
+            "    5.   frontend [own]",
+            "         └ —",
             "",
         ];
         for (k, w) in want.iter().enumerate() {
@@ -4077,11 +4779,11 @@ mod tests {
             !lines.iter().any(|l| l.contains("~/") || l.contains("cwd")),
             "{lines:#?}"
         );
-        // en curso y sola, un racimo de uno: el agente en su línea y la
-        // fila, tras el número, con la tarea colgada de └
-        assert_eq!(lines[g + 1], "       ✦ visual [workflow]");
+        // en curso y sola, un racimo de uno: el agente en su línea, con el
+        // número, y debajo la fila con la tarea colgada de └
+        assert_eq!(lines[g + 1], "    3. ✦ visual [workflow]");
         assert!(
-            lines[g + 2].starts_with("    3.   └ pintar la pantalla de activos  "),
+            lines[g + 2].starts_with("         └ pintar la pantalla de activos  "),
             "{:?}",
             lines[g + 2]
         );
@@ -4097,9 +4799,9 @@ mod tests {
         // otro agente, tras una línea en blanco; sin tarea, «—»; sin skill,
         // dos líneas
         assert_eq!(lines[g + 5], "");
-        assert_eq!(lines[g + 6], "       ✦ backend [own]");
+        assert_eq!(lines[g + 6], "    4. ✦ backend [own]");
         assert!(
-            lines[g + 7].starts_with("    4.   └ —  "),
+            lines[g + 7].starts_with("         └ —  "),
             "{:?}",
             lines[g + 7]
         );
@@ -4266,10 +4968,10 @@ mod tests {
             .iter()
             .any(|l| l.contains("[workflow]") || l.contains("[claude]") || l.contains("[own]")));
         let wf = blk(&lines, "pintar");
-        assert_eq!(lines[wf - 1], "       ✦ visual", "{lines:#?}");
-        assert!(lines[wf].starts_with("    3.   └ "), "{:?}", lines[wf]);
+        assert_eq!(lines[wf - 1], "    3. ✦ visual", "{lines:#?}");
+        assert!(lines[wf].starts_with("         └ "), "{:?}", lines[wf]);
         assert!(lines[wf].ends_with("<1 min"), "{:?}", lines[wf]);
-        assert!(lines.iter().any(|l| l == "       ✦ general-purpose"));
+        assert!(lines.iter().any(|l| l.ends_with(". ✦ general-purpose")));
     }
 
     #[test]
@@ -4315,7 +5017,7 @@ mod tests {
         let lines = draw(&mut app, 60, 40);
         let a = pos(&lines, "un-agente-con");
         assert_eq!(
-            lines[a], "       ✦ un-agente-con-un-nombre-larguisimo-de-verdad",
+            lines[a], "    3. ✦ un-agente-con-un-nombre-larguisimo-de-verdad",
             "sin sitio para la etiqueta, el nombre entero"
         );
         assert!(
@@ -4425,9 +5127,9 @@ mod tests {
         let y = b as u16;
         // el hueco de la estrella en blanco; el nombre, en su línea encima, y
         // la tarea colgada de `└` como en una en curso
-        assert_eq!(lines[b - 1], "         backend [own]", "{lines:#?}");
+        assert_eq!(lines[b - 1], "    4.   backend [own]", "{lines:#?}");
         assert!(
-            lines[b].starts_with("    4.   └ backend: tarea  "),
+            lines[b].starts_with("         └ backend: tarea  "),
             "{:?}",
             lines[b]
         );
@@ -4446,20 +5148,20 @@ mod tests {
         assert!(!lines.iter().any(|l| l.contains('✦') || l.contains('✧')));
         // número, tarea y tiempo en gris, sin negrita ni naranja; el árbol,
         // en subtle
-        for pat in ["4.", "tarea", "5 min ago"] {
-            let c = col(&lines[b], pat);
-            let st = buf[(c, y)].style();
+        for (line, pat) in [(b - 1, "4."), (b, "tarea"), (b, "5 min ago")] {
+            let c = col(&lines[line], pat);
+            let st = buf[(c, line as u16)].style();
             assert_eq!(st.fg, Some(t.ink_muted), "{pat}");
             assert!(!st.add_modifier.contains(Modifier::BOLD), "{pat}");
         }
         assert_eq!(buf[(col(&lines[b], "└"), y)].style().fg, Some(t.subtle));
-        // el cursor tiñe el número de su fila, también terminada; el nombre
-        // de su agente, encima, sigue en gris
+        // el cursor tiñe el número de su bloque (en la línea del agente),
+        // también terminado; el nombre de su agente sigue en gris
         let first = blk(&lines, "visual");
-        assert!(lines[first].starts_with(" ❯  1. "), "{:?}", lines[first]);
-        let st = buf[(col(&lines[first], "1."), first as u16)].style();
-        assert_eq!(st.fg, Some(t.claude_soft));
         let a = first - 1;
+        assert!(lines[a].starts_with(" ❯  1. "), "{:?}", lines[a]);
+        let st = buf[(col(&lines[a], "1."), a as u16)].style();
+        assert_eq!(st.fg, Some(t.claude_soft));
         let st = buf[(col(&lines[a], "visual"), a as u16)].style();
         assert_eq!(st.fg, Some(t.ink_muted));
         assert!(!st.add_modifier.contains(Modifier::BOLD));
@@ -4527,12 +5229,12 @@ mod tests {
         let (ex, be) = (ex_a + 1, be_a + 1);
         let fe = run_of(&lines, "frontend");
         let wf = run_of(&lines, "visual");
-        assert_eq!(lines[ex_a], "       ✦ Explore [claude]", "{lines:#?}");
-        assert!(lines[ex].starts_with("    3.   └ "), "{:?}", lines[ex]);
+        assert_eq!(lines[ex_a], "    3. ✦ Explore [claude]", "{lines:#?}");
+        assert!(lines[ex].starts_with("         └ "), "{:?}", lines[ex]);
         // texto por tipo: [propio] en definidos y pasos de workflow, [claude] en built-in
-        assert_eq!(lines[be_a], "       ✦ backend [own]", "{lines:#?}");
-        assert_eq!(lines[fe - 1], "         frontend [own]", "{lines:#?}");
-        assert_eq!(lines[wf - 1], "         visual [own]", "{lines:#?}");
+        assert_eq!(lines[be_a], "    4. ✦ backend [own]", "{lines:#?}");
+        assert_eq!(lines[fe - 1], "    5.   frontend [own]", "{lines:#?}");
+        assert_eq!(lines[wf - 1], " ❯  1.   visual [own]", "{lines:#?}");
         // ni `✻`, ni punto, ni la etiqueta vieja
         assert!(!lines
             .iter()
@@ -4562,7 +5264,7 @@ mod tests {
             let st = buf[(col(&lines[l], pat), l as u16)].style();
             assert_eq!(st.fg, Some(t.ink_muted), "{pat}");
         }
-        // el nombre empieza justo tras el número; cabecera y detalles, en esa columna
+        // el nombre empieza tras el número y la estrella; cabecera y detalles, en esa columna
         let name = col(&lines[ex_a], "Explore");
         assert_eq!(name, 9);
         assert_eq!(col(&lines[be_a], "backend"), name);
@@ -4737,6 +5439,8 @@ mod tests {
             press(&mut app, KeyCode::Char(n));
             press(&mut app, KeyCode::Enter);
             if app.can_open_agent() {
+                // de la pantalla del agente, a su primera ejecución
+                press(&mut app, KeyCode::Enter);
                 break;
             }
             press(&mut app, KeyCode::Esc);
@@ -4833,37 +5537,31 @@ mod tests {
     #[test]
     fn run_details_show_the_launcher_usage_and_launched_runs_in_order() {
         let mut app = rich_run();
-        let lines = draw(&mut app, 100, 40);
+        let lines = draw(&mut app, 100, 38);
         assert!(
-            lines[2].ends_with("running 4 min · 5 tools · 412k tok"),
+            lines[0].ends_with("running 4 min · 5 tools · 412k tok"),
             "{:?}",
-            lines[2]
+            lines[0]
         );
+        // las cifras de la cabecera acaban en la columna de las reglas
+        assert_eq!(width(&lines[0]), 99);
         assert_eq!(
-            lines[3],
+            lines[1],
             "   launched by  session 23dabecb · “paint the active screen with tokens”"
         );
-        assert_eq!(lines[4], "");
-        assert!(lines[5].starts_with(" task ─"), "{:?}", lines[5]);
-        assert!(lines[8].starts_with(" usage ─"), "{:?}", lines[8]);
-        assert!(lines[8].ends_with("─ sonnet-5-5"), "{:?}", lines[8]);
-        assert!(
-            lines[9].starts_with("   context       71%  ███"),
-            "{:?}",
-            lines[9]
-        );
-        assert!(lines[9].ends_with("░░  142k of 200k"), "{:?}", lines[9]);
+        assert_eq!(lines[2], "   running in   ~/Offing/argi/station");
+        assert_eq!(lines[3], "");
+        assert!(lines[4].starts_with(" usage ─"), "{:?}", lines[4]);
+        assert!(lines[4].ends_with("─ sonnet-5-5"), "{:?}", lines[4]);
+        assert_eq!(width(&lines[4]), 99);
         // la barra: 40 columnas como mucho, el 71 % lleno
-        let gauge: String = lines[9]
+        let gauge: String = lines[5]
             .chars()
             .filter(|c| "█▉▊▋▌▍▎▏░".contains(*c))
             .collect();
-        assert_eq!(gauge.chars().count(), 40, "{:?}", lines[9]);
+        assert_eq!(gauge.chars().count(), 40, "{:?}", lines[5]);
         assert_eq!(gauge.chars().filter(|&c| c == '█').count(), 28);
-        assert_eq!(lines[10], "   input         18k");
-        assert_eq!(lines[11], "   output        24k");
-        assert_eq!(lines[12], "   cache read   351k");
-        assert_eq!(lines[13], "   cache write   19k");
+        assert!(lines[6].starts_with("   tokens   412k  "), "{:?}", lines[6]);
         // ningún coste en dólares: va por suscripción y la cifra no es lo que paga
         assert!(
             !lines
@@ -4871,90 +5569,91 @@ mod tests {
                 .any(|l| l.contains('$') || l.contains("API prices")),
             "{lines:?}"
         );
-        assert!(lines[14].starts_with(" tools ─"), "{:?}", lines[14]);
-        assert!(lines[16].starts_with(" launched · 2 ─"), "{:?}", lines[16]);
+        assert!(lines[7].starts_with(" task ─"), "{:?}", lines[7]);
+        assert!(lines[10].starts_with(" tools ─"), "{:?}", lines[10]);
+        assert!(lines[12].starts_with(" launched · 2 ─"), "{:?}", lines[12]);
         assert_eq!(
-            lines[17],
+            lines[13],
             "   1. ✦ Explore [claude]           2 min · 9 tools · 64k tok         Find where ctx is computed"
         );
         assert_eq!(
-            lines[18],
+            lines[14],
             "   2.   general-purpose [claude]   4 min ago · 21 tools · 210k tok   Check ratatui gauge widths"
         );
-        assert!(lines[19].starts_with(" steps · 5 ─"), "{:?}", lines[19]);
+        assert!(lines[15].starts_with(" steps · 5 ─"), "{:?}", lines[15]);
     }
 
     #[test]
     fn run_usage_and_launched_are_painted_by_role() {
         let t = Theme::claude_256();
         let mut app = rich_run();
-        let lines = draw(&mut app, 100, 40);
-        let buf = draw_buf(&mut app, 100, 40);
+        let lines = draw(&mut app, 100, 38);
+        let buf = draw_buf(&mut app, 100, 38);
         let at = |y: usize, pat: &str| buf[(col(&lines[y], pat), y as u16)].style();
-        assert_eq!(at(3, "launched by").fg, Some(t.ink_muted));
-        assert_eq!(at(8, "usage").fg, Some(t.claude_soft));
-        assert_eq!(at(8, "sonnet").fg, Some(t.ink_muted));
-        assert_eq!(at(9, "context").fg, Some(t.ink_muted));
-        assert_eq!(at(9, "71%").fg, Some(t.ink));
-        assert_eq!(at(9, "█").fg, Some(t.claude_soft));
-        assert_eq!(at(9, "░").fg, Some(t.subtle));
-        assert_eq!(at(9, "142k").fg, Some(t.ink_muted));
-        assert_eq!(at(12, "351k").fg, Some(t.ink));
-        assert_eq!(at(13, "19k").fg, Some(t.ink));
+        assert_eq!(at(1, "launched by").fg, Some(t.ink_muted));
+        assert_eq!(at(4, "usage").fg, Some(t.claude_soft));
+        assert_eq!(at(4, "sonnet").fg, Some(t.ink_muted));
+        assert_eq!(at(5, "context").fg, Some(t.ink_muted));
+        assert_eq!(at(5, "71%").fg, Some(t.ink));
+        assert_eq!(at(5, "█").fg, Some(t.claude_soft));
+        assert_eq!(at(5, "░").fg, Some(t.subtle));
+        assert_eq!(at(5, "142k").fg, Some(t.ink_muted));
+        assert_eq!(at(6, "351k").fg, Some(t.ink));
+        assert_eq!(at(6, "19k").fg, Some(t.ink));
         // hijas: en curso, estrella y nombre claude-soft negrita; terminada, ink
-        assert_eq!(at(17, "✦").fg, Some(t.claude));
-        assert_eq!(at(17, "Explore").fg, Some(t.claude_soft));
-        assert!(at(17, "Explore").add_modifier.contains(Modifier::BOLD));
-        assert_eq!(at(18, "general").fg, Some(t.ink));
-        assert_eq!(at(18, "[claude]").fg, Some(t.ink_muted));
-        assert_eq!(at(18, "4 min ago").fg, Some(t.ink_muted));
-        assert_eq!(at(18, "Check").fg, Some(t.ink));
+        assert_eq!(at(13, "✦").fg, Some(t.claude));
+        assert_eq!(at(13, "Explore").fg, Some(t.claude_soft));
+        assert!(at(13, "Explore").add_modifier.contains(Modifier::BOLD));
+        assert_eq!(at(14, "general").fg, Some(t.ink));
+        assert_eq!(at(14, "[claude]").fg, Some(t.ink_muted));
+        assert_eq!(at(14, "4 min ago").fg, Some(t.ink_muted));
+        assert_eq!(at(14, "Check").fg, Some(t.ink));
         // desde el 85 %, la barra y la cifra en ámbar
         app.run_detail.as_mut().unwrap().context = Some(Context {
             used: 180_000,
             window: 200_000,
         });
-        let lines = draw(&mut app, 100, 40);
-        let buf = draw_buf(&mut app, 100, 40);
+        let lines = draw(&mut app, 100, 38);
+        let buf = draw_buf(&mut app, 100, 38);
         let at = |y: usize, pat: &str| buf[(col(&lines[y], pat), y as u16)].style();
-        assert_eq!(at(9, "90%").fg, Some(t.warning));
-        assert_eq!(at(9, "█").fg, Some(t.warning));
+        assert_eq!(at(5, "90%").fg, Some(t.warning));
+        assert_eq!(at(5, "█").fg, Some(t.warning));
     }
 
     #[test]
     fn the_selected_launched_run_carries_the_cursor_and_the_footer_says_open() {
         let t = Theme::claude_256();
         let mut app = rich_run();
-        let lines = draw(&mut app, 140, 40);
+        let lines = draw(&mut app, 140, 38);
         assert_eq!(
-            bare(&lines[39]),
-            " esc back · ↑↓ other agent · tab launched · pgup/pgdn steps · a agent · q quit"
+            bare(&lines[37]),
+            " esc back to visual · tab launched · pgup/pgdn steps · q quit"
         );
         app.launched_sel = Some(1);
-        let lines = draw(&mut app, 140, 40);
+        let lines = draw(&mut app, 140, 38);
         assert!(
-            lines[18].starts_with(" ❯ 2.   general-purpose"),
+            lines[14].starts_with(" ❯ 2.   general-purpose"),
             "{:?}",
-            lines[18]
+            lines[14]
         );
-        assert!(lines[17].starts_with("   1. ✦ Explore"), "{:?}", lines[17]);
-        let buf = draw_buf(&mut app, 140, 40);
-        assert_eq!(buf[(1, 18)].style().fg, Some(t.claude));
-        assert_eq!(buf[(3, 18)].style().fg, Some(t.claude_soft));
-        let name = buf[(col(&lines[18], "general"), 18)].style();
+        assert!(lines[13].starts_with("   1. ✦ Explore"), "{:?}", lines[13]);
+        let buf = draw_buf(&mut app, 140, 38);
+        assert_eq!(buf[(1, 14)].style().fg, Some(t.claude));
+        assert_eq!(buf[(3, 14)].style().fg, Some(t.claude_soft));
+        let name = buf[(col(&lines[14], "general"), 14)].style();
         assert_eq!(name.fg, Some(t.claude_soft));
         assert!(name.add_modifier.contains(Modifier::BOLD));
         assert_eq!(
-            bare(&lines[39]),
-            " esc back · ↑↓ other agent · tab launched · enter open · pgup/pgdn steps · a agent · q quit"
+            bare(&lines[37]),
+            " esc back to visual · tab launched · enter open · pgup/pgdn steps · q quit"
         );
         // sin hijas, ni sección ni tab
         let d = app.run_detail.as_mut().unwrap();
         d.launched.clear();
         app.launched_sel = None;
-        let lines = draw(&mut app, 140, 40);
+        let lines = draw(&mut app, 140, 38);
         assert!(!lines.iter().any(|l| l.contains("launched ·")));
-        assert!(!lines[39].contains("tab"), "{:?}", lines[39]);
+        assert!(!lines[37].contains("tab"), "{:?}", lines[37]);
     }
 
     #[test]
@@ -4966,33 +5665,32 @@ mod tests {
             ..parent
         }));
         assert!(app.can_open_parent());
-        let lines = draw(&mut app, 140, 40);
-        assert_eq!(lines[3], "   launched by  backend [own]");
-        assert!(lines[39].contains(" · p parent · "), "{:?}", lines[39]);
+        let lines = draw(&mut app, 140, 38);
+        assert_eq!(lines[1], "   launched by  backend [own]");
+        assert!(lines[37].contains(" · p parent · "), "{:?}", lines[37]);
         app.run_detail.as_mut().unwrap().launched_by = Some(LaunchedBy::GoneRun { id: "x".into() });
-        let lines = draw(&mut app, 140, 40);
-        assert_eq!(lines[3], "   launched by  a run no longer on disk");
-        assert!(!lines[39].contains("parent"), "{:?}", lines[39]);
-        // sin quién, ni línea: la sección del encargo sube
+        let lines = draw(&mut app, 140, 38);
+        assert_eq!(lines[1], "   launched by  a run no longer on disk");
+        assert!(!lines[37].contains("parent"), "{:?}", lines[37]);
+        // sin quién, ni línea: lo demás sube
         app.run_detail.as_mut().unwrap().launched_by = None;
-        let lines = draw(&mut app, 140, 40);
-        assert_eq!(lines[3], "");
-        assert!(lines[4].starts_with(" task"), "{:?}", lines[4]);
+        let lines = draw(&mut app, 140, 38);
+        assert_eq!(lines[1], "   running in   ~/Offing/argi/station");
+        assert_eq!(lines[2], "");
+        assert!(lines[3].starts_with(" usage"), "{:?}", lines[3]);
         // sesión sin prompt: solo el id corto
         app.run_detail.as_mut().unwrap().launched_by = Some(LaunchedBy::Session {
             id: "abc".into(),
             prompt: None,
         });
-        assert_eq!(draw(&mut app, 140, 40)[3], "   launched by  session abc");
+        assert_eq!(draw(&mut app, 140, 38)[1], "   launched by  session abc");
     }
 
     #[test]
     fn usage_has_no_cost_and_goes_without_a_known_model() {
         let mut app = rich_run();
-        // en una terminal estrecha tampoco aparece el coste en su propia fila
-        let lines = draw(&mut app, 40, 40);
-        assert_eq!(lines[13], "   cache write   19k");
-        assert!(lines[14].starts_with(" tools ─"), "{:?}", lines[14]);
+        // en una terminal estrecha tampoco aparece el coste
+        let lines = draw(&mut app, 40, 38);
         assert!(!lines
             .iter()
             .any(|l| l.contains('$') || l.contains("API prices")));
@@ -5004,15 +5702,34 @@ mod tests {
             cache_read: 0,
             cache_creation: 0,
         };
+        d.tokens = 20;
         d.usage.model = None;
-        let lines = draw(&mut app, 100, 40);
+        let lines = draw(&mut app, 100, 38);
         assert!(!lines
             .iter()
             .any(|l| l.contains('$') || l.contains("API prices")));
-        assert!(lines[8].ends_with("─ —"), "{:?}", lines[8]);
-        // sin contexto, un guion
+        assert!(lines[4].ends_with("─ —"), "{:?}", lines[4]);
+        assert_eq!(
+            lines[6],
+            "   tokens   20   input 10 · output 10 · cache read 0 · cache write 0"
+        );
+        // sin contexto, un guion apagado
+        let t = Theme::claude_256();
         app.run_detail.as_mut().unwrap().context = None;
-        assert_eq!(draw(&mut app, 100, 40)[9], "   context       —");
+        assert_eq!(draw(&mut app, 100, 38)[5], "   context  —");
+        assert_eq!(
+            draw_buf(&mut app, 100, 38)[(12, 5)].style().fg,
+            Some(t.subtle)
+        );
+        // sin tokens contados pero con modelo: guion, sin desglose
+        let d = app.run_detail.as_mut().unwrap();
+        d.tokens = 0;
+        d.usage.model = Some("claude-sonnet-5-5".into());
+        assert_eq!(draw(&mut app, 100, 38)[6], "   tokens   —");
+        // sin nada que contar, ni sección
+        app.run_detail.as_mut().unwrap().usage.model = None;
+        let lines = draw(&mut app, 100, 38);
+        assert!(!lines.iter().any(|l| l.starts_with(" usage")), "{lines:#?}");
     }
 
     #[test]
@@ -5034,7 +5751,7 @@ mod tests {
     }
 
     #[test]
-    fn a_short_run_screen_drops_usage_and_launched_before_the_task_and_steps() {
+    fn a_short_run_screen_drops_launched_then_usage_before_the_task_and_steps() {
         let mut app = rich_run();
         for h in 1u16..=40 {
             for w in [30u16, 60, 100] {
@@ -5046,16 +5763,26 @@ mod tests {
                 );
             }
         }
-        // 24 filas: los pasos se quedan con tres, el encargo entra y la
-        // sección de uso, que no cabe entera, se va
-        let lines = draw(&mut app, 100, 24);
-        assert!(lines.iter().any(|l| l.starts_with(" task")), "{lines:#?}");
+        let has = |lines: &[String], s: &str| lines.iter().any(|l| l.starts_with(s));
+        // 15 filas: los pasos se quedan con tres y entran encargo y
+        // herramientas; uso y lanzadas, que no caben enteras, se van
+        let lines = draw(&mut app, 100, 15);
+        assert!(has(&lines, " task") && has(&lines, " tools"), "{lines:#?}");
         assert!(
-            lines.iter().any(|l| l.starts_with(" launched")),
+            !has(&lines, " usage") && !has(&lines, " launched"),
             "{lines:#?}"
         );
         let steps = pos(&lines, " steps · 5");
         assert!(lines[steps + 3].contains("ago"), "{lines:#?}");
+        // 16: entra el uso, la primera sección; 20: también las lanzadas
+        let lines = draw(&mut app, 100, 16);
+        assert!(lines[4].starts_with(" usage"), "{lines:#?}");
+        assert!(!has(&lines, " launched"), "{lines:#?}");
+        let lines = draw(&mut app, 100, 20);
+        assert!(
+            has(&lines, " usage") && has(&lines, " launched"),
+            "{lines:#?}"
+        );
         // con alto de sobra, todo
         let lines = draw(&mut app, 100, 40);
         for s in [" task", " usage", " tools", " launched", " steps"] {
@@ -5064,86 +5791,96 @@ mod tests {
     }
 
     #[test]
-    fn run_header_has_the_name_by_state_the_origin_tag_and_the_project() {
+    fn run_header_carries_the_origin_tag_of_its_agent() {
         let t = Theme::claude_256();
         let mut app = run_app();
-        let lines = draw(&mut app, 100, 24);
-        let head = &lines[2];
+        let lines = draw(&mut app, 100, 22);
+        let head = &lines[0];
         assert!(
-            head.starts_with(" ✦ visual [own] via workflow · station"),
+            head.starts_with(" visual [own] via workflow › ✦ run 1 of 1  "),
             "{head:?}"
         );
         assert!(head.ends_with("running 4 min · 5 tools"), "{head:?}");
-        let buf = draw_buf(&mut app, 100, 24);
-        // en curso: estrella en claude; nombre claude-soft negrita; etiqueta gris
-        assert_eq!(buf[(1, 2)].symbol(), "✦");
-        assert_eq!(buf[(1, 2)].style().fg, Some(t.claude));
-        assert_eq!(buf[(3, 2)].style().fg, Some(t.claude_soft));
-        assert!(buf[(3, 2)].style().add_modifier.contains(Modifier::BOLD));
-        assert_eq!(buf[(col(head, "[own]"), 2)].style().fg, Some(t.ink_muted));
-        assert_eq!(buf[(col(head, "via"), 2)].style().fg, Some(t.ink_muted));
-        // un built-in en curso: [claude], mismo nombre claude-soft negrita
-        let d = app.run_detail.as_mut().unwrap();
-        d.kind = RunKind::BuiltIn;
-        d.name = "Explore".into();
-        let lines = draw(&mut app, 100, 24);
-        assert!(lines[2].starts_with(" ✦ Explore [claude] · station"));
-        let buf = draw_buf(&mut app, 100, 24);
-        assert_eq!(buf[(3, 2)].style().fg, Some(t.claude_soft));
-        assert!(buf[(3, 2)].style().add_modifier.contains(Modifier::BOLD));
-        // la estrella parpadea cada medio segundo
-        app.now += TimeDelta::milliseconds(500);
-        assert!(draw(&mut app, 100, 24)[2].starts_with(" ✧ Explore"));
-        app.now -= TimeDelta::milliseconds(500);
-        // un agente definido: [propio] sin «vía workflow»
-        let d = app.run_detail.as_mut().unwrap();
-        d.kind = RunKind::Defined;
-        d.name = "backend".into();
-        let lines = draw(&mut app, 100, 24);
+        let buf = draw_buf(&mut app, 100, 22);
+        assert_eq!(buf[(col(head, "via"), 0)].style().fg, Some(t.ink_muted));
+        // un built-in: [claude]; un agente definido: [own] sin «via workflow»
+        for (kind, name, tag) in [
+            (RunKind::BuiltIn, "Explore", "[claude]"),
+            (RunKind::Defined, "backend", "[own]"),
+        ] {
+            let d = app.run_detail.as_mut().unwrap();
+            d.kind = kind;
+            d.name = name.into();
+            let lines = draw(&mut app, 100, 22);
+            assert!(
+                lines[0].starts_with(&format!(" {name} {tag} › ✦ run 1 of 1  ")),
+                "{:?}",
+                lines[0]
+            );
+        }
+    }
+
+    /// Si la ejecución ya no está en la ventana de activos no hay `i of n`:
+    /// la cabecera es la estrella y el nombre por estado.
+    #[test]
+    fn a_run_out_of_the_active_window_heads_with_its_name() {
+        let t = Theme::claude_256();
+        let mut app = run_app();
+        app.run_detail.as_mut().unwrap().id = "ya-no-esta".into();
+        assert_eq!(app.run_nav(), None);
+        let lines = draw(&mut app, 100, 22);
         assert!(
-            lines[2].starts_with(" ✦ backend [own] · station"),
+            lines[0].starts_with(" ✦ visual [own] via workflow  "),
             "{:?}",
-            lines[2]
+            lines[0]
         );
+        assert!(!lines[0].contains("run "), "{:?}", lines[0]);
+        let buf = draw_buf(&mut app, 100, 22);
+        assert_eq!(buf[(1, 0)].style().fg, Some(t.claude));
+        assert_eq!(buf[(3, 0)].style().fg, Some(t.claude_soft));
+        assert!(buf[(3, 0)].style().add_modifier.contains(Modifier::BOLD));
+        // terminada: el hueco de la estrella en blanco y el nombre en ink
+        app.run_detail.as_mut().unwrap().ended = Some("2026-11-05T11:58:00Z".parse().unwrap());
+        let lines = draw(&mut app, 100, 22);
+        assert!(lines[0].starts_with("   visual [own]"), "{:?}", lines[0]);
+        assert_eq!(draw_buf(&mut app, 100, 22)[(3, 0)].style().fg, Some(t.ink));
+        for w in 8u16..=120 {
+            let lines = draw(&mut app, w, 12);
+            assert!(lines.iter().all(|l| width(l) <= w as usize), "{w}");
+        }
     }
 
     #[test]
-    fn an_ended_run_has_an_ink_name_and_says_when_it_ended_in_muted() {
+    fn an_ended_run_has_an_ink_title_and_says_when_it_ended_in_muted() {
         let t = Theme::claude_256();
         let mut app = run_app();
         app.run_detail.as_mut().unwrap().ended = Some("2026-11-05T11:58:00Z".parse().unwrap());
-        let lines = draw(&mut app, 100, 24);
-        let head = &lines[2];
+        let lines = draw(&mut app, 100, 22);
+        let head = &lines[0];
         assert!(
-            head.starts_with("   visual [own] via workflow · station"),
+            head.starts_with(" visual [own] via workflow › run 1 of 1  "),
             "{head:?}"
         );
         assert!(head.ends_with("ended 2 min ago"), "{head:?}");
         assert!(!head.contains("running") && !head.contains(['✦', '✧', '●']));
-        let buf = draw_buf(&mut app, 100, 24);
-        assert_eq!(buf[(3, 2)].style().fg, Some(t.ink));
-        assert!(!buf[(3, 2)].style().add_modifier.contains(Modifier::BOLD));
-        assert_eq!(buf[(col(head, "ended"), 2)].style().fg, Some(t.ink_muted));
-        // un definido terminado: ink, ya no naranja; un built-in, igual
-        for (kind, name) in [(RunKind::Defined, "backend"), (RunKind::BuiltIn, "Explore")] {
-            let d = app.run_detail.as_mut().unwrap();
-            d.kind = kind;
-            d.name = name.into();
-            let buf = draw_buf(&mut app, 100, 24);
-            assert_eq!(buf[(3, 2)].style().fg, Some(t.ink), "{name}");
-        }
+        let buf = draw_buf(&mut app, 100, 22);
+        let title = buf[(col(head, "run 1"), 0)].style();
+        assert_eq!(title.fg, Some(t.ink));
+        assert!(!title.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(buf[(1, 0)].style().fg, Some(t.ink_muted));
+        assert_eq!(buf[(col(head, "ended"), 0)].style().fg, Some(t.ink_muted));
     }
 
     #[test]
     fn run_header_drops_running_under_70_and_the_tag_under_50() {
         let mut app = run_app();
-        let head = draw(&mut app, 69, 24)[2].clone();
+        let head = draw(&mut app, 69, 22)[0].clone();
         assert!(
             head.contains("via workflow") && !head.contains("running"),
             "{head:?}"
         );
         assert!(head.ends_with("5 tools"), "{head:?}");
-        let head = draw(&mut app, 49, 24)[2].clone();
+        let head = draw(&mut app, 49, 22)[0].clone();
         assert!(
             !head.contains("via workflow") && head.contains("visual"),
             "{head:?}"
@@ -5151,28 +5888,29 @@ mod tests {
         assert!(head.ends_with("5 tools"), "{head:?}");
         // el nombre se recorta antes que perder las cifras
         app.run_detail.as_mut().unwrap().name = "un-nombre-larguisimo-de-agente".into();
-        let head = draw(&mut app, 30, 24)[2].clone();
+        let head = draw(&mut app, 30, 22)[0].clone();
         assert!(head.contains('…') && head.ends_with("5 tools"), "{head:?}");
     }
 
     #[test]
     fn run_sections_come_in_order_with_their_rules() {
         let mut app = run_app();
-        let lines = draw(&mut app, 80, 24);
-        assert_eq!(lines[3], "", "una línea en blanco tras la cabecera");
-        assert!(lines[4].starts_with(" task ─"), "{:?}", lines[4]);
-        assert_eq!(lines[5], "   pintar la pantalla de activos");
-        assert_eq!(lines[6], "   con el diseño B");
-        assert!(lines[7].starts_with(" tools ─"), "{:?}", lines[7]);
-        assert_eq!(lines[8], "   Read 3 · Bash 1 · Edit 1");
-        assert!(lines[9].starts_with(" steps · 5 ─"), "{:?}", lines[9]);
-        assert_eq!(lines[10], "   5 s ago    Bash · git diff --stat");
-        assert_eq!(lines[11], "   1 min ago  Read · src/d.rs");
-        assert_eq!(lines[14], "   4 min ago  Read · src/a.rs");
-        assert_eq!(lines[15], "", "el resto queda en blanco");
+        let lines = draw(&mut app, 80, 22);
+        assert_eq!(lines[1], "   running in   ~/Offing/argi/station");
+        assert_eq!(lines[2], "", "una línea en blanco tras la cabecera");
+        assert!(lines[3].starts_with(" task ─"), "{:?}", lines[3]);
+        assert_eq!(lines[4], "   pintar la pantalla de activos");
+        assert_eq!(lines[5], "   con el diseño B");
+        assert!(lines[6].starts_with(" tools ─"), "{:?}", lines[6]);
+        assert_eq!(lines[7], "   Read 3 · Bash 1 · Edit 1");
+        assert!(lines[8].starts_with(" steps · 5 ─"), "{:?}", lines[8]);
+        assert_eq!(lines[9], "   5 s ago    Bash · git diff --stat");
+        assert_eq!(lines[10], "   1 min ago  Read · src/d.rs");
+        assert_eq!(lines[13], "   4 min ago  Read · src/a.rs");
+        assert_eq!(lines[14], "", "el resto queda en blanco");
         assert_eq!(
-            bare(&lines[23]),
-            " esc back · ↑↓ other agent · pgup/pgdn steps · a agent · q quit"
+            bare(&lines[21]),
+            " esc back to visual · pgup/pgdn steps · q quit"
         );
     }
 
@@ -5180,41 +5918,41 @@ mod tests {
     fn run_section_rules_are_soft_with_a_subtle_line_and_the_last_step_is_ink() {
         let t = Theme::claude_256();
         let mut app = run_app();
-        let lines = draw(&mut app, 80, 24);
-        let buf = draw_buf(&mut app, 80, 24);
-        assert_eq!(buf[(1, 4)].style().fg, Some(t.claude_soft));
-        assert_eq!(buf[(40, 4)].style().fg, Some(t.subtle));
-        let first = &lines[10];
-        assert_eq!(buf[(col(first, "Bash"), 10)].style().fg, Some(t.ink));
-        assert_eq!(buf[(col(first, "ago"), 10)].style().fg, Some(t.ink_muted));
+        let lines = draw(&mut app, 80, 22);
+        let buf = draw_buf(&mut app, 80, 22);
+        assert_eq!(buf[(1, 3)].style().fg, Some(t.claude_soft));
+        assert_eq!(buf[(40, 3)].style().fg, Some(t.subtle));
+        let first = &lines[9];
+        assert_eq!(buf[(col(first, "Bash"), 9)].style().fg, Some(t.ink));
+        assert_eq!(buf[(col(first, "ago"), 9)].style().fg, Some(t.ink_muted));
         assert_eq!(
-            buf[(col(&lines[11], "Read"), 11)].style().fg,
+            buf[(col(&lines[10], "Read"), 10)].style().fg,
             Some(t.ink_muted)
         );
-        let tools = &lines[8];
-        assert_eq!(buf[(col(tools, "Read"), 8)].style().fg, Some(t.ink));
-        assert_eq!(buf[(col(tools, "3"), 8)].style().fg, Some(t.claude_soft));
+        let tools = &lines[7];
+        assert_eq!(buf[(col(tools, "Read"), 7)].style().fg, Some(t.ink));
+        assert_eq!(buf[(col(tools, "3"), 7)].style().fg, Some(t.claude_soft));
     }
 
     #[test]
     fn a_missing_task_says_dash_and_a_long_one_is_cut_with_an_ellipsis() {
         let mut app = run_app();
         app.run_detail.as_mut().unwrap().task_full = None;
-        let lines = draw(&mut app, 80, 24);
-        assert_eq!(lines[5], "   —");
+        let lines = draw(&mut app, 80, 22);
+        assert_eq!(lines[4], "   —");
         let long: Vec<String> = (1..=12).map(|i| format!("línea {i}")).collect();
         app.run_detail.as_mut().unwrap().task_full = Some(long.join("\n"));
-        let lines = draw(&mut app, 80, 24);
+        let lines = draw(&mut app, 80, 22);
         // ocho líneas como mucho; la última lleva `…`
-        assert_eq!(lines[5], "   línea 1");
-        assert_eq!(lines[12], "   línea 8…");
-        assert!(lines[13].starts_with(" tools"), "{:?}", lines[13]);
+        assert_eq!(lines[4], "   línea 1");
+        assert_eq!(lines[11], "   línea 8…");
+        assert!(lines[12].starts_with(" tools"), "{:?}", lines[12]);
         // una línea larga se ajusta al ancho
         app.run_detail.as_mut().unwrap().task_full =
             Some("una dos tres cuatro cinco seis siete ocho".into());
-        let lines = draw(&mut app, 24, 24);
-        assert_eq!(lines[5], "   una dos tres cuatro");
-        assert_eq!(lines[6], "   cinco seis siete");
+        let lines = draw(&mut app, 24, 22);
+        assert_eq!(lines[4], "   una dos tres cuatro");
+        assert_eq!(lines[5], "   cinco seis siete");
     }
 
     #[test]
@@ -5290,47 +6028,41 @@ mod tests {
             let lines = draw(&mut app, w, h);
             assert_eq!(lines.len(), h as usize);
         }
-        // 9 filas: 6 de cuerpo = cabecera, regla de pasos y 3 pasos; sin encargo
-        let lines = draw(&mut app, 80, 9);
-        assert!(lines[2].starts_with(" ✦ visual"));
-        assert!(lines[3].starts_with(" steps · 5"), "{lines:?}");
-        assert_eq!(lines[6], "   2 min ago  Edit · src/c.rs");
+        // 6 filas: 5 de cuerpo = cabecera, regla de pasos y 3 pasos; sin encargo
+        let lines = draw(&mut app, 80, 6);
+        assert!(lines[0].starts_with(" visual"));
+        assert!(lines[1].starts_with(" steps · 5"), "{lines:?}");
+        assert_eq!(lines[4], "   2 min ago  Edit · src/c.rs");
         assert!(!lines.iter().any(|l| l.starts_with(" task")));
-        // con 12 filas caben el encargo y las herramientas
-        let lines = draw(&mut app, 80, 12);
+        // con 11 filas caben `running in`, el encargo y las herramientas
+        let lines = draw(&mut app, 80, 11);
+        assert!(lines[1].contains("running in"), "{lines:?}");
         assert!(lines.iter().any(|l| l.starts_with(" task")));
         assert!(lines.iter().any(|l| l.starts_with(" tools")));
-        // con 10 filas, las herramientas ganan al encargo
-        let lines = draw(&mut app, 80, 10);
+        // con 9 filas, las herramientas ganan al encargo
+        let lines = draw(&mut app, 80, 9);
         assert!(!lines.iter().any(|l| l.starts_with(" task")));
         assert!(lines.iter().any(|l| l.starts_with(" tools")));
     }
 
+    /// `esc` dice a dónde vuelve; `a` y `↑↓` ya no son de esta pantalla.
     #[test]
-    fn the_run_footer_announces_a_only_when_the_agent_can_be_opened() {
+    fn the_run_footer_says_where_esc_goes_back_to() {
         let t = Theme::claude_256();
         let mut app = run_app();
-        assert!(app.can_open_agent());
-        let lines = draw(&mut app, 100, 24);
+        let lines = draw(&mut app, 100, 22);
         assert_eq!(
-            bare(&lines[23]),
-            " esc back · ↑↓ other agent · pgup/pgdn steps · a agent · q quit"
+            bare(&lines[21]),
+            " esc back to visual · pgup/pgdn steps · q quit"
         );
-        let buf = draw_buf(&mut app, 100, 24);
-        let x = col(&lines[23], "pgup/pgdn");
-        assert_eq!(buf[(x, 23)].style().fg, Some(t.claude));
-        assert_eq!(buf[(x + 10, 23)].style().fg, Some(t.ink));
-        // sin agente que abrir, `a` no sale
-        app.run_detail.as_mut().unwrap().owner = None;
-        let lines = draw(&mut app, 100, 24);
-        assert_eq!(
-            bare(&lines[23]),
-            " esc back · ↑↓ other agent · pgup/pgdn steps · q quit"
-        );
+        let buf = draw_buf(&mut app, 100, 22);
+        let x = col(&lines[21], "pgup/pgdn");
+        assert_eq!(buf[(x, 21)].style().fg, Some(t.claude));
+        assert_eq!(buf[(x + 10, 21)].style().fg, Some(t.ink));
         // estrecho: se quitan teclas menores antes que `q`
-        let lines = draw(&mut app, 30, 24);
-        assert!(bare(&lines[23]).ends_with("q quit"), "{:?}", lines[23]);
-        assert!(width(&lines[23]) <= 30);
+        let lines = draw(&mut app, 30, 22);
+        assert!(bare(&lines[21]).ends_with("q quit"), "{:?}", lines[21]);
+        assert!(width(&lines[21]) <= 30);
     }
 
     #[test]
@@ -6481,30 +7213,43 @@ mod tests {
     }
 
     /// El `×N` va en la línea del agente, tras la etiqueta y en `subtle`, y
-    /// cuenta las ejecuciones de todo su bloque (la en curso y las terminadas
-    /// fundidas en su fila), solo si son más de una; las filas no lo llevan.
+    /// cuenta solo las ejecuciones en curso de su bloque, si son más de una:
+    /// 4 en curso y una terminada que funde 3 dicen `×4`, no `×7`. Ni las
+    /// filas ni la terminada fundida llevan recuento.
     #[test]
-    fn the_count_sits_after_the_tags_in_subtle_and_only_when_runs_exceed_one() {
+    fn the_count_sits_after_the_tags_in_subtle_and_counts_only_running_runs() {
         let t = Theme::claude_256();
-        let mut app = fused_app(5);
-        let lines = draw(&mut app, 100, 30);
-        let a = pos(&lines, "backend [own] ×5");
-        assert_eq!(lines[a], "       ✦ backend [own] ×5", "{lines:#?}");
-        assert!(lines[a + 1].contains(".   ├ backend: tarea"), "{lines:#?}");
-        assert_eq!(lines[a + 2], "         │ now    —", "{lines:#?}");
-        assert!(lines[a + 3].contains(".   └ backend: tarea"), "{lines:#?}");
+        let mut app = counted(4, 3);
+        let lines = draw(&mut app, 100, 40);
+        let a = pos(&lines, "backend [own] ×4");
+        assert_eq!(lines[a], "    3. ✦ backend [own] ×4", "{lines:#?}");
         assert_eq!(lines.iter().filter(|l| l.contains('×')).count(), 1);
-        let buf = draw_buf(&mut app, 100, 30);
+        let buf = draw_buf(&mut app, 100, 40);
         let y = a as u16;
-        assert_eq!(buf[(col(&lines[a], "×5"), y)].style().fg, Some(t.subtle));
+        assert_eq!(buf[(col(&lines[a], "×4"), y)].style().fg, Some(t.subtle));
         assert_eq!(
             buf[(col(&lines[a], "[own]"), y)].style().fg,
             Some(t.ink_muted)
         );
-        // una sola ejecución: sin contador
-        let mut one = fused_app(1);
-        let lines = draw(&mut one, 100, 30);
-        assert!(!lines.iter().any(|l| l.contains('×')), "{lines:#?}");
+        // una sola en curso, o solo terminadas: sin contador
+        for (running, done) in [(1, 3), (0, 3)] {
+            let mut one = counted(running, done);
+            let lines = draw(&mut one, 100, 40);
+            assert!(lines.iter().any(|l| l.contains("backend [own]")));
+            assert!(!lines.iter().any(|l| l.contains('×')), "{lines:#?}");
+        }
+        // con filtro, solo las en curso que quedan
+        let mut two = counted(4, 3);
+        press(&mut two, KeyCode::Char('/'));
+        for c in "revisar".chars() {
+            press(&mut two, KeyCode::Char(c));
+        }
+        press(&mut two, KeyCode::Enter);
+        let lines = draw(&mut two, 100, 40);
+        assert!(
+            lines.iter().any(|l| l.ends_with("backend [own] ×2")),
+            "{lines:#?}"
+        );
     }
 
     #[test]
@@ -6546,7 +7291,7 @@ mod tests {
 
     #[test]
     fn the_count_goes_with_the_tags_under_50_columns_and_never_overflows() {
-        let mut app = fused_app(5);
+        let mut app = counted(4, 3);
         let lines = draw(&mut app, 49, 60);
         assert!(!lines.iter().any(|l| l.contains('×')), "{lines:#?}");
         for w in 30u16..=160 {
@@ -6585,12 +7330,14 @@ mod tests {
         app
     }
 
-    /// Abre la ficha de la fila de `backend`.
+    /// Abre la primera ejecución del bloque de `backend`, pasando por la
+    /// pantalla de su agente.
     fn open_backend(app: &mut App) {
         for n in ['1', '2', '3', '4', '5', '6'] {
             press(app, KeyCode::Char(n));
             press(app, KeyCode::Enter);
-            if app.run_detail.as_ref().is_some_and(|d| d.name == "backend") {
+            if app.agent_view().is_some_and(|v| v.name == "backend") {
+                press(app, KeyCode::Enter);
                 return;
             }
             press(app, KeyCode::Esc);
@@ -6599,34 +7346,22 @@ mod tests {
     }
 
     #[test]
-    fn the_run_header_says_which_run_it_is_when_there_are_several() {
-        let t = Theme::claude_256();
+    fn the_run_header_says_which_run_it_is_and_follows_left_right() {
         let mut app = nav_app();
-        let lines = draw(&mut app, 100, 24);
+        let lines = draw(&mut app, 100, 22);
         assert!(
-            lines[2].contains("run 1/2 · running ") && lines[2].ends_with(" · 7 tools"),
+            lines[0].starts_with(" backend [own] › ✦ run 1 of 2  ")
+                && lines[0].ends_with(" · 7 tools"),
             "{:?}",
-            lines[2]
+            lines[0]
         );
-        let buf = draw_buf(&mut app, 100, 24);
-        assert_eq!(
-            buf[(col(&lines[2], "run"), 2)].style().fg,
-            Some(t.ink_muted)
-        );
-        press(&mut app, KeyCode::Left);
-        let lines = draw(&mut app, 100, 24);
-        assert!(lines[2].contains("run 2/2 · "), "{:?}", lines[2]);
-        // el resto de la cabecera sigue donde estaba
+        press(&mut app, KeyCode::Right);
+        let lines = draw(&mut app, 100, 22);
         assert!(
-            lines[2].starts_with(" ✧ backend [own] · station")
-                || lines[2].starts_with(" ✦ backend [own] · station")
-                || lines[2].starts_with("   backend [own] · station"),
+            lines[0].starts_with(" backend [own] › ✦ run 2 of 2  "),
             "{:?}",
-            lines[2]
+            lines[0]
         );
-        // estrecha: cede antes que `lleva …`
-        let lines = draw(&mut app, 69, 24);
-        assert!(!lines[2].contains("run"), "{:?}", lines[2]);
         for w in 30u16..=160 {
             let lines = draw(&mut app, w, 24);
             assert!(lines.iter().all(|l| width(l) <= w as usize), "{w}");
@@ -6634,52 +7369,43 @@ mod tests {
     }
 
     #[test]
-    fn the_run_header_has_no_counter_with_a_single_run() {
-        let mut app = fused_app(1);
-        open_backend(&mut app);
-        let lines = draw(&mut app, 100, 24);
-        assert!(!lines[2].contains("run "), "{:?}", lines[2]);
-        assert!(lines[2].ends_with("tools"), "{:?}", lines[2]);
-    }
-
-    #[test]
     fn a_temp_folder_run_says_so_under_the_header_in_muted() {
         let t = Theme::claude_256();
         let mut app = run_app();
-        let before = draw(&mut app, 110, 24);
+        let before = draw(&mut app, 110, 22);
         assert!(!before.iter().any(|l| l.contains("temp folder")));
         {
             let d = app.run_detail.as_mut().unwrap();
             d.temp_cwd = Some(PathBuf::from("/Users/x/tmp/claude-abc"));
             d.cwd_resolved = true;
         }
-        let lines = draw(&mut app, 120, 24);
+        let lines = draw(&mut app, 120, 22);
         assert_eq!(
-            lines[3],
+            lines[2],
             "   launched from Claude's temp folder · project taken from the session · ~/tmp/claude-abc"
         );
-        let buf = draw_buf(&mut app, 120, 24);
-        assert_eq!(buf[(5, 3)].style().fg, Some(t.ink_muted));
+        let buf = draw_buf(&mut app, 120, 22);
+        assert_eq!(buf[(5, 2)].style().fg, Some(t.ink_muted));
         assert_eq!(
-            buf[(col(&lines[3], "~/tmp"), 3)].style().fg,
+            buf[(col(&lines[2], "~/tmp"), 2)].style().fg,
             Some(t.ink_muted)
         );
         // sin resolver
         app.run_detail.as_mut().unwrap().cwd_resolved = false;
-        let lines = draw(&mut app, 120, 24);
+        let lines = draw(&mut app, 120, 22);
         assert!(
-            lines[3].starts_with("   launched from Claude's temp folder · project unresolved"),
+            lines[2].starts_with("   launched from Claude's temp folder · project unresolved"),
             "{:?}",
-            lines[3]
+            lines[2]
         );
         // la ruta se recorta con … y sin sitio desaparece
-        let lines = draw(&mut app, 66, 24);
-        assert!(lines[3].ends_with("unresolved"), "{:?}", lines[3]);
-        let lines = draw(&mut app, 90, 24);
+        let lines = draw(&mut app, 66, 22);
+        assert!(lines[2].ends_with("unresolved"), "{:?}", lines[2]);
+        let lines = draw(&mut app, 90, 22);
         assert!(
-            lines[3].contains("·") && width(&lines[3]) <= 90,
+            lines[2].contains("·") && width(&lines[2]) <= 90,
             "{:?}",
-            lines[3]
+            lines[2]
         );
         // el resto de la ficha cuelga una línea más abajo, sin desbordes
         for w in 30u16..=160 {
@@ -6697,17 +7423,23 @@ mod tests {
         let d = app.run_detail.as_mut().unwrap();
         d.temp_cwd = Some(PathBuf::from("/tmp/x"));
         d.cwd_resolved = true;
-        // 9 filas: cuerpo de 6 = cabecera, regla, 3 pasos y una libre: el
-        // aviso entra en esa, antes que herramientas y encargo
-        let lines = draw(&mut app, 100, 9);
-        assert!(lines[3].contains("temp folder"), "{lines:#?}");
+        // 8 filas: cuerpo de 7 = cabecera, regla, 3 pasos y dos libres: entran
+        // `running in` y el aviso, antes que herramientas y encargo
+        let lines = draw(&mut app, 100, 8);
+        assert!(lines[1].contains("running in"), "{lines:#?}");
+        assert!(lines[2].contains("temp folder"), "{lines:#?}");
         assert!(!lines.iter().any(|l| l.starts_with(" task")));
         assert!(!lines.iter().any(|l| l.starts_with(" tools")));
-        // justo con cabecera, regla y pasos mínimos: sin aviso
-        let lines = draw(&mut app, 100, 8);
+        // una sola libre: `running in` antes que el aviso
+        let lines = draw(&mut app, 100, 7);
+        assert!(lines[1].contains("running in"), "{lines:#?}");
+        assert!(!lines.iter().any(|l| l.contains("temp folder")));
+        // justo con cabecera, regla y pasos mínimos: ni lo uno ni lo otro
+        let lines = draw(&mut app, 100, 6);
+        assert!(!lines.iter().any(|l| l.contains("running in")));
         assert!(!lines.iter().any(|l| l.contains("temp folder")));
         // holgado: el aviso y todo lo demás
-        let lines = draw(&mut app, 100, 24);
+        let lines = draw(&mut app, 100, 22);
         assert!(lines.iter().any(|l| l.starts_with(" task")));
         assert!(lines.iter().any(|l| l.starts_with(" tools")));
         assert!(lines.iter().any(|l| l.contains("temp folder")));
@@ -6738,83 +7470,850 @@ mod tests {
     }
 
     #[test]
-    fn the_run_header_takes_the_project_from_the_launch_dir_and_tells_the_cwd() {
+    fn the_run_screen_runs_in_the_launch_dir_and_tells_the_cwd() {
         let t = Theme::claude_256();
         let mut app = run_app();
         // mismo sitio: sin línea de cwd
         app.run_detail.as_mut().unwrap().launch_dir = Some(PathBuf::from(STATION));
-        let lines = draw(&mut app, 100, 24);
+        let lines = draw(&mut app, 100, 22);
         assert!(
             !lines.iter().any(|l| l.starts_with("   cwd ")),
             "{lines:#?}"
         );
-        // el subagente hizo cd: el proyecto es el de lanzamiento, el cwd debajo
+        // el subagente hizo cd: corre en la de lanzamiento, el cwd debajo
         {
             let d = app.run_detail.as_mut().unwrap();
             d.launch_dir = Some(PathBuf::from("/Users/x/lanzadera"));
             d.cwd = Some(PathBuf::from(STATION));
         }
-        let lines = draw(&mut app, 100, 24);
-        assert!(
-            lines[2].starts_with(" ✦ visual [own] via workflow · lanzadera"),
-            "{:?}",
-            lines[2]
-        );
+        let lines = draw(&mut app, 100, 22);
+        assert_eq!(lines[1], "   running in   ~/lanzadera");
         // el valor en la columna de «launched by»
-        assert_eq!(lines[3], "   cwd          ~/Offing/argi/station");
-        let buf = draw_buf(&mut app, 100, 24);
-        assert_eq!(buf[(3, 3)].style().fg, Some(t.ink_muted));
-        assert_eq!(buf[(16, 3)].style().fg, Some(t.ink_muted));
+        assert_eq!(lines[2], "   cwd          ~/Offing/argi/station");
+        let buf = draw_buf(&mut app, 100, 22);
+        assert_eq!(buf[(3, 2)].style().fg, Some(t.ink_muted));
+        assert_eq!(buf[(16, 2)].style().fg, Some(t.ink_muted));
         // estrecho: la ruta se recorta con … y nada desborda
-        let lines = draw(&mut app, 30, 24);
-        assert_eq!(lines[3], "   cwd          ~/Offing/arg…");
+        let lines = draw(&mut app, 30, 22);
+        assert_eq!(lines[2], "   cwd          ~/Offing/arg…");
         for w in 10u16..=100 {
             let lines = draw(&mut app, w, 24);
             assert!(lines.iter().all(|l| width(l) <= w as usize), "{w}");
         }
-        // sin launch_dir el proyecto sale del cwd, sin línea extra
+        // sin launch_dir corre en el cwd, sin línea extra
         app.run_detail.as_mut().unwrap().launch_dir = None;
-        let lines = draw(&mut app, 100, 24);
-        assert!(lines[2].contains("· station"), "{:?}", lines[2]);
+        let lines = draw(&mut app, 100, 22);
+        assert_eq!(lines[1], "   running in   ~/Offing/argi/station");
         assert!(!lines.iter().any(|l| l.starts_with("   cwd ")));
-        // sin cwd, con launch_dir: proyecto de lanzamiento, sin línea extra
+        // sin cwd, con launch_dir: la de lanzamiento, sin línea extra
         {
             let d = app.run_detail.as_mut().unwrap();
             d.launch_dir = Some(PathBuf::from("/Users/x/lanzadera"));
             d.cwd = None;
         }
-        let lines = draw(&mut app, 100, 24);
-        assert!(lines[2].contains("· lanzadera"), "{:?}", lines[2]);
+        let lines = draw(&mut app, 100, 22);
+        assert_eq!(lines[1], "   running in   ~/lanzadera");
         assert!(!lines.iter().any(|l| l.starts_with("   cwd ")));
     }
 
     #[test]
-    fn the_run_footer_tells_up_down_from_left_right() {
+    fn the_run_footer_offers_left_right_only_with_several_runs() {
         let mut app = nav_app();
-        let lines = draw(&mut app, 120, 24);
+        let lines = draw(&mut app, 120, 22);
         assert_eq!(
-            bare(&lines[23]),
-            " esc back · ↑↓ other agent · ←→ other run · pgup/pgdn steps · a agent · q quit"
+            bare(&lines[21]),
+            " esc back to backend · ←→ other run · pgup/pgdn steps · q quit"
         );
         // una sola ejecución: sin ←→
         let mut one = fused_app(1);
         open_backend(&mut one);
-        let lines = draw(&mut one, 120, 24);
-        assert!(bare(&lines[23]).contains("↑↓ other agent"));
-        assert!(!bare(&lines[23]).contains("←→"));
-        // estrecho: cede primero ←→, luego a, pgup/pgdn y ↑↓
-        let full = bare(&draw(&mut app, 120, 24)[23]);
-        let wd = width(&full);
-        let lines = draw(&mut app, (wd - 1) as u16, 24);
-        let f = bare(&lines[23]);
+        let lines = draw(&mut one, 120, 22);
+        assert!(!bare(&lines[21]).contains("←→"));
         assert!(
-            !f.contains("←→") && f.contains("a agent") && f.contains("pgup/pgdn"),
-            "{f}"
+            !bare(&lines[21]).contains("↑↓"),
+            "↑↓ ya no cambian de agente"
         );
-        assert!(f.contains("↑↓ other agent"));
-        let lines = draw(&mut app, 30, 24);
-        let f = bare(&lines[23]);
+        // estrecho: cede primero pgup/pgdn y luego ←→
+        let full = bare(&draw(&mut app, 120, 22)[21]);
+        let wd = width(&full);
+        let lines = draw(&mut app, (wd - 1) as u16, 22);
+        let f = bare(&lines[21]);
+        assert!(f.contains("←→") && !f.contains("pgup/pgdn"), "{f}");
+        let lines = draw(&mut app, 30, 22);
+        let f = bare(&lines[21]);
         assert!(f.contains("esc back") && f.ends_with("q quit"), "{f}");
+    }
+
+    // --- pantalla del agente y pantalla completa ---
+
+    /// La pantalla del agente va sin pestañas ni segunda línea: la cabecera
+    /// del agente arriba del todo, sus ejecuciones numeradas y su pie.
+    #[test]
+    fn the_agent_screen_has_no_tabs_and_lists_its_runs_with_its_footer() {
+        let mut app = nav_app();
+        press(&mut app, KeyCode::Esc);
+        assert!(app.agent_view().is_some() && app.run_detail.is_none());
+        let lines = draw(&mut app, 110, 20);
+        assert!(
+            lines[0].starts_with(" ✦ backend [own] · 2 runs")
+                || lines[0].starts_with(" ✧ backend [own] · 2 runs"),
+            "{:?}",
+            lines[0]
+        );
+        assert!(lines[0].contains("2 working now"), "{:?}", lines[0]);
+        assert_eq!(
+            lines[1],
+            "   defined in   ~/Offing/argi/station/.claude/agents/backend.md"
+        );
+        assert_eq!(lines[2], "   running in   ~/Offing/argi/station");
+        assert!(lines[4].starts_with(" working now · 2 ─"), "{:?}", lines[4]);
+        assert!(lines[5].starts_with(" ❯ 1. ✦ "), "{:?}", lines[5]);
+        assert!(lines[6].trim_start().starts_with("now"), "{:?}", lines[6]);
+        assert_eq!(lines[7], "", "una línea en blanco entre filas en curso");
+        assert!(lines[8].starts_with("   2. ✦ "), "{:?}", lines[8]);
+        assert!(!lines.iter().any(|l| l.contains("ranking")), "sin pestañas");
+        assert!(app.hits.tabs.is_empty());
+        assert_eq!(
+            bare(&lines[19]),
+            " esc back · ↑↓ run · enter open run · ←→ other agent · a agent · q quit"
+        );
+        // cada línea de una ejecución apunta a su número menos 1
+        let hits: Vec<(u16, usize)> = app.hits.rows.iter().map(|h| (h.row, h.cursor)).collect();
+        assert_eq!(hits, [(5, 0), (6, 0), (8, 1), (9, 1)]);
+        for w in 20u16..=140 {
+            let lines = draw(&mut app, w, 12);
+            assert!(lines.iter().all(|l| width(l) <= w as usize), "{w}");
+        }
+        for h in 1u16..=8 {
+            assert_eq!(draw(&mut app, 80, h).len(), h as usize);
+        }
+    }
+
+    /// Con más bloques en activos el pie ofrece ←→, y sin agente definido
+    /// no ofrece `a`.
+    #[test]
+    fn the_agent_footer_offers_other_agents_and_the_card_only_when_they_exist() {
+        let mut app = busy();
+        press(&mut app, KeyCode::Char('3'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.agent_view().unwrap().name, "Explore");
+        let lines = draw(&mut app, 110, 20);
+        assert_eq!(
+            bare(&lines[19]),
+            " esc back · ↑↓ run · enter open run · ←→ other agent · q quit"
+        );
+        assert!(
+            lines[0].contains("Explore [claude] · 1 run"),
+            "{:?}",
+            lines[0]
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("defined in")),
+            "un built-in no tiene definición"
+        );
+        // hasta el primer bloque de un agente definido
+        for _ in 0..8 {
+            if app.can_open_agent() {
+                break;
+            }
+            press(&mut app, KeyCode::Right);
+        }
+        assert!(app.agent_view().unwrap().owner.is_some());
+        let lines = draw(&mut app, 110, 20);
+        assert_eq!(
+            bare(&lines[19]),
+            " esc back · ↑↓ run · enter open run · ←→ other agent · a agent · q quit"
+        );
+    }
+
+    /// La pantalla de la ejecución tampoco lleva pestañas; la ficha del
+    /// agente abierta con `a` desde su pantalla, sí.
+    #[test]
+    fn the_run_screen_has_no_tabs_and_the_agent_card_keeps_them() {
+        let mut app = nav_app();
+        let lines = draw(&mut app, 110, 20);
+        assert!(lines[0].contains("backend [own]"), "{:?}", lines[0]);
+        assert!(!lines.iter().any(|l| l.contains("ranking")));
+        assert!(app.hits.tabs.is_empty() && app.hits.rows.is_empty());
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('a'));
+        assert!(app.detail);
+        let lines = draw(&mut app, 110, 20);
+        assert!(lines[0].contains("ranking"), "{:?}", lines[0]);
+        assert_eq!(app.hits.tabs.len(), 3);
+        assert!(app.hits.rows.is_empty());
+    }
+
+    // --- pantalla del agente: la maqueta ---
+
+    /// `backend` con dos en curso (la más reciente, 412k al 71 % con skill; la
+    /// otra, 140k al 22 % sin ella) y dos terminadas hace 3 y 4 min (835k y 3.2M), abierta su pantalla.
+    fn agent_app() -> App {
+        let mk = |start: &str, mins: i64, id: &str, done: bool, task: &str, total: u64| {
+            let mut r = run("backend", STATION, start, mins, Some(id), done);
+            r.task = Some(task.into());
+            r.usage = usage(total, None);
+            r
+        };
+        let mut a = mk(
+            "2026-11-05T11:59:00Z",
+            1,
+            "toolu_a0",
+            false,
+            "paint the active screen with design B",
+            412_000,
+        );
+        a.usage.context = Some(142_000);
+        a.last_tool = Some("Bash · git diff --stat".into());
+        a.skill = Some("frontend-design".into());
+        let mut b = mk(
+            "2026-11-05T11:56:00Z",
+            4,
+            "toolu_a1",
+            false,
+            "check ratatui gauge widths",
+            140_000,
+        );
+        b.usage.context = Some(44_000);
+        b.last_tool = Some("Read · src/tui/view.rs".into());
+        let c = mk(
+            "2026-11-05T11:49:00Z",
+            8,
+            "toolu_a2",
+            true,
+            "fix the footer keys",
+            835_000,
+        );
+        let d = mk(
+            "2026-11-05T11:54:00Z",
+            2,
+            "toolu_a3",
+            true,
+            "review the docs conventions",
+            3_200_000,
+        );
+        let mut app = with_runs(fixture(), vec![a, b, c, d]);
+        press(&mut app, KeyCode::Char('a'));
+        open_backend(&mut app);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.agent_view().is_some() && app.run_detail.is_none());
+        app
+    }
+
+    #[test]
+    fn the_agent_screen_paints_its_header_sections_and_columns() {
+        let mut app = agent_app();
+        let lines = draw(&mut app, 110, 20);
+        assert!(
+            lines[0].starts_with(" ✦ backend [own] · 4 runs  "),
+            "{:?}",
+            lines[0]
+        );
+        assert!(
+            lines[0].ends_with("  2 working now · 2 finished · 4.6M tok"),
+            "{:?}",
+            lines[0]
+        );
+        assert_eq!(width(&lines[0]), 109);
+        assert_eq!(
+            lines[1],
+            "   defined in   ~/Offing/argi/station/.claude/agents/backend.md"
+        );
+        assert_eq!(lines[2], "   running in   ~/Offing/argi/station");
+        assert_eq!(lines[3], "");
+        // la primera regla lleva las cabeceras, pegadas a la regla
+        assert!(
+            lines[4].starts_with(" working now · 2 ──"),
+            "{:?}",
+            lines[4]
+        );
+        assert!(
+            lines[4].ends_with("── ctx        time   tokens"),
+            "{:?}",
+            lines[4]
+        );
+        assert!(
+            lines[5].starts_with(" ❯ 1. ✦ paint the active screen with design B  "),
+            "{:?}",
+            lines[5]
+        );
+        assert!(
+            lines[5].ends_with("  ▰▰▰▰▰▰▱▱ 71%       1 min     412k"),
+            "{:?}",
+            lines[5]
+        );
+        assert_eq!(lines[6], "        now     Bash · git diff --stat");
+        assert_eq!(lines[7], "        skills  frontend-design");
+        assert_eq!(lines[8], "", "una línea en blanco entre filas en curso");
+        assert!(
+            lines[9].starts_with("   2. ✦ check ratatui gauge widths  "),
+            "{:?}",
+            lines[9]
+        );
+        assert!(
+            lines[9].ends_with("  ▰▰▱▱▱▱▱▱ 22%       4 min     140k"),
+            "{:?}",
+            lines[9]
+        );
+        assert_eq!(lines[10], "        now     Read · src/tui/view.rs");
+        // la segunda regla, sin cabeceras y hasta el borde
+        assert!(lines[11].starts_with(" finished · 2 ──"), "{:?}", lines[11]);
+        assert!(lines[11].ends_with('─'), "{:?}", lines[11]);
+        assert_eq!(width(&lines[11]), 109);
+        assert!(
+            lines[12].starts_with("   3.   fix the footer keys  "),
+            "{:?}",
+            lines[12]
+        );
+        assert!(
+            lines[12].ends_with("  —   3 min ago     835k"),
+            "{:?}",
+            lines[12]
+        );
+        assert!(
+            lines[13].starts_with("   4.   review the docs conventions  "),
+            "{:?}",
+            lines[13]
+        );
+        assert!(
+            lines[13].ends_with("  —   4 min ago     3.2M"),
+            "{:?}",
+            lines[13]
+        );
+        assert_eq!(lines[14], "");
+        // cada cifra acaba bajo su cabecera, en curso y terminadas
+        let head = &lines[4];
+        for y in [5, 9, 12, 13] {
+            assert_eq!(end_of(&lines[y]), end_col(head, "tokens"), "{y}");
+        }
+        assert_eq!(end_col(&lines[5], "71%"), end_col(head, "ctx"));
+        assert_eq!(end_col(&lines[12], "—"), end_col(head, "ctx"));
+        assert_eq!(end_col(&lines[5], "1 min"), end_col(head, "time"));
+        assert_eq!(end_col(&lines[12], "3 min ago"), end_col(head, "time"));
+        assert_eq!(
+            bare(&lines[19]),
+            " esc back · ↑↓ run · enter open run · ←→ other agent · a agent · q quit"
+        );
+    }
+
+    #[test]
+    fn the_agent_screen_is_painted_by_role() {
+        let t = Theme::claude_256();
+        let mut app = agent_app();
+        let lines = draw(&mut app, 110, 20);
+        let buf = draw_buf(&mut app, 110, 20);
+        let at = |y: usize, pat: &str| buf[(col(&lines[y], pat), y as u16)].style();
+        let bold = |s: Style| s.add_modifier.contains(Modifier::BOLD);
+        // cabecera: estrella claude, nombre claude-soft negrita, lo demás gris
+        // salvo `N working now`, en claude negrita
+        assert_eq!(at(0, "✦").fg, Some(t.claude));
+        assert_eq!(at(0, "backend").fg, Some(t.claude_soft));
+        assert!(bold(at(0, "backend")));
+        assert_eq!(at(0, "[own]").fg, Some(t.ink_muted));
+        assert_eq!(at(0, "4 runs").fg, Some(t.ink_muted));
+        assert_eq!(at(0, "2 working now").fg, Some(t.claude));
+        assert!(bold(at(0, "2 working now")));
+        assert_eq!(at(0, "2 finished").fg, Some(t.ink_muted));
+        assert_eq!(at(0, "4.6M").fg, Some(t.ink_muted));
+        assert_eq!(at(1, "defined in").fg, Some(t.ink_muted));
+        assert_eq!(at(2, "~/Offing").fg, Some(t.ink_muted));
+        // reglas: `working now` en claude, `finished` en claude-soft, la línea
+        // subtle y las cabeceras en gris
+        assert_eq!(at(4, "working now").fg, Some(t.claude));
+        assert_eq!(at(4, "──").fg, Some(t.subtle));
+        assert_eq!(at(4, "ctx").fg, Some(t.ink_muted));
+        assert_eq!(at(11, "finished").fg, Some(t.claude_soft));
+        // el cursor: ❯ en claude, número en claude-soft, la tarea en ink negrita
+        assert_eq!(at(5, "❯").fg, Some(t.claude));
+        assert_eq!(at(5, "1.").fg, Some(t.claude_soft));
+        assert_eq!(at(5, "✦").fg, Some(t.claude));
+        assert_eq!(at(5, "paint").fg, Some(t.ink));
+        assert!(bold(at(5, "paint")));
+        // las cifras: medidor en claude, lo vacío subtle, lo demás gris
+        assert_eq!(at(5, "▰").fg, Some(t.claude));
+        assert_eq!(at(5, "▱").fg, Some(t.subtle));
+        assert_eq!(at(5, "71%").fg, Some(t.ink_muted));
+        assert_eq!(at(5, "1 min").fg, Some(t.ink_muted));
+        assert_eq!(at(5, "412k").fg, Some(t.ink_muted));
+        // sublíneas como en activos: etiqueta subtle, valor gris
+        assert_eq!(at(6, "now").fg, Some(t.subtle));
+        assert_eq!(at(6, "Bash").fg, Some(t.ink_muted));
+        assert_eq!(at(7, "skills").fg, Some(t.subtle));
+        assert_eq!(at(7, "frontend-design").fg, Some(t.ink_muted));
+        // fuera del cursor: número gris, tarea en ink sin negrita
+        assert_eq!(at(9, "2.").fg, Some(t.ink_muted));
+        assert_eq!(at(9, "check").fg, Some(t.ink));
+        assert!(!bold(at(9, "check")));
+        // terminada: tarea gris, raya de ctx subtle, cifras gris
+        assert_eq!(at(12, "3.").fg, Some(t.ink_muted));
+        assert_eq!(at(12, "fix").fg, Some(t.ink_muted));
+        assert!(!bold(at(12, "fix")));
+        assert_eq!(at(12, "—").fg, Some(t.subtle));
+        assert_eq!(at(12, "3 min ago").fg, Some(t.ink_muted));
+        assert_eq!(at(12, "835k").fg, Some(t.ink_muted));
+        // el cursor sobre una terminada: sigue gris, en negrita
+        press(&mut app, KeyCode::Char('3'));
+        let lines = draw(&mut app, 110, 20);
+        let buf = draw_buf(&mut app, 110, 20);
+        let at = |y: usize, pat: &str| buf[(col(&lines[y], pat), y as u16)].style();
+        assert!(lines[12].starts_with(" ❯ 3.   fix"), "{:?}", lines[12]);
+        assert_eq!(at(12, "3.").fg, Some(t.claude_soft));
+        assert_eq!(at(12, "fix").fg, Some(t.ink_muted));
+        assert!(bold(at(12, "fix")));
+        assert!(!bold(at(5, "paint")));
+        // un bloque sin nada en curso: nombre en ink, sin estrella
+        let mut app = done_only();
+        press(&mut app, KeyCode::Char('1'));
+        press(&mut app, KeyCode::Enter);
+        let lines = draw(&mut app, 110, 20);
+        let buf = draw_buf(&mut app, 110, 20);
+        assert!(lines[0].starts_with("   "), "{:?}", lines[0]);
+        assert!(!lines[0].contains("working now"), "{:?}", lines[0]);
+        assert_eq!(buf[(3, 0)].style().fg, Some(t.ink));
+    }
+
+    /// Una llamada sin ejecución: raya apagada en ctx y en tokens, nunca 0, y
+    /// la cabecera no suma tokens que no hay.
+    #[test]
+    fn a_lone_call_says_dash_in_tokens_on_the_agent_screen() {
+        let t = Theme::claude_256();
+        let mut app = done_only();
+        for n in ['1', '2', '3'] {
+            press(&mut app, KeyCode::Char(n));
+            press(&mut app, KeyCode::Enter);
+            if app.agent_view().is_some_and(|v| v.name == "visual") {
+                break;
+            }
+            press(&mut app, KeyCode::Esc);
+        }
+        let v = app.agent_view().unwrap();
+        assert_eq!(v.name, "visual");
+        let lines = draw(&mut app, 110, 20);
+        assert!(lines[0].ends_with("  1 finished"), "{:?}", lines[0]);
+        let row = pos(&lines, " ❯ 1.   ");
+        assert!(
+            lines[row].ends_with("  —   5 s ago        —"),
+            "{:?}",
+            lines[row]
+        );
+        let buf = draw_buf(&mut app, 110, 20);
+        assert_eq!(
+            buf[(end_of(&lines[row]) as u16 - 1, row as u16)].style().fg,
+            Some(t.subtle)
+        );
+    }
+
+    /// Estrecha: bajo 70 columnas solo queda `time`; la cabecera pierde
+    /// primero los tokens, luego `N finished`; nada desborda.
+    #[test]
+    fn a_narrow_agent_screen_keeps_time_and_never_overflows() {
+        let mut app = agent_app();
+        let lines = draw(&mut app, 80, 20);
+        assert!(
+            lines[0].ends_with("  2 working now · 2 finished · 4.6M tok"),
+            "{:?}",
+            lines[0]
+        );
+        assert!(
+            lines[4].ends_with("── ctx        time   tokens"),
+            "{:?}",
+            lines[4]
+        );
+        assert!(
+            lines[5].ends_with(" with design…  ▰▰▰▰▰▰▱▱ 71%       1 min     412k"),
+            "{:?}",
+            lines[5]
+        );
+        let lines = draw(&mut app, 50, 20);
+        assert_eq!(
+            lines[0],
+            " ✦ backend [own] · 4 runs           2 working now"
+        );
+        assert_eq!(
+            lines[1],
+            "   defined in   ~/Offing/argi/station/.claude/ag…"
+        );
+        assert!(lines[4].ends_with("── time"), "{:?}", lines[4]);
+        assert_eq!(
+            lines[5],
+            " ❯ 1. ✦ paint the active screen with …      1 min"
+        );
+        assert_eq!(
+            lines[12],
+            "   3.   fix the footer keys             3 min ago"
+        );
+        // muy estrecha: sin sitio para la tarea, se van también las cifras
+        let lines = draw(&mut app, 24, 20);
+        assert_eq!(lines[0], " ✦ backend [own]");
+        assert_eq!(lines[5], " ❯ 1. ✦ paint the acti…");
+        for w in 10u16..=140 {
+            for h in [6u16, 12, 30] {
+                let lines = draw(&mut app, w, h);
+                assert_eq!(lines.len(), h as usize);
+                assert!(
+                    lines.iter().all(|l| width(l) <= w as usize),
+                    "{w}x{h}: {lines:#?}"
+                );
+            }
+        }
+    }
+
+    /// Baja: las líneas `defined in`/`running in` y el blanco ceden ante las
+    /// ejecuciones; con scroll, el pie dice qué ejecuciones se ven.
+    #[test]
+    fn a_low_agent_screen_gives_its_rows_before_the_paths() {
+        let mut app = agent_app();
+        // 6 de cuerpo: cabecera, regla, fila con now y skills, y un blanco
+        let lines = draw(&mut app, 110, 7);
+        assert!(lines[0].contains("backend [own]"), "{lines:#?}");
+        assert!(lines[1].starts_with(" working now · 2 ─"), "{lines:#?}");
+        assert!(lines[2].starts_with(" ❯ 1. ✦ paint"), "{lines:#?}");
+        assert!(!lines.iter().any(|l| l.contains("defined in")));
+        assert!(lines[6].contains("1-1/4"), "{:?}", lines[6]);
+        // con alto de sobra, sin contador
+        let lines = draw(&mut app, 110, 20);
+        assert!(!lines[19].contains("/4"), "{:?}", lines[19]);
+        // las rutas vuelven antes que el blanco
+        let lines = draw(&mut app, 110, 9);
+        assert!(lines[1].contains("defined in"), "{lines:#?}");
+        assert!(lines[3].starts_with(" working now"), "{lines:#?}");
+        // el cursor abajo: la vista le sigue y el contador también
+        press(&mut app, KeyCode::Char('4'));
+        let lines = draw(&mut app, 110, 7);
+        assert!(lines.iter().any(|l| l.starts_with(" ❯ 4.")), "{lines:#?}");
+        assert!(lines[6].contains("-4/4"), "{:?}", lines[6]);
+    }
+
+    /// El pie del agente recorta, por este orden: la versión, `a`, `←→`,
+    /// `↑↓` y `enter`; `esc` y `q` nunca.
+    #[test]
+    fn the_agent_footer_drops_a_then_arrows_then_enter() {
+        let mut app = busy();
+        press(&mut app, KeyCode::Char('1'));
+        press(&mut app, KeyCode::Enter);
+        for _ in 0..8 {
+            if app.can_open_agent() {
+                break;
+            }
+            press(&mut app, KeyCode::Right);
+        }
+        let full = " esc back · ↑↓ run · enter open run · ←→ other agent · a agent · q quit";
+        let foot = |app: &mut App, w: usize| draw(app, w as u16, 12)[11].clone();
+        let wd = width(full);
+        assert_eq!(bare(&foot(&mut app, wd + 20)), full);
+        // justo sin sitio para la versión: se va ella, no una tecla
+        assert_eq!(foot(&mut app, wd + 2), full);
+        assert_eq!(
+            bare(&foot(&mut app, wd)),
+            " esc back · ↑↓ run · enter open run · ←→ other agent · q quit"
+        );
+        assert_eq!(
+            bare(&foot(&mut app, 50)),
+            " esc back · ↑↓ run · enter open run · q quit"
+        );
+        assert_eq!(
+            bare(&foot(&mut app, 40)),
+            " esc back · enter open run · q quit"
+        );
+        assert_eq!(bare(&foot(&mut app, 30)), " esc back · q quit");
+    }
+
+    // --- pantalla de la ejecución: la maqueta ---
+
+    #[test]
+    fn the_run_header_names_the_agent_in_muted_and_the_run_by_state() {
+        let t = Theme::claude_256();
+        let mut app = agent_app();
+        press(&mut app, KeyCode::Enter);
+        let lines = draw(&mut app, 110, 24);
+        assert!(
+            lines[0].starts_with(" backend [own] › ✦ run 1 of 4  "),
+            "{:?}",
+            lines[0]
+        );
+        assert!(
+            lines[0].ends_with("  running 1 min · 7 tools · 412k tok"),
+            "{:?}",
+            lines[0]
+        );
+        let buf = draw_buf(&mut app, 110, 24);
+        let at = |pat: &str| buf[(col(&lines[0], pat), 0)].style();
+        assert_eq!(at("backend").fg, Some(t.ink_muted));
+        assert!(!at("backend").add_modifier.contains(Modifier::BOLD));
+        assert_eq!(at("[own]").fg, Some(t.ink_muted));
+        assert_eq!(at("›").fg, Some(t.ink_muted));
+        assert_eq!(at("✦").fg, Some(t.claude));
+        assert_eq!(at("run 1 of 4").fg, Some(t.claude_soft));
+        assert!(at("run 1 of 4").add_modifier.contains(Modifier::BOLD));
+        assert_eq!(at("running").fg, Some(t.ink_muted));
+        // la estrella parpadea
+        app.now += TimeDelta::milliseconds(500);
+        assert!(draw(&mut app, 110, 24)[0].starts_with(" backend [own] › ✧ run 1 of 4"));
+        app.now -= TimeDelta::milliseconds(500);
+        // una terminada: sin estrella ni hueco, en ink sin negrita
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right);
+        let lines = draw(&mut app, 110, 24);
+        assert!(
+            lines[0].starts_with(" backend [own] › run 3 of 4  "),
+            "{:?}",
+            lines[0]
+        );
+        assert!(
+            lines[0].ends_with("ended 3 min ago · 835k tok"),
+            "{:?}",
+            lines[0]
+        );
+        let buf = draw_buf(&mut app, 110, 24);
+        let run = buf[(col(&lines[0], "run 3"), 0)].style();
+        assert_eq!(run.fg, Some(t.ink));
+        assert!(!run.add_modifier.contains(Modifier::BOLD));
+    }
+
+    /// `run i of n` es el título: se queda también con una sola y en
+    /// estrecho; antes ceden las cifras, la etiqueta y el nombre del agente.
+    #[test]
+    fn the_run_counter_stays_also_alone_and_narrow() {
+        let mut one = fused_app(1);
+        open_backend(&mut one);
+        let lines = draw(&mut one, 100, 22);
+        assert!(
+            lines[0].starts_with(" backend [own] › ✦ run 1 of 1  "),
+            "{:?}",
+            lines[0]
+        );
+        let mut app = agent_app();
+        press(&mut app, KeyCode::Enter);
+        // bajo 70 columnas ceden `running …` y los tokens; bajo 50, la etiqueta
+        let head = draw(&mut app, 69, 22)[0].clone();
+        assert!(
+            head.starts_with(" backend [own] › ✦ run 1 of 4  ") && head.ends_with("  7 tools"),
+            "{head:?}"
+        );
+        assert_eq!(width(&head), 68);
+        let head = draw(&mut app, 49, 22)[0].clone();
+        assert!(
+            head.starts_with(" backend › ✦ run 1 of 4  ") && head.ends_with("  7 tools"),
+            "{head:?}"
+        );
+        // el nombre se corta y, sin sitio ni para cuatro columnas, se va con
+        // su `›`; lo último, las cifras
+        assert_eq!(draw(&mut app, 30, 22)[0], " bac… › ✦ run 1 of 4  7 tools");
+        assert_eq!(draw(&mut app, 29, 22)[0], " ✦ run 1 of 4        7 tools");
+        app.run_detail.as_mut().unwrap().name = "un-nombre-larguisimo".into();
+        assert_eq!(
+            draw(&mut app, 40, 22)[0],
+            " un-nombre-lar… › ✦ run 1 of 4  7 tools"
+        );
+        assert_eq!(draw(&mut app, 16, 22)[0], " ✦ run 1 of 4");
+        for w in 8u16..=160 {
+            let lines = draw(&mut app, w, 24);
+            assert!(lines.iter().all(|l| width(l) <= w as usize), "{w}");
+        }
+    }
+
+    #[test]
+    fn the_run_screen_says_where_it_runs_under_who_launched_it() {
+        let t = Theme::claude_256();
+        let mut app = rich_run();
+        let lines = draw(&mut app, 100, 38);
+        assert!(
+            lines[1].starts_with("   launched by  session"),
+            "{:?}",
+            lines[1]
+        );
+        assert_eq!(lines[2], "   running in   ~/Offing/argi/station");
+        assert_eq!(lines[3], "");
+        let buf = draw_buf(&mut app, 100, 38);
+        assert_eq!(buf[(3, 2)].style().fg, Some(t.ink_muted));
+        assert_eq!(buf[(16, 2)].style().fg, Some(t.ink_muted));
+        // la carpeta de lanzamiento manda sobre el cwd, que sale aparte
+        {
+            let d = app.run_detail.as_mut().unwrap();
+            d.launch_dir = Some(PathBuf::from("/Users/x/Offing/argi"));
+        }
+        let lines = draw(&mut app, 100, 38);
+        assert_eq!(lines[2], "   running in   ~/Offing/argi");
+        assert_eq!(lines[3], "   cwd          ~/Offing/argi/station");
+        // estrecha, la ruta se corta; sin carpeta conocida, no hay línea
+        let lines = draw(&mut app, 24, 38);
+        assert_eq!(lines[2], "   running in   ~/Offi…");
+        let d = app.run_detail.as_mut().unwrap();
+        d.launch_dir = None;
+        d.cwd = None;
+        let lines = draw(&mut app, 100, 38);
+        assert!(!lines.iter().any(|l| l.contains("running in")));
+    }
+
+    #[test]
+    fn usage_is_the_first_section_in_two_lines() {
+        let t = Theme::claude_256();
+        let mut app = rich_run();
+        let lines = draw(&mut app, 100, 38);
+        assert!(lines[4].starts_with(" usage ─"), "{:?}", lines[4]);
+        assert!(lines[4].ends_with("─ sonnet-5-5"), "{:?}", lines[4]);
+        assert!(
+            lines[5].starts_with("   context  71%   ███"),
+            "{:?}",
+            lines[5]
+        );
+        assert!(lines[5].ends_with("░░  142k of 200k"), "{:?}", lines[5]);
+        assert_eq!(
+            lines[6],
+            "   tokens   412k  input 18k · output 24k · cache read 351k · cache write 19k"
+        );
+        assert!(lines[7].starts_with(" task ─"), "{:?}", lines[7]);
+        // la barra empieza donde el desglose
+        assert_eq!(col(&lines[5], "█"), col(&lines[6], "input"));
+        let buf = draw_buf(&mut app, 100, 38);
+        let at = |y: usize, pat: &str| buf[(col(&lines[y], pat), y as u16)].style();
+        let bold = |s: Style| s.add_modifier.contains(Modifier::BOLD);
+        assert_eq!(at(4, "usage").fg, Some(t.claude_soft));
+        assert_eq!(at(4, "sonnet").fg, Some(t.ink_muted));
+        assert_eq!(at(5, "context").fg, Some(t.ink_muted));
+        assert_eq!(at(5, "71%").fg, Some(t.ink));
+        assert!(bold(at(5, "71%")));
+        assert_eq!(at(5, "142k").fg, Some(t.ink_muted));
+        assert_eq!(at(6, "tokens").fg, Some(t.ink_muted));
+        // el total en ink negrita; etiquetas en gris y cifras en ink
+        assert_eq!(at(6, "412k").fg, Some(t.ink));
+        assert!(bold(at(6, "412k")));
+        for (label, value) in [
+            ("input", "18k"),
+            ("output", "24k"),
+            ("cache read", "351k"),
+            ("cache write", "19k"),
+        ] {
+            assert_eq!(at(6, label).fg, Some(t.ink_muted), "{label}");
+            assert_eq!(at(6, value).fg, Some(t.ink), "{value}");
+            assert!(!bold(at(6, value)), "{value}");
+        }
+        assert_eq!(at(6, " · ").fg, Some(t.ink_muted));
+    }
+
+    /// Estrecha, el desglose baja a otra línea bajo su columna, sin perder
+    /// ninguna cifra.
+    #[test]
+    fn a_narrow_usage_wraps_the_breakdown_under_its_column() {
+        let mut app = rich_run();
+        let lines = draw(&mut app, 60, 38);
+        let u = pos(&lines, " usage ─");
+        assert_eq!(
+            lines[u + 1],
+            "   context  71%   ███████████████████▏░░░░░░░  142k of 200k"
+        );
+        assert_eq!(
+            lines[u + 2],
+            "   tokens   412k  input 18k · output 24k · cache read 351k"
+        );
+        assert_eq!(lines[u + 3], "                  cache write 19k");
+        assert!(lines[u + 4].starts_with(" task ─"), "{:?}", lines[u + 4]);
+        let lines = draw(&mut app, 40, 38);
+        let u = pos(&lines, " usage ─");
+        // sin sitio para ocho columnas de barra, se va
+        assert_eq!(lines[u + 1], "   context  71%   142k of 200k");
+        assert_eq!(lines[u + 2], "   tokens   412k  input 18k");
+        assert_eq!(lines[u + 3], "                  output 24k");
+        assert_eq!(lines[u + 4], "                  cache read 351k");
+        assert_eq!(lines[u + 5], "                  cache write 19k");
+    }
+
+    #[test]
+    fn skills_come_after_the_task_newest_first_with_when() {
+        let t = Theme::claude_256();
+        let mut app = rich_run();
+        // sin skills, sin sección
+        let lines = draw(&mut app, 100, 38);
+        assert!(
+            !lines.iter().any(|l| l.starts_with(" skills")),
+            "{lines:#?}"
+        );
+        let at = |s: &str| -> DateTime<Utc> { s.parse().unwrap() };
+        let skill = |when: &str, name: &str| crate::runs::SkillUse {
+            at: at(when),
+            name: name.into(),
+        };
+        app.run_detail.as_mut().unwrap().skills = vec![
+            skill(
+                "2026-11-05T11:56:00Z",
+                "superpowers:verification-before-completion",
+            ),
+            skill("2026-11-05T11:59:30Z", "frontend-design"),
+        ];
+        let lines = draw(&mut app, 100, 38);
+        let task = pos(&lines, " task ─");
+        let s = pos(&lines, " skills · 2 ─");
+        assert_eq!(s, task + 3, "{lines:#?}");
+        assert_eq!(lines[s + 1], "   30 s ago   frontend-design");
+        assert_eq!(
+            lines[s + 2],
+            "   4 min ago  superpowers:verification-before-completion"
+        );
+        assert!(lines[s + 3].starts_with(" tools ─"), "{:?}", lines[s + 3]);
+        let buf = draw_buf(&mut app, 100, 38);
+        assert_eq!(buf[(1, s as u16)].style().fg, Some(t.claude_soft));
+        assert_eq!(buf[(3, s as u16 + 1)].style().fg, Some(t.ink_muted));
+        assert_eq!(buf[(14, s as u16 + 1)].style().fg, Some(t.ink));
+        assert_eq!(buf[(14, s as u16 + 2)].style().fg, Some(t.ink));
+        // baja: la segunda línea del encargo entra antes que las skills
+        let lines = draw(&mut app, 100, 19);
+        assert!(
+            lines.iter().any(|l| l == "   con el diseño B"),
+            "{lines:#?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.starts_with(" skills")),
+            "{lines:#?}"
+        );
+        // un nombre largo se corta con …
+        let lines = draw(&mut app, 30, 38);
+        let s = pos(&lines, " skills · 2 ─");
+        assert_eq!(lines[s + 2], "   4 min ago  superpowers:ve…");
+        // más de las que caben: las más recientes, y la regla dice cuáles
+        app.run_detail.as_mut().unwrap().skills = (0..9)
+            .map(|i| skill("2026-11-05T11:58:00Z", &format!("skill-{i}")))
+            .collect();
+        let lines = draw(&mut app, 100, 50);
+        let s = pos(&lines, " skills · 9 ─");
+        assert!(lines[s].ends_with("─ 1-6/9"), "{:?}", lines[s]);
+        assert_eq!(lines[s + 1], "   2 min ago  skill-8");
+        assert_eq!(lines[s + 6], "   2 min ago  skill-3");
+        assert!(lines[s + 7].starts_with(" tools ─"), "{:?}", lines[s + 7]);
+    }
+
+    /// El pie de la ejecución recorta, por este orden: `pgup/pgdn`, `p`,
+    /// `tab`, `←→` y `enter`; y al final `back to <agente>` pasa a `back`.
+    #[test]
+    fn the_run_footer_drops_steps_then_parent_tab_arrows_and_the_agent_name() {
+        let mut app = agent_app();
+        press(&mut app, KeyCode::Enter);
+        let parent = link("docs", true, 10, 7, 0, "");
+        {
+            let d = app.run_detail.as_mut().unwrap();
+            d.launched = vec![link("Explore", true, 2, 9, 64_000, "x")];
+            d.launched_by = Some(LaunchedBy::Run(RunLink {
+                kind: RunKind::Defined,
+                ..parent
+            }));
+        }
+        assert!(app.can_open_parent());
+        let foot = |app: &mut App, w: usize| bare(&draw(app, w as u16, 12)[11]);
+        let full = " esc back to backend · ←→ other run · tab launched · pgup/pgdn steps · p parent · q quit";
+        assert_eq!(foot(&mut app, 140), full);
+        assert_eq!(
+            foot(&mut app, width(full)),
+            " esc back to backend · ←→ other run · tab launched · p parent · q quit"
+        );
+        assert_eq!(
+            foot(&mut app, 66),
+            " esc back to backend · ←→ other run · tab launched · q quit"
+        );
+        assert_eq!(
+            foot(&mut app, 50),
+            " esc back to backend · ←→ other run · q quit"
+        );
+        assert_eq!(foot(&mut app, 40), " esc back to backend · q quit");
+        assert_eq!(foot(&mut app, 26), " esc back · q quit");
     }
 
     #[test]
@@ -6946,8 +8445,9 @@ mod tests {
         let live = |n: usize| {
             items
                 .iter()
-                .position(|i| matches!(i, Item::Live { n: m, .. } if *m == n))
+                .position(|i| matches!(i, Item::LiveAgent { n: m, .. } if *m == n))
                 .unwrap()
+                + 1
         };
         // el `Live` de la fila 3 queda justo encima de la vista
         app.scroll = live(3) + 1;
@@ -6973,13 +8473,6 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         assert!(app.detail);
         draw(&mut app, 110, 20);
-        assert!(app.hits.rows.is_empty());
-        assert_eq!(app.hits.tabs.len(), 3);
-
-        let mut app = blocks();
-        press(&mut app, KeyCode::Enter);
-        assert!(app.run_detail.is_some());
-        draw(&mut app, 110, 30);
         assert!(app.hits.rows.is_empty());
         assert_eq!(app.hits.tabs.len(), 3);
     }

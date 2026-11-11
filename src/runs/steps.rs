@@ -9,6 +9,19 @@ use std::sync::Arc;
 /// herramienta no se ve afectado: cuenta todos.
 pub const MAX_STEPS: usize = 200;
 
+/// Cuántas invocaciones de skill se guardan por ejecución (las más recientes).
+/// Una ejecución real invoca unas pocas; el tope solo acota una desbocada.
+pub const MAX_SKILLS: usize = 50;
+
+/// Una invocación de skill: un `tool_use` `Skill` con `input.skill`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillUse {
+    /// `timestamp` de la línea de la llamada (la última conocida si no lo trae).
+    pub at: DateTime<Utc>,
+    /// `input.skill`, tal cual (`superpowers:brainstorming`).
+    pub name: String,
+}
+
 /// Un bloque `tool_use` de la transcripción.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolStep {
@@ -34,20 +47,28 @@ impl ToolStep {
 pub(super) struct Steps {
     recent: VecDeque<ToolStep>,
     counts: HashMap<String, usize>,
-    /// Nombre de la última skill invocada (`Skill` con `input.skill`) en TODA
-    /// la ejecución: no se pierde aunque su paso salga de `recent`.
-    skill: Option<String>,
+    /// Las últimas `MAX_SKILLS` invocaciones de skill (`Skill` con
+    /// `input.skill`) de TODA la ejecución, de la más antigua: no se pierden
+    /// aunque su paso salga de `recent`.
+    skills: VecDeque<SkillUse>,
     /// Copias compartidas de lo anterior, rehechas por `seal` al acabar cada
     /// lectura: `Runs::runs()` solo clona el `Arc`, no los pasos.
     recent_arc: Arc<[ToolStep]>,
     counts_arc: Arc<[(String, usize)]>,
+    skills_arc: Arc<[SkillUse]>,
 }
 
 impl Steps {
     pub(super) fn push(&mut self, step: ToolStep) {
         *self.counts.entry(step.name.clone()).or_default() += 1;
-        if step.name == "Skill" && step.arg.is_some() {
-            self.skill.clone_from(&step.arg);
+        if let Some(name) = step.arg.as_ref().filter(|_| step.name == "Skill") {
+            if self.skills.len() == MAX_SKILLS {
+                self.skills.pop_front();
+            }
+            self.skills.push_back(SkillUse {
+                at: step.at,
+                name: name.clone(),
+            });
         }
         if self.recent.len() == MAX_STEPS {
             self.recent.pop_front();
@@ -59,6 +80,21 @@ impl Steps {
     pub(super) fn seal(&mut self) {
         self.recent_arc = self.recent().into();
         self.counts_arc = self.sorted_counts().into();
+        // Solo cambia cuando hay una invocación nueva: si no, se queda el mismo.
+        if self.skills_arc.len() != self.skills.len()
+            || self.skills_arc.last() != self.skills.back()
+        {
+            self.skills_arc = self.skills().into();
+        }
+    }
+
+    pub(super) fn skills_arc(&self) -> Arc<[SkillUse]> {
+        Arc::clone(&self.skills_arc)
+    }
+
+    /// Las invocaciones de skill guardadas, de la más antigua a la más reciente.
+    pub(super) fn skills(&self) -> Vec<SkillUse> {
+        self.skills.iter().cloned().collect()
     }
 
     pub(super) fn recent_arc(&self) -> Arc<[ToolStep]> {
@@ -76,7 +112,7 @@ impl Steps {
 
     /// La skill que manda: la última invocada; sigue hasta que se carga otra.
     pub(super) fn skill(&self) -> Option<&str> {
-        self.skill.as_deref()
+        self.skills.back().map(|s| s.name.as_str())
     }
 
     /// Los pasos guardados, del más antiguo al más reciente.

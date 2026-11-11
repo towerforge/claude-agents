@@ -15,14 +15,16 @@ use std::time::SystemTime;
 use walkdir::WalkDir;
 
 pub mod cwd;
+mod ending;
 pub mod history;
 mod links;
 mod steps;
 mod text;
 pub mod usage;
+use ending::{turn_of, Ending, Turn};
 use history::Kept;
 use steps::Steps;
-pub use steps::ToolStep;
+pub use steps::{SkillUse, ToolStep};
 pub use text::first_task_line;
 use text::{task_full_of, task_of, tool_parts};
 use usage::{usage_of, LineUsage, Usage, UsageAcc};
@@ -34,8 +36,9 @@ pub const IDLE_GAP: TimeDelta = TimeDelta::minutes(5);
 /// Una ejecución sin terminar cuya transcripción lleva más que esto sin
 /// tocarse se da por interrumpida, no en curso.
 pub const STALE_AFTER: TimeDelta = TimeDelta::minutes(10);
-/// Sin `finished` en el meta (las ejecuciones de workflow) no hay forma de saber
-/// si terminó: cuenta como en curso solo mientras su transcripción se escribe.
+/// Sin `finished` en el meta (las ejecuciones de workflow), si la transcripción
+/// no acaba en un mensaje final (`Run::closed`) no hay forma de saber si
+/// terminó: cuenta como en curso solo mientras se escribe.
 pub const QUIET_AFTER: TimeDelta = TimeDelta::minutes(2);
 
 /// Ancho de las franjas UTC en que se guarda el trabajo. Todas las zonas
@@ -97,14 +100,22 @@ pub struct Run {
     /// La skill que está usando: la última que invocó (`Skill` con
     /// `input.skill`, p. ej. `superpowers:brainstorming`), tal cual; sigue
     /// mandando hasta que carga otra. `None` si no invocó ninguna o si la
-    /// ejecución viene del historial guardado.
+    /// ejecución viene del historial guardado. Es la última de `skills`.
     pub skill: Option<String>,
+    /// Todas las invocaciones de skill con su hora, de la más antigua a la más
+    /// reciente (las últimas 50, `MAX_SKILLS`). Vacía si no invocó ninguna o
+    /// si la ejecución viene del historial guardado.
+    pub skills: Arc<[SkillUse]>,
     /// Los últimos 200 `tool_use` (`MAX_STEPS`), del más antiguo, con su hora.
     pub steps: Arc<[ToolStep]>,
     /// Usos por herramienta sobre TODA la ejecución, de más a menos; suman `tools`.
     pub tool_counts: Arc<[(String, usize)]>,
     /// `finished` del meta; `None` si no lo trae (las de workflows no lo llevan).
     pub finished: Option<bool>,
+    /// La transcripción acaba en un mensaje final (ver `ending`): la entrega
+    /// del informe o un turno del asistente sin herramientas. Vuelve a `false`
+    /// si después se escribe algo más.
+    pub closed: bool,
     /// Última modificación del `.jsonl`.
     pub modified: DateTime<Utc>,
     /// Tokens, modelo y contexto (ver `usage`).
@@ -119,19 +130,26 @@ pub struct Run {
     /// `id` de las ejecuciones que lanzó ella, ordenados.
     pub children: Vec<String>,
     /// Solo está en el historial guardado: su transcripción ya no existe. No
-    /// tiene `steps`, `last_tool`, `skill` ni `temp_cwd`.
+    /// tiene `steps`, `last_tool`, `skill`, `skills` ni `temp_cwd`.
     pub from_cache: bool,
 }
 
 impl Run {
     /// En curso: el meta dice `finished: false` y la transcripción se tocó hace
-    /// menos de `STALE_AFTER`; o el meta no dice nada (workflows) y se tocó hace
-    /// menos de `QUIET_AFTER`. `finished: true`, nunca.
+    /// menos de `STALE_AFTER`; o el meta no dice nada (workflows), la
+    /// transcripción no está cerrada (`closed`) y se tocó hace menos de
+    /// `QUIET_AFTER`. `finished: true`, nunca.
+    ///
+    /// Con `finished: false` no se mira `closed`: el meta es explícito y Claude
+    /// Code lo pone a `true` en el mismo segundo que la última línea, así que
+    /// si aún dice `false` tras un mensaje final es que la ejecución sigue
+    /// abierta (le van a pedir que continúe) o que se cortó, y eso ya lo
+    /// resuelve `STALE_AFTER`.
     pub fn in_progress(&self, now: DateTime<Utc>) -> bool {
         let idle = now - self.modified;
         match self.finished {
             Some(false) => idle < STALE_AFTER,
-            None => idle < QUIET_AFTER,
+            None => !self.closed && idle < QUIET_AFTER,
             Some(true) => false,
         }
     }
@@ -223,11 +241,23 @@ struct LineInfo {
     usage: Option<LineUsage>,
     /// Ids de las llamadas `Agent`/`Task` de la línea.
     launches: Vec<String>,
+    /// Lo que dice sobre el final, si es un mensaje `assistant` o `user`.
+    turn: Option<Turn>,
 }
 
 fn parse_run_line(line: &str) -> Option<LineInfo> {
     let doc: Value = serde_json::from_str(line).ok()?;
     let text_of = |k: &str| doc.get(k).and_then(Value::as_str);
+    // Las líneas `api-request*` (Claude Code 2.1.319+) son la petición a la API,
+    // no un mensaje de la ejecución: su `message` repite bloques ya escritos en
+    // líneas `assistant`. De ellas solo vale la hora.
+    if text_of("type").is_some_and(|t| t.starts_with("api-request")) {
+        return Some(LineInfo {
+            at: text_of("timestamp").and_then(|t| t.parse().ok()),
+            session_id: text_of("sessionId").map(str::to_string),
+            ..LineInfo::default()
+        });
+    }
     let cwd = text_of("cwd");
     // Un bloque sin nombre cuenta igual (como `?`) para que la suma cuadre.
     let tool_uses: Vec<_> = doc
@@ -251,6 +281,7 @@ fn parse_run_line(line: &str) -> Option<LineInfo> {
         tool_uses,
         usage: usage_of(&doc),
         launches: links::launch_ids(&doc),
+        turn: turn_of(&doc),
     })
 }
 
@@ -282,6 +313,8 @@ struct Transcript {
     launches: Vec<String>,
     /// De la sesión padre, puesto por `resolve_sessions`.
     session_prompt: Option<String>,
+    /// Si el último mensaje la cierra.
+    ending: Ending,
 }
 
 impl Transcript {
@@ -298,6 +331,9 @@ impl Transcript {
             self.usage.add(u);
         }
         self.launches.append(&mut info.launches);
+        if let Some(turn) = info.turn.take() {
+            self.ending.add(turn);
+        }
         self.tools += info.tools;
         if self.task.is_none() {
             self.task = info.task;
@@ -500,9 +536,11 @@ impl Runs {
                     task_full: t.task_full.clone(),
                     last_tool: t.steps.last_label(),
                     skill: t.steps.skill().map(str::to_string),
+                    skills: t.steps.skills_arc(),
                     steps: t.steps.recent_arc(),
                     tool_counts: t.steps.counts_arc(),
                     finished: meta.finished,
+                    closed: t.ending.closed(),
                     modified: f.modified.map(DateTime::<Utc>::from).unwrap_or_default(),
                     usage: t.usage.usage(),
                     session_prompt: t.session_prompt.clone(),

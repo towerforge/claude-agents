@@ -66,11 +66,11 @@ No configuration: it looks for agents under your home directory (`~/.claude/agen
 
 Three views, as tabs in the header:
 
-- **active** (default): one block per agent, under its name on a line of its own, marked `✦` while something in it is running: one row per running run, with its task, context, time and tokens, and `skill` and `now` under it; then one row for what it finished within the window. A blank line separates the blocks. Groups go by the folder where the Claude Code session was launched.
-- **all**: every agent on disk by project, with a 14-day bar, time worked, runs and last use.
+- **active** (default): one numbered block per agent, under its name on a line of its own, marked `✦` while something in it is running: one row per running run, with its task, context, time and tokens, and `skill` and `now` under it; then one row for what it finished within the window. A blank line separates the blocks. Groups go by the folder where the Claude Code session was launched.
+- **all**: every agent on disk by project, with a 14-day bar, time worked, tokens and last use.
 - **ranking**: agents with work in the period, from most to least.
 
-`Enter` opens the agent's details (in all and ranking) or the run's (in active). The mouse works too: the wheel scrolls, a click on a tab switches view, a click on a row selects it and a second click on it opens it like `Enter`. Every view in detail: [docs/interface.md](docs/interface.md); all the keys: [keys and formats](docs/interface.md#keys-and-formats).
+`Enter` opens the agent's details (in all and ranking) or, in active, the agent screen: every run of that agent in the window, one per row, running and finished; `Enter` on a run opens it, with its usage, task, skills, tools and steps, and `Esc` goes back one level. The mouse works too: the wheel scrolls, a click on a tab switches view, a click on a row (in active, anywhere in a block) selects it and a second click on it opens it like `Enter`. Every view in detail: [docs/interface.md](docs/interface.md); all the keys: [keys and formats](docs/interface.md#keys-and-formats).
 
 ### Flags
 
@@ -138,7 +138,7 @@ Limitations: [docs/how-it-works.md](docs/how-it-works.md#limitations).
 
 ## FAQ
 
-**A run shows as finished but it is still working.** A run that writes nothing for 10 minutes (a pending permission, a long tool) shows as interrupted until it writes again; a workflow step, after 2 minutes.
+**A run shows as finished but it is still working.** A run that writes nothing for 10 minutes (a pending permission, a long tool) shows as interrupted until it writes again; a workflow step that stops writing without a final message, after 2 minutes.
 
 **Why don't `general-purpose` or `Explore` show in all or in the ranking?** They have no definition on disk. They show in active, but add no time to any agent.
 
