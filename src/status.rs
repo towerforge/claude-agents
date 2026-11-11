@@ -3,10 +3,11 @@
 
 use crate::agents::{Agent, Scope};
 use crate::runs::usage::Usage;
-use crate::runs::{Run, ToolStep};
+use crate::runs::{Run, SkillUse, ToolStep};
 use crate::transcripts::Invocation;
 use chrono::{DateTime, NaiveDate, TimeDelta, TimeZone, Utc};
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::ops::AddAssign;
 use std::path::{Path, PathBuf};
 
@@ -84,6 +85,9 @@ pub struct Work {
     pub total: TimeDelta,
     /// Número de ejecuciones; 0 si no hay ninguna registrada.
     pub runs: usize,
+    /// `Tokens::total` de esas mismas ejecuciones, de siempre. Las en curso,
+    /// lo que llevan.
+    pub tokens: u64,
     /// La ejecución en curso que empezó antes, si hay alguna.
     pub running: Option<Running>,
 }
@@ -104,6 +108,7 @@ pub fn work_of(agent: &Agent, runs: &[Run], now: DateTime<Utc>) -> Work {
     Work {
         total: mine.iter().map(|r| r.worked_until(now)).sum(),
         runs: mine.len(),
+        tokens: mine.iter().map(|r| r.usage.tokens.total()).sum(),
         running,
     }
 }
@@ -457,6 +462,11 @@ pub struct NowRun<'a> {
     /// Posición en el racimo de su agente (`Chain`); `Single` fuera de
     /// `active_groups`.
     pub chain: Chain,
+    /// Es una llamada `Agent` sin ejecución enlazada (`lone_call_line`): no
+    /// tiene cifras que enseñar (0 trabajado, 0 tokens, sin herramientas ni
+    /// skill) y `ended` es el instante de la llamada. En una fila que funde
+    /// varias, lo de la representante.
+    pub lone_call: bool,
 }
 
 /// Identificador estable de una ejecución: su `tool_use_id` si lo tiene; los
@@ -496,6 +506,11 @@ pub struct RunDetail {
     pub task_full: Option<String>,
     pub last_tool: Option<String>,
     pub steps: Vec<ToolStep>,
+    /// Todas las invocaciones de skill con su hora (`Run::skills`), de la más
+    /// antigua a la más reciente, como `steps`: la sección `skills · N` las
+    /// pinta al revés. Vacía si no invocó ninguna, si viene del historial
+    /// guardado (`from_cache`) o en una llamada sin ejecución.
+    pub skills: Vec<SkillUse>,
     pub tool_counts: Vec<(String, usize)>,
     /// `Some(instante de su última línea)` si ya no está en curso; la pantalla
     /// muestra «terminó hace N min» con él.
@@ -566,6 +581,13 @@ impl RunDetail {
             *self = new;
         }
     }
+
+    /// La carpeta del grupo, la de `running in`: donde se lanzó la sesión
+    /// (`launch_dir`) o, si no se sabe, el `cwd`. La misma regla que agrupa
+    /// activos (`NowRun::group_dir`, `AgentBlock::dir`).
+    pub fn group_dir(&self) -> Option<&Path> {
+        self.launch_dir.as_deref().or(self.cwd.as_deref())
+    }
 }
 
 /// Localiza una ejecución por su `run_id` (en curso o ya terminada) y devuelve
@@ -593,6 +615,7 @@ pub fn run_detail(
         task_full: r.task_full.clone(),
         last_tool: r.last_tool.clone(),
         steps: r.steps.to_vec(),
+        skills: r.skills.to_vec(),
         tool_counts: r.tool_counts.to_vec(),
         ended,
         temp_cwd: r.temp_cwd.clone(),
@@ -703,6 +726,7 @@ fn now_run<'a>(agents: &'a [Agent], r: &'a Run, now: DateTime<Utc>) -> NowRun<'a
         tokens: r.usage.tokens.total(),
         context: Context::of(&r.usage),
         chain: Chain::Single,
+        lone_call: false,
     }
 }
 
@@ -756,26 +780,166 @@ fn agent_key<'a>(l: &NowRun<'a>) -> AgentKey<'a> {
 }
 
 /// Los ids entre los que salta la ficha (←→) desde la fila que contiene `id`:
-/// en una fila en curso, los de su racimo (las en curso del mismo agente en el
-/// grupo) en el orden de la pantalla; en una terminada, sus `run_ids`, de la
-/// más reciente a la más antigua. Vacío si ninguna fila lo contiene.
+/// todas las ejecuciones del bloque de su agente en el grupo (`Chain`), sea
+/// `id` una en curso o una terminada. Primero las en curso, en el orden en que
+/// salen en el bloque; luego las fundidas en su fila terminada (`run_ids`), de
+/// la más reciente a la más antigua. Vacío si ninguna fila lo contiene.
 pub fn sibling_ids(groups: &[LiveGroup], id: &str) -> Vec<String> {
     for g in groups {
         let Some(line) = g.lines.iter().find(|l| l.run_ids.iter().any(|r| r == id)) else {
             continue;
         };
-        if line.state != RunState::Running {
-            return line.run_ids.clone();
-        }
+        // el bloque ya viene en ese orden: las en curso (cada una su id) y,
+        // al final, la terminada con sus fundidas
         let key = agent_key(line);
         return g
             .lines
             .iter()
-            .filter(|l| l.state == RunState::Running && agent_key(l) == key)
-            .map(|l| l.id.clone())
+            .filter(|l| agent_key(l) == key)
+            .flat_map(|l| l.run_ids.iter().cloned())
             .collect();
     }
     Vec::new()
+}
+
+/// El bloque de un agente en activos «desplegado»: lo que pinta la pantalla
+/// del agente. Las mismas ejecuciones que su bloque en `active_groups`, pero
+/// UNA POR FILA: las terminadas no se funden.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentBlock<'a> {
+    /// Nombre resuelto del agente (`NowRun::name` de la primera fila del bloque).
+    pub name: &'a str,
+    /// Origen de la primera fila del bloque, el mismo que rotula el bloque en
+    /// activos. Un agente definido puede mezclar `Defined` y `Workflow`: cada
+    /// ejecución lleva el suyo en `runs`.
+    pub kind: RunKind,
+    /// Índice del agente definido; `None` en built-in y pasos de workflow sin
+    /// agente definido.
+    pub owner: Option<usize>,
+    /// Ruta absoluta del `.md` que lo define (`Agent::path`); `None` sin `owner`.
+    pub definition: Option<&'a Path>,
+    /// Clave del grupo (`LiveGroup::section`): «global» o la carpeta con `~`.
+    pub section: String,
+    /// Carpeta del grupo sin acortar (`NowRun::group_dir`); `None` en «global».
+    pub dir: Option<&'a Path>,
+    /// Cuántas de `runs` están en curso.
+    pub running: usize,
+    /// Cuántas de `runs` terminaron en la ventana (llamadas sin ejecución
+    /// incluidas): `running + finished == runs.len()`.
+    pub finished: usize,
+    /// Suma de `NowRun::tokens` de `runs`: lo mismo que suman las filas del
+    /// bloque en activos.
+    pub tokens: u64,
+    /// Sus ejecuciones, una por fila y en el orden de `sibling_ids`: primero
+    /// las en curso como salen en el bloque (la de inicio más tardío arriba) y
+    /// luego las terminadas en la ventana, de la más reciente a la más
+    /// antigua. Cada una con `runs == 1`, `run_ids == [id]`, sus propias
+    /// cifras y `chain == Single` (aquí no significa nada). Las terminadas
+    /// llevan `state: Done { ended }` y `context: None`.
+    ///
+    /// Una llamada sin ejecución enlazada sale como una terminada más, en su
+    /// sitio por la hora de la llamada, con `lone_call: true` y sin cifras
+    /// (0 trabajado, 0 tokens, sin herramienta ni skill): cuenta en
+    /// `finished` y en el total, y su `id` (`call_id`) abre la ficha mínima
+    /// de `activity_detail`.
+    pub runs: Vec<NowRun<'a>>,
+}
+
+/// El bloque desplegado del agente al que pertenece `id` (el de cualquiera de
+/// sus ejecuciones; el de su primera fila sirve de id del bloque). `groups`
+/// son los de `active_groups` con estos mismos `agents`, `calls`, `runs` y
+/// `now`. `None` si ninguna fila de la ventana contiene `id`: el bloque ya no
+/// está en activos.
+pub fn agent_block<'a>(
+    agents: &'a [Agent],
+    calls: &'a [Invocation],
+    runs: &'a [Run],
+    groups: &[LiveGroup<'a>],
+    id: &str,
+    now: DateTime<Utc>,
+) -> Option<AgentBlock<'a>> {
+    let has = |l: &NowRun| l.run_ids.iter().any(|r| r == id);
+    let (g, line) = groups
+        .iter()
+        .find_map(|g| g.lines.iter().find(|l| has(l)).map(|l| (g, l)))?;
+    let key = agent_key(line);
+    let block: Vec<&NowRun<'a>> = g.lines.iter().filter(|l| agent_key(l) == key).collect();
+    let head = block[0];
+
+    // las fundidas en una fila terminada, cada una con sus datos; solo se
+    // buscan si hay alguna fila que funda. Por id puede haber más de una (dos
+    // ejecuciones con el mismo `tool_use_id`, dos llamadas antiguas con el
+    // mismo id compuesto): se guardan todas, para que cada id de `run_ids`
+    // (que las cuenta una a una) encuentre la suya
+    let fused: Vec<&str> = block
+        .iter()
+        .filter(|l| l.run_ids.len() > 1)
+        .flat_map(|l| l.run_ids.iter().map(String::as_str))
+        .collect();
+    let mut apart: HashMap<String, Vec<(DateTime<Utc>, NowRun<'a>)>> = HashMap::new();
+    if !fused.is_empty() {
+        for r in runs {
+            // las en curso son su propia fila, nunca una fundida
+            if r.in_progress(now) {
+                continue;
+            }
+            let rid = run_id(r);
+            if fused.contains(&rid.as_str()) {
+                if let Some(ended) = r.last.or(r.start) {
+                    let row = NowRun {
+                        state: RunState::Done { ended },
+                        context: None,
+                        ..now_run(agents, r, now)
+                    };
+                    apart.entry(rid).or_default().push((ended, row));
+                }
+            }
+        }
+        for c in calls {
+            let cid = call_id(c);
+            if fused.contains(&cid.as_str()) && run_of(c, runs).is_none() {
+                apart
+                    .entry(cid)
+                    .or_default()
+                    .push((c.at, lone_call_line(agents, c)));
+            }
+        }
+        // de la más antigua a la más reciente: `pop` saca primero la más
+        // reciente, como las fundió `active_groups`, y las que comparten id
+        // pero quedaron fuera de la ventana (más antiguas) no se llegan a sacar
+        for same in apart.values_mut() {
+            same.sort_by_key(|(ended, _)| *ended);
+        }
+    }
+
+    let mut rows: Vec<NowRun<'a>> = Vec::new();
+    for l in block {
+        if l.run_ids.len() <= 1 {
+            rows.push(NowRun {
+                chain: Chain::Single,
+                ..l.clone()
+            });
+        } else {
+            rows.extend(
+                l.run_ids
+                    .iter()
+                    .filter_map(|rid| apart.get_mut(rid).and_then(Vec::pop).map(|(_, row)| row)),
+            );
+        }
+    }
+    let running = rows.iter().filter(|r| r.state == RunState::Running).count();
+    Some(AgentBlock {
+        name: head.name,
+        kind: head.kind,
+        owner: head.owner,
+        definition: head.owner.map(|i| agents[i].path.as_path()),
+        section: g.section.clone(),
+        dir: head.group_dir,
+        running,
+        finished: rows.len() - running,
+        tokens: rows.iter().map(|r| r.tokens).sum(),
+        runs: rows,
+    })
 }
 
 /// Clave de grupo de una línea (`NowRun::group_dir`): como `Row::section`.
@@ -823,6 +987,7 @@ fn lone_call_line<'a>(agents: &'a [Agent], c: &'a Invocation) -> NowRun<'a> {
         tokens: 0,
         context: None,
         chain: Chain::Single,
+        lone_call: true,
     }
 }
 
@@ -1018,6 +1183,7 @@ pub fn activity_detail(
         task_full: None,
         last_tool: None,
         steps: Vec::new(),
+        skills: Vec::new(),
         tool_counts: Vec::new(),
         ended: Some(c.at),
         temp_cwd: None,
@@ -1066,7 +1232,7 @@ pub fn last_use_overall(
 mod tests {
     use super::*;
     use crate::runs::usage::Tokens;
-    use crate::runs::{Run, ToolStep};
+    use crate::runs::{Run, SkillUse, ToolStep};
     use chrono::{DurationRound, FixedOffset, TimeDelta};
     use std::path::PathBuf;
 
@@ -1231,12 +1397,14 @@ mod tests {
             Work {
                 total: mins(30),
                 runs: 2,
+                tokens: 0,
                 running: None,
             },
             Work::default(),
             Work {
                 total: mins(12),
                 runs: 1,
+                tokens: 0,
                 running: None,
             },
         ];
@@ -1313,6 +1481,7 @@ mod tests {
                 tokens: 0,
                 context: None,
                 chain: Chain::Single,
+                lone_call: false,
             }
         );
         // 15 min hasta su última línea a las 11:55 y 4 más hasta ahora
@@ -1800,11 +1969,32 @@ mod tests {
     }
 
     #[test]
+    fn work_adds_up_the_tokens_of_every_run_of_the_agent() {
+        let a = agent("docs", Scope::Global);
+        let now = t("2026-11-05T12:00:00Z");
+        let mut done = run("docs", Some("/p"), "2026-11-05T09:00:00Z", 10);
+        done.usage = usage(100, None);
+        // una de hace semanas cuenta igual: es el total de siempre
+        let mut old = run("docs", Some("/p"), "2026-10-10T09:00:00Z", 5);
+        old.usage = usage(7, None);
+        // la en curso suma lo que lleva
+        let mut live = running("docs", "2026-11-05T11:55:00Z", 2);
+        live.usage = usage(30, Some(1));
+        // la de otro agente no entra
+        let mut other = run("backend", Some("/p"), "2026-11-05T10:00:00Z", 99);
+        other.usage = usage(5000, None);
+        let w = work_of(&a, &[done, old, live, other], now);
+        // las mismas ejecuciones que cuentan en `runs`
+        assert_eq!((w.runs, w.tokens), (3, 137));
+    }
+
+    #[test]
     fn no_runs_is_zero_work() {
         let a = agent("docs", Scope::Global);
         let w = work_of(&a, &[], t("2026-11-05T12:00:00Z"));
         assert_eq!(w, Work::default());
         assert_eq!(w.runs, 0);
+        assert_eq!(w.tokens, 0);
     }
 
     #[test]
@@ -2052,7 +2242,7 @@ mod tests {
     }
 
     #[test]
-    fn counters_count_rows_and_sibling_ids_come_from_the_row() {
+    fn counters_count_rows_and_sibling_ids_come_from_the_agent_block() {
         let now = t("2026-11-05T12:00:00Z");
         let since = t("2026-11-05T11:00:00Z");
         let agents = defined();
@@ -2068,10 +2258,15 @@ mod tests {
         // docs en curso; terminadas: Explore (llamada), backend, docs (2 fundidas)
         assert_eq!((g.running, g.recent, g.lines.len()), (1, 3, 4));
         assert_eq!(g.running + g.recent, g.lines.len());
-        // un id que ya no representa a la fila sigue dando los hermanos terminados
-        assert_eq!(sibling_ids(&groups, "toolu_2"), vec!["toolu_3", "toolu_2"]);
-        // la en curso sola no arrastra a las terminadas de su agente
-        assert_eq!(sibling_ids(&groups, "toolu_1"), vec!["toolu_1"]);
+        // todo el bloque de `docs`: la en curso y luego sus terminadas fundidas,
+        // de la más reciente a la más antigua; da igual desde qué id se pregunte
+        // (también uno que no representa a su fila)
+        let docs = vec!["toolu_1", "toolu_3", "toolu_2"];
+        assert_eq!(sibling_ids(&groups, "toolu_2"), docs);
+        assert_eq!(sibling_ids(&groups, "toolu_3"), docs);
+        assert_eq!(sibling_ids(&groups, "toolu_1"), docs);
+        // un bloque de una sola fila y una sola ejecución
+        assert_eq!(sibling_ids(&groups, "toolu_4"), vec!["toolu_4"]);
         assert!(sibling_ids(&groups, "nope").is_empty());
     }
 
@@ -2166,11 +2361,13 @@ mod tests {
         assert_eq!(g.running + g.recent, g.lines.len());
         assert_eq!(g.tokens, g.lines.iter().map(|l| l.tokens).sum::<u64>());
         assert_eq!(g.tokens, 2_800);
-        // ←→ en la ficha: el racimo en su orden, o los fundidos de la terminada
-        assert_eq!(sibling_ids(&groups, "d1"), vec!["d2", "d3", "d1"]);
+        // ←→ en la ficha: todo el bloque del agente, las en curso en su orden
+        // y luego las fundidas de la terminada
+        let docs = vec!["d2", "d3", "d1", "dd2", "dd1"];
+        assert_eq!(sibling_ids(&groups, "d1"), docs);
+        assert_eq!(sibling_ids(&groups, "dd1"), docs);
         assert_eq!(sibling_ids(&groups, "e2"), vec!["e1", "e2"]);
         assert_eq!(sibling_ids(&groups, "g1"), vec!["g1"]);
-        assert_eq!(sibling_ids(&groups, "dd1"), vec!["dd2", "dd1"]);
     }
 
     #[test]
@@ -2226,10 +2423,12 @@ mod tests {
         );
         // los contadores no cambian de significado
         assert_eq!((g.running, g.recent), (3, 4));
-        // ←→ en la ficha: la en curso salta entre las en curso de su agente;
-        // la terminada, entre sus fundidas
-        assert_eq!(sibling_ids(&groups, "d2"), vec!["d1", "d2"]);
-        assert_eq!(sibling_ids(&groups, "dd"), vec!["dd"]);
+        // ←→ en la ficha: el bloque entero, desde una en curso o desde la terminada
+        assert_eq!(sibling_ids(&groups, "d2"), vec!["d1", "d2", "dd"]);
+        assert_eq!(sibling_ids(&groups, "dd"), vec!["d1", "d2", "dd"]);
+        assert_eq!(sibling_ids(&groups, "bd"), vec!["b1", "bd"]);
+        // un agente solo con terminada no arrastra a los demás
+        assert_eq!(sibling_ids(&groups, "ed"), vec!["ed"]);
     }
 
     /// Uso con `total` tokens de entrada, `context` de contexto y modelo opus 5.5.
@@ -2687,5 +2886,296 @@ mod tests {
             (l.owner, l.launch_dir),
             (Some(1), Some(PathBuf::from("/Users/x/app")))
         );
+    }
+
+    /// `defined()` con la ruta de definición de `docs` propia.
+    fn defined_with_paths() -> Vec<Agent> {
+        let mut agents = defined();
+        agents[0].path = PathBuf::from("/Users/x/.claude/agents/docs.md");
+        agents
+    }
+
+    #[test]
+    fn agent_block_unfolds_every_run_of_the_agent_with_its_header() {
+        let now = t("2026-11-05T12:00:00Z");
+        let since = t("2026-11-05T11:00:00Z");
+        let agents = defined_with_paths();
+        let mut dd1 = at_app(run("docs", None, "2026-11-05T11:10:00Z", 5), "dd1");
+        dd1.usage = usage(1_000, Some(9_000));
+        let mut dd2 = at_app(run("docs", None, "2026-11-05T11:20:00Z", 5), "dd2");
+        dd2.usage = usage(2_000, Some(9_000));
+        dd2.task = Some("revisa".into());
+        dd2.skill = Some("superpowers:brainstorming".into());
+        dd2.last_tool = Some("Read · a.rs".into());
+        let runs = [
+            live_at_app("docs", "2026-11-05T11:40:00Z", 15, "d1", 1),
+            dd1,
+            live_at_app("general-purpose", "2026-11-05T11:55:00Z", 1, "g1", 4),
+            live_at_app("docs", "2026-11-05T11:50:00Z", 5, "d2", 2),
+            dd2,
+        ];
+        // una llamada a docs sin ejecución enlazada: la terminada más reciente
+        let mut lone = call("docs", "/Users/x/app", "2026-11-05T11:30:00Z");
+        lone.id = Some("toolu_lone".into());
+        lone.prompt_line = Some("mira esto".into());
+        let calls = [lone];
+        let groups = active_groups(&agents, &calls, &runs, since, now, home());
+        // en la lista, las tres terminadas son UNA fila
+        let fused = groups[0].lines.iter().find(|l| l.runs == 3).unwrap();
+        assert_eq!(fused.run_ids, vec!["toolu_lone", "dd2", "dd1"]);
+
+        let b = agent_block(&agents, &calls, &runs, &groups, "dd1", now).unwrap();
+        assert_eq!(
+            (b.name, b.kind, b.owner),
+            ("docs", RunKind::Defined, Some(0))
+        );
+        assert_eq!(
+            b.definition,
+            Some(Path::new("/Users/x/.claude/agents/docs.md"))
+        );
+        assert_eq!(b.section, "~/app");
+        assert_eq!(b.dir, Some(Path::new("/Users/x/app")));
+        assert_eq!((b.running, b.finished, b.runs.len()), (2, 3, 5));
+        assert_eq!(b.tokens, 100 + 200 + 2_000 + 1_000);
+        // las en curso en el orden del bloque y luego las terminadas, una a
+        // una, de la más reciente a la más antigua: el orden de `sibling_ids`
+        let ids: Vec<&str> = b.runs.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["d2", "d1", "toolu_lone", "dd2", "dd1"]);
+        assert_eq!(ids, sibling_ids(&groups, "dd1"));
+        // cada fila es UNA ejecución con sus propias cifras
+        assert!(b
+            .runs
+            .iter()
+            .all(|r| r.runs == 1 && r.run_ids == [r.id.clone()] && r.chain == Chain::Single));
+        let d2 = &b.runs[0];
+        assert_eq!(d2.state, RunState::Running);
+        assert_eq!(
+            (d2.task, d2.last_tool, d2.skill, d2.tokens, d2.worked),
+            (
+                Some("encargo d2"),
+                Some("Bash · d2"),
+                Some("skill-d2"),
+                200,
+                mins(5)
+            )
+        );
+        assert_eq!(d2.context.map(|c| c.used), Some(2_000));
+        let done = &b.runs[3];
+        assert_eq!(
+            done.state,
+            RunState::Done {
+                ended: t("2026-11-05T11:25:00Z")
+            }
+        );
+        assert_eq!(
+            (done.task, done.last_tool, done.skill, done.tokens),
+            (
+                Some("revisa"),
+                Some("Read · a.rs"),
+                Some("superpowers:brainstorming"),
+                2_000
+            )
+        );
+        // terminada: sin contexto, aunque su uso lo traiga
+        assert_eq!((done.context, done.worked), (None, mins(5)));
+        assert_eq!((b.runs[4].tokens, b.runs[4].lone_call), (1_000, false));
+        // la llamada sin ejecución: fila terminada en su instante, sin cifras
+        // y marcada como tal
+        let l = &b.runs[2];
+        assert!(l.lone_call);
+        assert_eq!(
+            l.state,
+            RunState::Done {
+                ended: t("2026-11-05T11:30:00Z")
+            }
+        );
+        assert_eq!(
+            (l.task, l.tokens, l.worked, l.tools, l.last_tool, l.skill),
+            (Some("mira esto"), 0, TimeDelta::zero(), 0, None, None)
+        );
+        assert!(b.runs.iter().filter(|r| r.lone_call).count() == 1);
+
+        // da igual desde qué ejecución del bloque se pregunte
+        for id in ["d2", "d1", "toolu_lone", "dd2"] {
+            assert_eq!(
+                agent_block(&agents, &calls, &runs, &groups, id, now).as_ref(),
+                Some(&b)
+            );
+        }
+        // un built-in: sin agente definido no hay ruta de definición
+        let g = agent_block(&agents, &calls, &runs, &groups, "g1", now).unwrap();
+        assert_eq!(
+            (g.name, g.kind, g.owner, g.definition),
+            ("general-purpose", RunKind::BuiltIn, None, None)
+        );
+        assert_eq!(
+            (g.running, g.finished, g.runs.len(), g.tokens),
+            (1, 0, 1, 400)
+        );
+        // el bloque ya no está en la ventana
+        assert_eq!(
+            agent_block(&agents, &calls, &runs, &groups, "nope", now),
+            None
+        );
+    }
+
+    #[test]
+    fn agent_block_of_a_lone_call_alone_is_one_finished_row() {
+        let now = t("2026-11-05T12:00:00Z");
+        let since = t("2026-11-05T11:00:00Z");
+        let agents = defined_with_paths();
+        let calls = [call("Explore", "/Users/x/app", "2026-11-05T11:45:00Z")];
+        let groups = active_groups(&agents, &calls, &[], since, now, home());
+        let id = call_id(&calls[0]);
+        let b = agent_block(&agents, &calls, &[], &groups, &id, now).unwrap();
+        assert_eq!(
+            (b.name, b.kind, b.definition),
+            ("Explore", RunKind::BuiltIn, None)
+        );
+        assert_eq!((b.running, b.finished, b.tokens), (0, 1, 0));
+        assert!(b.runs[0].lone_call);
+        // en la lista de activos la fila también lo dice
+        assert!(groups[0].lines[0].lone_call);
+    }
+
+    /// Las tres cifras del bloque de `id`: lo que suman sus filas en activos
+    /// (`runs` de cada una; el `×N` de la línea del agente ya no es esto, solo
+    /// cuenta las en curso), `sibling_ids` y la pantalla del agente
+    /// (`agent_block`, que además debe cuadrar con `running + finished`).
+    fn block_counts(
+        agents: &[Agent],
+        calls: &[Invocation],
+        runs: &[Run],
+        since: DateTime<Utc>,
+        now: DateTime<Utc>,
+        id: &str,
+    ) -> (usize, usize, usize) {
+        let groups = active_groups(agents, calls, runs, since, now, home());
+        let (g, line) = groups
+            .iter()
+            .find_map(|g| {
+                let has = |l: &&NowRun| l.run_ids.iter().any(|r| r == id);
+                g.lines.iter().find(has).map(|l| (g, l))
+            })
+            .unwrap();
+        let key = agent_key(line);
+        let listed: usize = g
+            .lines
+            .iter()
+            .filter(|l| agent_key(l) == key)
+            .map(|l| l.runs)
+            .sum();
+        let b = agent_block(agents, calls, runs, &groups, id, now).unwrap();
+        assert_eq!(b.running + b.finished, b.runs.len());
+        (listed, sibling_ids(&groups, id).len(), b.runs.len())
+    }
+
+    #[test]
+    fn the_block_total_is_the_same_in_the_list_the_siblings_and_the_agent_screen() {
+        let now = t("2026-11-05T12:00:00Z");
+        let since = t("2026-11-05T11:00:00Z");
+        let agents = defined();
+        // un paso de workflow que resuelve a `docs`: mismo bloque que las definidas
+        let mut wf = at_app(
+            run("workflow-subagent", None, "2026-11-05T11:15:00Z", 5),
+            "wf",
+        );
+        wf.description = Some("docs".into());
+        let runs = [
+            live_at_app("docs", "2026-11-05T11:50:00Z", 5, "d1", 1),
+            live_at_app("docs", "2026-11-05T11:55:00Z", 2, "d2", 2),
+            at_app(run("docs", None, "2026-11-05T11:10:00Z", 5), "dd1"),
+            at_app(run("docs", None, "2026-11-05T11:20:00Z", 5), "dd2"),
+            wf,
+            // enlazada con su llamada: una sola vez, no dos
+            at_app(run("docs", None, "2026-11-05T11:30:00Z", 5), "linked"),
+            // terminada fuera de la ventana: no entra en ninguna cifra
+            at_app(run("docs", None, "2026-11-05T10:00:00Z", 5), "old"),
+            // otro agente del mismo proyecto: otro bloque
+            at_app(run("backend", None, "2026-11-05T11:40:00Z", 5), "b1"),
+        ];
+        let mut linked = call("docs", "/Users/x/app", "2026-11-05T11:30:00Z");
+        linked.id = Some("linked".into());
+        let mut lone = call("docs", "/Users/x/app", "2026-11-05T11:35:00Z");
+        lone.id = Some("lone".into());
+        let calls = [
+            linked,
+            lone,
+            // una antigua, sin id, y otra fuera de la ventana
+            call("docs", "/Users/x/app", "2026-11-05T11:05:00Z"),
+            call("docs", "/Users/x/app", "2026-11-05T10:30:00Z"),
+        ];
+        // 2 en curso + dd1, dd2, wf, linked + 2 llamadas sin ejecución
+        for id in ["d1", "dd1", "wf", "linked", "lone"] {
+            assert_eq!(
+                block_counts(&agents, &calls, &runs, since, now, id),
+                (8, 8, 8),
+                "desde {id}"
+            );
+        }
+        assert_eq!(
+            block_counts(&agents, &calls, &runs, since, now, "b1"),
+            (1, 1, 1)
+        );
+    }
+
+    #[test]
+    fn runs_and_calls_that_share_an_id_still_count_the_same_everywhere() {
+        let now = t("2026-11-05T12:00:00Z");
+        let since = t("2026-11-05T11:00:00Z");
+        let agents = defined();
+        // la misma llamada leída de dos transcripciones (sesión reanudada)
+        let mut lone = call("docs", "/Users/x/app", "2026-11-05T11:35:00Z");
+        lone.id = Some("lone".into());
+        let calls = [lone.clone(), lone];
+        // dos terminadas con el mismo `tool_use_id`
+        let runs = [
+            live_at_app("docs", "2026-11-05T11:50:00Z", 5, "d1", 1),
+            at_app(run("docs", None, "2026-11-05T11:10:00Z", 5), "dup"),
+            at_app(run("docs", None, "2026-11-05T11:20:00Z", 5), "dup"),
+            at_app(run("docs", None, "2026-11-05T11:25:00Z", 5), "dd"),
+        ];
+        let (listed, siblings, screen) = block_counts(&agents, &calls, &runs, since, now, "dd");
+        assert_eq!((listed, siblings), (screen, screen));
+        // los tokens de la pantalla, los mismos que suman las filas de la lista
+        let groups = active_groups(&agents, &calls, &runs, since, now, home());
+        let b = agent_block(&agents, &calls, &runs, &groups, "dd", now).unwrap();
+        assert_eq!(b.tokens, groups[0].tokens);
+    }
+
+    #[test]
+    fn detail_carries_every_skill_and_the_group_folder() {
+        let now = t("2026-11-05T12:00:00Z");
+        let agents = defined();
+        let mut r = at_app(running("docs", "2026-11-05T11:50:00Z", 5), "toolu_s");
+        r.launch_dir = Some("/Users/x/app".into());
+        r.cwd = Some("/Users/x/app/front".into());
+        let skills = vec![
+            SkillUse {
+                at: t("2026-11-05T11:51:00Z"),
+                name: "superpowers:verification-before-completion".into(),
+            },
+            SkillUse {
+                at: t("2026-11-05T11:53:00Z"),
+                name: "frontend-design".into(),
+            },
+        ];
+        r.skills = skills.clone().into();
+        r.skill = Some("frontend-design".into());
+        // sin `launch_dir`, la carpeta del grupo es el `cwd`
+        let plain = at_app(run("docs", None, "2026-11-05T11:00:00Z", 5), "toolu_n");
+        let runs = [r, plain];
+        let d = run_detail(&agents, &runs, "toolu_s", now).unwrap();
+        // todas, de la más antigua a la más reciente, como `steps`
+        assert_eq!(d.skills, skills);
+        assert_eq!(d.group_dir(), Some(Path::new("/Users/x/app")));
+        let n = run_detail(&agents, &runs, "toolu_n", now).unwrap();
+        assert!(n.skills.is_empty());
+        assert_eq!(n.group_dir(), Some(Path::new("/Users/x/app")));
+        // una llamada sin ejecución: sin skills; su carpeta, la de la llamada
+        let calls = [call("Explore", "/Users/x/otro", "2026-11-05T11:45:00Z")];
+        let c = activity_detail(&agents, &calls, &runs, &call_id(&calls[0]), now).unwrap();
+        assert!(c.skills.is_empty());
+        assert_eq!(c.group_dir(), Some(Path::new("/Users/x/otro")));
     }
 }

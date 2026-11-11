@@ -774,3 +774,6 @@ fn the_skill_survives_dropping_old_steps_and_reaches_the_run() {
     runs.refresh(&tmp.0).unwrap();
     assert_eq!(find(&runs.runs(), "a2").skill, None);
 }
+
+mod closing;
+mod skills;
