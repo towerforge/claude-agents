@@ -28,7 +28,7 @@ struct Cli {
     roots: Vec<PathBuf>,
 
     /// Window in minutes: an agent is active if it was used within it or has a run in progress.
-    #[arg(short, long, default_value_t = 10, value_name = "N")]
+    #[arg(short, long, default_value_t = 5, value_name = "N")]
     minutes: i64,
 
     /// Also shows open Claude sessions, with pid and command (only with --plain).
@@ -427,6 +427,12 @@ mod tests {
         let cli = Cli::try_parse_from(["claude-agents", "-p", "-m", "5", "-v"]).unwrap();
         assert!(cli.cmd.is_none());
         assert!(cli.plain && cli.verbose);
+        assert_eq!(cli.minutes, 5);
+    }
+
+    #[test]
+    fn the_window_defaults_to_five_minutes() {
+        let cli = Cli::try_parse_from(["claude-agents"]).unwrap();
         assert_eq!(cli.minutes, 5);
     }
 
